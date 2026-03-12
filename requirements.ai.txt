@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+gunicorn
+python-dotenv
+pymongo
+python-multipart
+opencv-python
+ultralytics
+pillow
+numpy
+supervision
+torch
+torchvision

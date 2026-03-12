@@ -1,0 +1,18 @@
+#pip install -r requirements.txt
+
+fastapi
+uvicorn
+gunicorn
+python-dotenv
+pymongo
+pillow
+fpdf
+ezdxf
+exif
+pdf2image
+joblib
+pyproj
+scikit-learn
+python-multipart
+requests
+opencv-python

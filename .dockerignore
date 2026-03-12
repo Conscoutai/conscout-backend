@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.env.*
+data/
+compare_results/
+issue_reports/
+virtual_tours/
+streetview/
+floorplans/
