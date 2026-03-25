@@ -6,9 +6,9 @@ from fastapi import HTTPException
 from core.database import floorplans_collection, tours_collection, work_schedules_collection
 from core.config import (
     DEFAULT_SITE_NAME,
-    SITES_DIR,
     site_dir,
     site_floorplan_dir,
+    site_storage_roots,
 )
 
 
@@ -19,7 +19,14 @@ def delete_floorplan_image(fp: dict) -> None:
     image_path = os.path.join(site_floorplan_dir(site_name), image_name)
     if image_url.startswith("/sites/"):
         rel = image_url.replace("/sites/", "").lstrip("/").replace("/", os.sep)
-        image_path = os.path.join(SITES_DIR, rel)
+        for root in site_storage_roots(
+            owner_email=fp.get("owner_email"),
+            owner_user_id=fp.get("owner_user_id"),
+        ):
+            candidate = os.path.join(root, rel)
+            if os.path.exists(candidate):
+                image_path = candidate
+                break
     if os.path.exists(image_path):
         os.remove(image_path)
 

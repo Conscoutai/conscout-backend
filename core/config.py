@@ -2,6 +2,10 @@
 # Single source of paths, defaults, and feature flags.
 
 import os
+import re
+from typing import Optional
+
+from core.auth_context import get_current_user
 
 # ---------------------------------------------------------
 # Base directory
@@ -50,8 +54,9 @@ def _port(default_key: str, default_value: int) -> int:
 # ---------------------------------------------------------
 MODEL_DIR = _env("MODEL_DIR", os.path.join(BASE_DIR, "models"))
 
-SITES_DIR = _env("SITES_DIR", os.path.join(BASE_DIR, "data", "sites"))
-TOURS_DIR = _env("TOURS_DIR", os.path.join(BASE_DIR, "data", "tours"))
+DATA_DIR = _env("DATA_DIR", os.path.join(BASE_DIR, "data"))
+SITES_DIR = _env("SITES_DIR", os.path.join(DATA_DIR, "sites"))
+TOURS_DIR = _env("TOURS_DIR", os.path.join(DATA_DIR, "tours"))
 
 SITE_FLOORPLAN_DIRNAME = _env("SITE_FLOORPLAN_DIRNAME", "floorplan")
 SITE_DXF_DIRNAME = _env("SITE_DXF_DIRNAME", "dxf")
@@ -63,45 +68,147 @@ TOUR_DETECT_DIRNAME = _env("TOUR_DETECT_DIRNAME", "detect")
 TOUR_DETECT_SEG_DIRNAME = _env("TOUR_DETECT_SEG_DIRNAME", "detect+seg")
 TOUR_COMMENTS_DIRNAME = _env("TOUR_COMMENTS_DIRNAME", "comments")
 
-def site_dir(site_name: str) -> str:
-    return os.path.join(SITES_DIR, site_name)
 
-def site_floorplan_dir(site_name: str) -> str:
-    return os.path.join(site_dir(site_name), SITE_FLOORPLAN_DIRNAME)
+def _sanitize_user_segment(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return "anonymous"
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug or "anonymous"
 
-def site_dxf_dir(site_name: str) -> str:
-    return os.path.join(site_dir(site_name), SITE_DXF_DIRNAME)
 
-def site_baseline_dir(site_name: str) -> str:
-    return os.path.join(site_dir(site_name), SITE_BASELINE_DIRNAME)
+def _owner_storage_segment(
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> Optional[str]:
+    email = (owner_email or "").strip().lower()
+    if email:
+        username = email.split("@", 1)[0]
+        return _sanitize_user_segment(username)
 
-def tour_dir(tour_id: str) -> str:
-    direct = os.path.join(TOURS_DIR, tour_id)
-    if os.path.isdir(direct):
-        return direct
-    # Backward/forward compatibility:
-    # prefer folder ending with "__{tour_id}" when named storage keys are used.
+    user_id = (owner_user_id or "").strip()
+    if user_id:
+        return _sanitize_user_segment(user_id)
+
+    current_user = get_current_user()
+    if current_user:
+        username = (current_user.email or "").split("@", 1)[0]
+        return _sanitize_user_segment(username or current_user.user_id)
+
+    return None
+
+
+def user_data_dir(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    segment = _owner_storage_segment(owner_email=owner_email, owner_user_id=owner_user_id)
+    if not segment:
+        return DATA_DIR
+    return os.path.join(DATA_DIR, segment)
+
+
+def user_sites_dir(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        user_data_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+        "sites",
+    )
+
+
+def user_tours_dir(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        user_data_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+        "tours",
+    )
+
+
+def site_storage_roots(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> list[str]:
+    roots: list[str] = []
+    scoped = user_sites_dir(owner_email=owner_email, owner_user_id=owner_user_id)
+    if scoped not in roots:
+        roots.append(scoped)
+    if SITES_DIR not in roots:
+        roots.append(SITES_DIR)
+    return roots
+
+
+def tour_storage_roots(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> list[str]:
+    roots: list[str] = []
+    scoped = user_tours_dir(owner_email=owner_email, owner_user_id=owner_user_id)
+    if scoped not in roots:
+        roots.append(scoped)
+    if TOURS_DIR not in roots:
+        roots.append(TOURS_DIR)
+    return roots
+
+def site_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        user_sites_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+        site_name,
+    )
+
+def site_floorplan_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
+        SITE_FLOORPLAN_DIRNAME,
+    )
+
+def site_dxf_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
+        SITE_DXF_DIRNAME,
+    )
+
+def site_baseline_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
+        SITE_BASELINE_DIRNAME,
+    )
+
+def tour_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> str:
     suffix = f"__{tour_id}"
-    try:
-        for entry in os.listdir(TOURS_DIR):
-            candidate = os.path.join(TOURS_DIR, entry)
-            if os.path.isdir(candidate) and entry.endswith(suffix):
-                return candidate
-    except FileNotFoundError:
-        pass
-    return direct
+    for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+        direct = os.path.join(root, tour_id)
+        if os.path.isdir(direct):
+            return direct
+        try:
+            for entry in os.listdir(root):
+                candidate = os.path.join(root, entry)
+                if os.path.isdir(candidate) and entry.endswith(suffix):
+                    return candidate
+        except FileNotFoundError:
+            pass
+    return os.path.join(
+        user_tours_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+        tour_id,
+    )
 
-def tour_raw_dir(tour_id: str) -> str:
-    return os.path.join(tour_dir(tour_id), TOUR_RAW_DIRNAME)
+def tour_raw_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        TOUR_RAW_DIRNAME,
+    )
 
-def tour_detect_dir(tour_id: str) -> str:
-    return os.path.join(tour_dir(tour_id), TOUR_DETECT_DIRNAME)
+def tour_detect_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        TOUR_DETECT_DIRNAME,
+    )
 
-def tour_detect_seg_dir(tour_id: str) -> str:
-    return os.path.join(tour_dir(tour_id), TOUR_DETECT_SEG_DIRNAME)
+def tour_detect_seg_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        TOUR_DETECT_SEG_DIRNAME,
+    )
 
-def tour_comments_dir(tour_id: str) -> str:
-    return os.path.join(tour_dir(tour_id), TOUR_COMMENTS_DIRNAME)
+def tour_comments_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        TOUR_COMMENTS_DIRNAME,
+    )
 
 # ---------------------------------------------------------
 # Mongo

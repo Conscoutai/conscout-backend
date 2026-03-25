@@ -6,7 +6,7 @@ from pathlib import Path
 from pyproj import Transformer
 from typing import List, Dict, Optional
 
-from core.config import SITES_DIR, SITE_DXF_DIRNAME
+from core.config import site_dxf_dir
 from core.site_config import get_dxf_blocks
 from core.database import floorplans_collection
 from utils.geo import gps_to_xy
@@ -19,7 +19,6 @@ class DXFService:
     """
 
     def __init__(self):
-        self.base_dxf_dir = Path(SITES_DIR)
         self._cache: Dict[str, List[dict]] = {}
 
         # EPSG:32639 (UTM 39N) -> WGS84
@@ -39,7 +38,13 @@ class DXFService:
         """
         Full DXF pipeline for a project (one-time truth ingestion)
         """
-        dxf_dir = self.base_dxf_dir / project_id / SITE_DXF_DIRNAME
+        dxf_dir = Path(
+            site_dxf_dir(
+                project_id,
+                owner_email=(floorplan or {}).get("owner_email"),
+                owner_user_id=(floorplan or {}).get("owner_user_id"),
+            )
+        )
         if not dxf_dir.exists():
             raise FileNotFoundError(f"DXF folder not found: {dxf_dir}")
 

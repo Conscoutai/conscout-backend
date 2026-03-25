@@ -12,12 +12,12 @@ from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageFont
 
 from core.config import (
-    SITES_DIR,
-    TOURS_DIR,
     SITE_FLOORPLAN_DIRNAME,
     TOUR_DETECT_DIRNAME,
     TOUR_DETECT_SEG_DIRNAME,
     TOUR_RAW_DIRNAME,
+    site_storage_roots,
+    tour_storage_roots,
     tour_comments_dir,
 )
 
@@ -87,6 +87,70 @@ def _resolve_local_image_path(url_or_path: Optional[str]) -> Optional[str]:
         return raw_path
 
     return None
+
+
+def _resolve_local_image_path_for_owner(
+    url_or_path: Optional[str],
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> Optional[str]:
+    if not url_or_path:
+        return None
+
+    raw_path = url_or_path.strip()
+    if raw_path.startswith("http://") or raw_path.startswith("https://"):
+        raw_path = urlparse(raw_path).path
+
+    raw_path = raw_path.replace("\\", "/")
+
+    if raw_path.startswith("/streetview/"):
+        rel = raw_path.replace("/streetview/", "").lstrip("/").replace("/", os.sep)
+        for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+            candidate = os.path.join(root, rel)
+            if os.path.exists(candidate):
+                return candidate
+
+        parts = rel.split(os.sep, 1)
+        if len(parts) == 2 and parts[1].lower().endswith((".jpg", ".jpeg", ".png")):
+            tour_id = parts[0]
+            filename = parts[1]
+            for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+                for subdir in (TOUR_RAW_DIRNAME, TOUR_DETECT_DIRNAME, TOUR_DETECT_SEG_DIRNAME):
+                    alt = os.path.join(root, tour_id, subdir, filename)
+                    if os.path.exists(alt):
+                        return alt
+        return None
+
+    if raw_path.startswith("/sites/"):
+        rel = raw_path.replace("/sites/", "").lstrip("/").replace("/", os.sep)
+        for root in site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+            candidate = os.path.join(root, rel)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    if raw_path.startswith("/floorplans/"):
+        rel = raw_path.replace("/floorplans/", "").lstrip("/").replace("/", os.sep)
+        filename = os.path.basename(rel)
+        for root in site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+            candidate = os.path.join(root, rel)
+            if os.path.exists(candidate):
+                return candidate
+            if os.path.isdir(root):
+                for site_name in os.listdir(root):
+                    site_path = os.path.join(root, site_name)
+                    if not os.path.isdir(site_path):
+                        continue
+                    alt = os.path.join(site_path, SITE_FLOORPLAN_DIRNAME, filename)
+                    if os.path.exists(alt):
+                        return alt
+        return None
+
+    if os.path.exists(raw_path):
+        return raw_path
+
+    return _resolve_local_image_path(url_or_path)
 
 
 def _sanitize_filename(text: str) -> str:
@@ -578,7 +642,11 @@ def _add_image_with_caption(
 
 def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], floorplan: Optional[dict]) -> str:
     tour_id = tour.get("tour_id") or "tour_unknown"
-    output_dir = tour_comments_dir(tour_id)
+    output_dir = tour_comments_dir(
+        tour_id,
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+    )
     os.makedirs(output_dir, exist_ok=True)
 
     issue_name = issue.get("title") or "Comment"
@@ -602,10 +670,18 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
     pano_url = node.get("detectedImageUrl") if node else None
     if not pano_url and node:
         pano_url = node.get("imageUrl")
-    pano_path = _resolve_local_image_path(pano_url)
+    pano_path = _resolve_local_image_path_for_owner(
+        pano_url,
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+    )
 
     floorplan_url = floorplan.get("imageUrl") if floorplan else None
-    floorplan_path = _resolve_local_image_path(floorplan_url)
+    floorplan_path = _resolve_local_image_path_for_owner(
+        floorplan_url,
+        owner_email=(floorplan or {}).get("owner_email"),
+        owner_user_id=(floorplan or {}).get("owner_user_id"),
+    )
 
     pano_annotated = _annotate_pano_image(pano_path, issue, output_dir) if pano_path else None
     floorplan_annotated = None

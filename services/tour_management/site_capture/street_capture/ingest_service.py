@@ -11,12 +11,12 @@ from typing import Optional
 from exif import Image as ExifImage
 from fastapi import HTTPException, UploadFile
 
-from core.config import TOURS_DIR
 from core.database import floorplans_collection, tours_collection
 from utils.geo import gps_to_xy, haversine, project_point
 from services.tour_management.site_capture.shared.storage_service import (
     build_storage_key,
     build_streetview_url,
+    resolve_storage_dir_for_tour,
     resolve_storage_key_for_tour,
 )
 
@@ -219,7 +219,12 @@ def upload_streetview_image(
     if existing is None:
         storage_key = build_storage_key(tour_id, tour_name or tour_id)
 
-    tour_folder = os.path.join(TOURS_DIR, storage_key, "raw")
+    storage_owner_doc = {
+        "storage_key": storage_key,
+        "owner_email": (existing or {}).get("owner_email"),
+        "owner_user_id": (existing or {}).get("owner_user_id"),
+    }
+    tour_folder = os.path.join(resolve_storage_dir_for_tour(tour_id, storage_owner_doc), "raw")
     os.makedirs(tour_folder, exist_ok=True)
 
     filename = f"{node_id}.jpg"

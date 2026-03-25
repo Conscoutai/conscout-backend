@@ -7,16 +7,15 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from api.router import api_router
+from core.auth import ensure_default_user_and_migrate_legacy_data
 from core.config import (
     ALLOWED_ORIGINS,
     API_PORT,
     APP_TITLE,
     APP_VERSION,
-    SITES_DIR,
-    TOURS_DIR,
+    DATA_DIR,
 )
 
 load_dotenv()
@@ -38,12 +37,10 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+ensure_default_user_and_migrate_legacy_data()
 
-for directory in (SITES_DIR, TOURS_DIR):
+for directory in (DATA_DIR,):
     os.makedirs(directory, exist_ok=True)
-
-app.mount("/sites", StaticFiles(directory=SITES_DIR), name="sites")
-app.mount("/streetview", StaticFiles(directory=TOURS_DIR), name="streetview")
 
 
 @app.get("/")

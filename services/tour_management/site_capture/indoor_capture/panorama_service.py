@@ -5,11 +5,11 @@ from typing import Iterable, Optional
 import cv2
 from fastapi import HTTPException, UploadFile
 
-from core.config import TOURS_DIR
 from core.database import floorplans_collection, tours_collection
 from services.tour_management.site_capture.shared.storage_service import (
     build_storage_key,
     build_streetview_url,
+    resolve_storage_dir_for_tour,
     resolve_storage_key_for_tour,
 )
 
@@ -19,16 +19,14 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp")
 
 
 def _frames_dir(tour_id: str, tour_doc=None, node_index: Optional[int] = None) -> str:
-    storage_key = resolve_storage_key_for_tour(tour_id, tour_doc)
-    base = os.path.join(TOURS_DIR, storage_key, "frames")
+    base = os.path.join(resolve_storage_dir_for_tour(tour_id, tour_doc), "frames")
     if isinstance(node_index, int) and node_index >= 0:
         return os.path.join(base, f"node_{node_index}")
     return base
 
 
 def _videos_dir(tour_id: str, tour_doc=None, node_index: Optional[int] = None) -> str:
-    storage_key = resolve_storage_key_for_tour(tour_id, tour_doc)
-    base = os.path.join(TOURS_DIR, storage_key, "videos")
+    base = os.path.join(resolve_storage_dir_for_tour(tour_id, tour_doc), "videos")
     if isinstance(node_index, int) and node_index >= 0:
         return os.path.join(base, f"node_{node_index}")
     return base
@@ -209,7 +207,17 @@ def stitch_indoor_panoramas(tour_id: str, node_count: int) -> dict:
         raise HTTPException(status_code=404, detail="No frames directory found for this tour")
 
     storage_key = resolve_storage_key_for_tour(tour_id, tour_doc)
-    raw_dir = os.path.join(TOURS_DIR, storage_key, "raw")
+    raw_dir = os.path.join(
+        resolve_storage_dir_for_tour(
+            tour_id,
+            {
+                "storage_key": storage_key,
+                "owner_email": (tour_doc or {}).get("owner_email"),
+                "owner_user_id": (tour_doc or {}).get("owner_user_id"),
+            },
+        ),
+        "raw",
+    )
     os.makedirs(raw_dir, exist_ok=True)
 
     node_dirs = _node_dirs_with_frames(frames_dir)
@@ -288,8 +296,22 @@ def save_indoor_tour_metadata(tour_id: str, payload: dict) -> dict:
     old_storage_key = resolve_storage_key_for_tour(tour_id, existing)
     desired_storage_key = build_storage_key(tour_id, payload.get("tour_name") or (existing or {}).get("name"))
 
-    old_dir = os.path.join(TOURS_DIR, old_storage_key)
-    new_dir = os.path.join(TOURS_DIR, desired_storage_key)
+    old_dir = resolve_storage_dir_for_tour(
+        tour_id,
+        {
+            "storage_key": old_storage_key,
+            "owner_email": (existing or {}).get("owner_email"),
+            "owner_user_id": (existing or {}).get("owner_user_id"),
+        },
+    )
+    new_dir = resolve_storage_dir_for_tour(
+        tour_id,
+        {
+            "storage_key": desired_storage_key,
+            "owner_email": (existing or {}).get("owner_email"),
+            "owner_user_id": (existing or {}).get("owner_user_id"),
+        },
+    )
     if old_storage_key != desired_storage_key and os.path.isdir(old_dir) and not os.path.exists(new_dir):
         os.rename(old_dir, new_dir)
 

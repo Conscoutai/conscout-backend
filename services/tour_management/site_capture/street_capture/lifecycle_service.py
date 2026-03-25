@@ -2,9 +2,11 @@ import os
 import shutil
 
 from core.database import floorplans_collection, tours_collection
-from core.config import TOURS_DIR
 from services.tour_management.site_capture.shared.node_path_mapper import normalize_node_paths
-from services.tour_management.site_capture.shared.storage_service import resolve_storage_key_for_tour
+from services.tour_management.site_capture.shared.storage_service import (
+    resolve_storage_dir_for_tour,
+    resolve_storage_key_for_tour,
+)
 
 
 def get_latest_tour_id():
@@ -44,7 +46,14 @@ def delete_tour(tour_id: str):
     result = tours_collection.delete_one({"tour_id": tour_id})
 
     storage_key = resolve_storage_key_for_tour(tour_id, tour_doc)
-    sv_path = os.path.join(TOURS_DIR, storage_key)
+    sv_path = resolve_storage_dir_for_tour(
+        tour_id,
+        {
+            "storage_key": storage_key,
+            "owner_email": (tour_doc or {}).get("owner_email"),
+            "owner_user_id": (tour_doc or {}).get("owner_user_id"),
+        },
+    )
 
     if os.path.exists(sv_path):
         shutil.rmtree(sv_path)
