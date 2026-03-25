@@ -60,7 +60,15 @@ async def sync_streetview_images(
     if not files:
         raise HTTPException(400, "No files provided")
 
-    dest_dir = tour_raw_dir(tour_id)
+    tour = tours_collection.find_one({"tour_id": tour_id})
+    if not tour:
+        raise HTTPException(404, "Tour not found")
+
+    dest_dir = tour_raw_dir(
+        tour_id,
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+    )
     os.makedirs(dest_dir, exist_ok=True)
 
     saved = 0

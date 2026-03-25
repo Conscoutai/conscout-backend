@@ -49,8 +49,19 @@ async def run_count_ai_for_tour(
         print(f"[count] floorplan not found for id={floorplan_id}")
     storage_key = resolve_storage_key_for_tour(tour_id, tour)
 
-    raw_dir = tour_raw_dir(tour_id)
-    detect_dir = tour_detect_dir(tour_id)
+    owner_email = tour.get("owner_email")
+    owner_user_id = tour.get("owner_user_id")
+
+    raw_dir = tour_raw_dir(
+        tour_id,
+        owner_email=owner_email,
+        owner_user_id=owner_user_id,
+    )
+    detect_dir = tour_detect_dir(
+        tour_id,
+        owner_email=owner_email,
+        owner_user_id=owner_user_id,
+    )
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(detect_dir, exist_ok=True)
 
