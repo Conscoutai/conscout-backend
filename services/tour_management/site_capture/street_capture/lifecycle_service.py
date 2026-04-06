@@ -26,6 +26,18 @@ def list_all_tours():
 
         storage_key = resolve_storage_key_for_tour(doc.get("tour_id"), doc)
         nodes = [normalize_node_paths(doc.get("tour_id"), n.copy(), storage_key=storage_key) for n in doc.get("nodes", [])]
+        preview_image_url = ""
+        thumbnail_url = ""
+        if nodes:
+            first_node = nodes[0]
+            preview_image_url = (
+                first_node.get("thumbnailUrl")
+                or first_node.get("thumbnail_url")
+                or first_node.get("imageUrl")
+                or first_node.get("image_url")
+                or ""
+            )
+            thumbnail_url = preview_image_url
         tours.append({
             "tour_id": doc.get("tour_id"),
             "name": doc.get("name"),
@@ -33,6 +45,8 @@ def list_all_tours():
             "floorplan_id": doc.get("floorplan_id"),
             "site_name": site_name,
             "created_at": doc.get("created_at"),
+            "preview_image_url": preview_image_url,
+            "thumbnail_url": thumbnail_url,
             "nodes": nodes,
             "progress": doc.get("progress"),
             "coverage": doc.get("coverage"),
@@ -61,5 +75,28 @@ def delete_tour(tour_id: str):
     return {
         "status": "deleted",
         "mongo_deleted": result.deleted_count,
+    }
+
+
+def rename_tour(tour_id: str, new_name: str):
+    resolved_tour_id = (tour_id or "").strip()
+    resolved_name = (new_name or "").strip()
+    if not resolved_tour_id:
+        raise ValueError("tour_id is required")
+    if not resolved_name:
+        raise ValueError("name is required")
+
+    result = tours_collection.update_one(
+        {"tour_id": resolved_tour_id},
+        {"$set": {"name": resolved_name}},
+    )
+    if result.matched_count == 0:
+        raise FileNotFoundError("Tour not found")
+
+    return {
+        "status": "renamed",
+        "tour_id": resolved_tour_id,
+        "name": resolved_name,
+        "message": "Tour renamed successfully",
     }
 

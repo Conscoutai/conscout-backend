@@ -4,6 +4,7 @@ from .lifecycle_service import (
     delete_tour,
     get_latest_tour_id,
     list_all_tours,
+    rename_tour,
 )
 
 
@@ -30,4 +31,8 @@ def list_all_street_capture_tours():
 
 def delete_street_capture_tour(tour_id: str):
     return delete_tour(tour_id)
+
+
+def rename_street_capture_tour(tour_id: str, new_name: str):
+    return rename_tour(tour_id, new_name)
 

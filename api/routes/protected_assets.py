@@ -12,6 +12,10 @@ from core.database import floorplans_collection, tours_collection
 
 router = APIRouter(tags=["ProtectedAssets"], dependencies=[Depends(require_authenticated_user)])
 
+_ASSET_CACHE_HEADERS = {
+    "Cache-Control": "private, max-age=86400, stale-while-revalidate=604800",
+}
+
 
 def _safe_join(base_dir: str, relative_path: str) -> str:
     candidate = os.path.abspath(os.path.join(base_dir, relative_path))
@@ -61,7 +65,7 @@ def get_tour_asset(asset_path: str):
         ),
         normalized,
     )
-    return FileResponse(file_path)
+    return FileResponse(file_path, headers=_ASSET_CACHE_HEADERS)
 
 
 @router.get("/sites/{asset_path:path}")
@@ -85,4 +89,4 @@ def get_site_asset(asset_path: str):
         ),
         normalized,
     )
-    return FileResponse(file_path)
+    return FileResponse(file_path, headers=_ASSET_CACHE_HEADERS)

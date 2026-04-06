@@ -11,6 +11,7 @@ from services.tour_management.site_capture.street_capture import (
     delete_street_capture_tour,
     get_latest_street_capture_tour_id,
     list_all_street_capture_tours,
+    rename_street_capture_tour,
     upload_street_capture_image,
 )
 
@@ -55,6 +56,17 @@ def all_street_capture_tours():
 @router.delete("/delete-streetview-tour/{tour_id}")
 def delete_street_capture(tour_id: str):
     return delete_street_capture_tour(tour_id)
+
+
+@router.put("/site-capture/street-capture/rename/{tour_id}")
+@router.put("/rename-streetview-tour/{tour_id}")
+async def rename_street_capture(tour_id: str, payload: dict):
+    try:
+        return rename_street_capture_tour(tour_id, payload.get("name", ""))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @router.post("/site-capture/street-capture/save/{tour_id}")
