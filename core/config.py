@@ -19,6 +19,12 @@ def _env(key: str, default: str) -> str:
     value = os.getenv(key)
     return value if value is not None and value != "" else default
 
+def _required_env(key: str) -> str:
+    value = os.getenv(key)
+    if value is None or value == "":
+        raise RuntimeError(f"Missing required environment variable: {key}")
+    return value
+
 def _env_int(key: str, default: int) -> int:
     value = os.getenv(key)
     if value is None or value == "":
@@ -213,7 +219,7 @@ def tour_comments_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_
 # ---------------------------------------------------------
 # Mongo
 # ---------------------------------------------------------
-MONGO_URI = _env("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = _required_env("MONGO_URI")
 DB_NAME = _env("DB_NAME", "construction_ai")
 
 # ---------------------------------------------------------
