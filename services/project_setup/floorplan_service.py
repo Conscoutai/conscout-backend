@@ -25,14 +25,14 @@ def create_floorplan(
     *,
     file: UploadFile,
     name: str,
-    pointA_px: float,
-    pointA_py: float,
-    pointA_lat: float,
-    pointA_lon: float,
-    pointB_px: float,
-    pointB_py: float,
-    pointB_lat: float,
-    pointB_lon: float,
+    pointA_px: Optional[float],
+    pointA_py: Optional[float],
+    pointA_lat: Optional[float],
+    pointA_lon: Optional[float],
+    pointB_px: Optional[float],
+    pointB_py: Optional[float],
+    pointB_lat: Optional[float],
+    pointB_lon: Optional[float],
     calibration_points: Optional[str] = None,
     site_name: Optional[str] = None,
     dxf_project_id: Optional[str] = None,
@@ -74,24 +74,58 @@ def create_floorplan(
         img = Image.open(image_path)
         width, height = img.size
 
-        # ---- Compute GPS distance vs pixel distance ----
-        gps_dist = haversine(pointA_lat, pointA_lon, pointB_lat, pointB_lon)
-        pixel_dist = math.dist([pointA_px, pointA_py], [pointB_px, pointB_py])
+        safe_capture_mode = capture_mode if capture_mode in {"outdoor", "indoor"} else "outdoor"
+        has_calibration = all(
+            value is not None
+            for value in (
+                pointA_px,
+                pointA_py,
+                pointA_lat,
+                pointA_lon,
+                pointB_px,
+                pointB_py,
+                pointB_lat,
+                pointB_lon,
+            )
+        )
+        if safe_capture_mode == "outdoor" and not has_calibration:
+            raise HTTPException(
+                422,
+                "Outdoor floorplans require Point A and Point B calibration values",
+            )
+        if calibration_points and not has_calibration:
+            raise HTTPException(
+                422,
+                "Calibration points require Point A and Point B calibration values",
+            )
 
-        if pixel_dist == 0:
-            raise HTTPException(400, "Point A/B pixels must be different")
+        scale = None
+        rotation_deg = None
+        origin = None
+        if has_calibration:
+            # ---- Compute GPS distance vs pixel distance ----
+            gps_dist = haversine(pointA_lat, pointA_lon, pointB_lat, pointB_lon)
+            pixel_dist = math.dist([pointA_px, pointA_py], [pointB_px, pointB_py])
 
-        scale = gps_dist / pixel_dist  # meters per pixel
+            if pixel_dist == 0:
+                raise HTTPException(400, "Point A/B pixels must be different")
 
-        # ---- Compute rotation (pixel Y-axis inverted) ----
-        gps_angle = math.atan2(pointB_lat - pointA_lat, pointB_lon - pointA_lon)
+            scale = gps_dist / pixel_dist  # meters per pixel
 
-        dy_pixel = -(pointB_py - pointA_py)
-        dx_pixel = (pointB_px - pointA_px)
+            # ---- Compute rotation (pixel Y-axis inverted) ----
+            gps_angle = math.atan2(pointB_lat - pointA_lat, pointB_lon - pointA_lon)
 
-        pixel_angle = math.atan2(dy_pixel, dx_pixel)
-        rotation = gps_angle - pixel_angle
-        rotation_deg = math.degrees(rotation)
+            dy_pixel = -(pointB_py - pointA_py)
+            dx_pixel = (pointB_px - pointA_px)
+
+            pixel_angle = math.atan2(dy_pixel, dx_pixel)
+            rotation = gps_angle - pixel_angle
+            rotation_deg = math.degrees(rotation)
+            origin = {
+                "latitude": pointA_lat,
+                "longitude": pointA_lon,
+                "pixel": {"x": pointA_px, "y": pointA_py},
+            }
 
         calibration_points_data = None
         if calibration_points:
@@ -121,24 +155,22 @@ def create_floorplan(
         # ---- Save metadata ----
         effective_name = site_name or name
         now = datetime.now(timezone.utc)
-        safe_capture_mode = capture_mode if capture_mode in {"outdoor", "indoor"} else "outdoor"
         floorplan_metadata = {
             "id": floorplan_id,
             "name": effective_name,
             "imageUrl": f"/sites/{site_name}/floorplan/{save_as}",
-            "scale": scale,
-            "rotation": rotation_deg,
-            "origin": {
-                "latitude": pointA_lat,
-                "longitude": pointA_lon,
-                "pixel": {"x": pointA_px, "y": pointA_py},
-            },
             "bounds": {"width": width, "height": height},
             "site_name": site_name,
             "capture_mode": safe_capture_mode,
             "created_at": existing_floorplan.get("created_at") if existing_floorplan else now,
             "updated_at": now,
         }
+        if scale is not None:
+            floorplan_metadata["scale"] = scale
+        if rotation_deg is not None:
+            floorplan_metadata["rotation"] = rotation_deg
+        if origin is not None:
+            floorplan_metadata["origin"] = origin
         if baseline_xer_url:
             floorplan_metadata["baseline_xer_url"] = baseline_xer_url
         if baseline_xer_name:
