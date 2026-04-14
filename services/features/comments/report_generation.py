@@ -13,9 +13,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 from core.config import (
     SITE_FLOORPLAN_DIRNAME,
+    SITES_DIR,
     TOUR_DETECT_DIRNAME,
     TOUR_DETECT_SEG_DIRNAME,
     TOUR_RAW_DIRNAME,
+    TOURS_DIR,
     site_storage_roots,
     tour_storage_roots,
     tour_comments_dir,
