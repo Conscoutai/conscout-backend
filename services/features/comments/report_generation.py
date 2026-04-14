@@ -265,20 +265,49 @@ def _decode_data_url_image(data_url: str, output_dir: str) -> Optional[str]:
 
 def _resolve_first_attachment_image(issue: dict, output_dir: str) -> Optional[str]:
     attachments = issue.get("image_attachments") or []
-    if not isinstance(attachments, list) or not attachments:
-        return None
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
+    direct_candidates = [
+        issue.get("attachment_url"),
+        issue.get("attachmentUrl"),
+        issue.get("image_url"),
+        issue.get("imageUrl"),
+        issue.get("evidence_image_url"),
+        issue.get("evidenceImageUrl"),
+    ]
+    raw_visual_evidence = issue.get("visual_evidence") or issue.get("visualEvidence")
+    if isinstance(raw_visual_evidence, list):
+        direct_candidates.extend(raw_visual_evidence)
+    elif raw_visual_evidence:
+        direct_candidates.append(raw_visual_evidence)
+    raw_attachments = issue.get("attachments")
+    if isinstance(raw_attachments, list):
+        direct_candidates.extend(raw_attachments)
+    elif raw_attachments:
+        direct_candidates.append(raw_attachments)
+
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            data_url = attachment.get("data_url") or attachment.get("url")
+            if not data_url:
+                continue
+            decoded = _decode_data_url_image(data_url, output_dir)
+            if decoded:
+                return decoded
+            resolved = _resolve_local_image_path(data_url)
+            if resolved:
+                return resolved
+
+    for candidate in direct_candidates:
+        if not isinstance(candidate, str):
             continue
-        data_url = attachment.get("data_url") or attachment.get("url")
-        if not data_url:
-            continue
-        decoded = _decode_data_url_image(data_url, output_dir)
+        decoded = _decode_data_url_image(candidate, output_dir)
         if decoded:
             return decoded
-        resolved = _resolve_local_image_path(data_url)
+        resolved = _resolve_local_image_path(candidate)
         if resolved:
             return resolved
+
     return None
 
 

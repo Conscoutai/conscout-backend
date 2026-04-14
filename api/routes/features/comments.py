@@ -50,6 +50,9 @@ class IssueCreate(BaseModel):
     image_attachments: Optional[List[IssueAttachment]] = None
     document_attachments: Optional[List[IssueAttachment]] = None
 
+    class Config:
+        extra = "allow"
+
 
 # =========================================================
 # Get ALL comments of a tour

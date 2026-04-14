@@ -4,11 +4,110 @@
 import time
 import uuid
 import math
+import mimetypes
 
 from fastapi import HTTPException
 
 from core.database import floorplans_collection, tours_collection
 from services.features.comments.report_generation import generate_issue_report_pdf
+
+
+def _first_non_empty_string(*values) -> str:
+    for value in values:
+        if value is None:
+            continue
+        parsed = str(value).strip()
+        if parsed and parsed.lower() != "null":
+            return parsed
+    return ""
+
+
+def _attachment_candidates(payload: dict) -> list:
+    return [
+        payload.get("attachments"),
+        payload.get("attachment"),
+        payload.get("attachment_url"),
+        payload.get("attachmentUrl"),
+        payload.get("image_url"),
+        payload.get("imageUrl"),
+        payload.get("visual_evidence"),
+        payload.get("visualEvidence"),
+        payload.get("evidence_image_url"),
+        payload.get("evidenceImageUrl"),
+    ]
+
+
+def _guess_attachment_type(url_or_path: str) -> str:
+    guessed, _ = mimetypes.guess_type(url_or_path)
+    return guessed or "image/jpeg"
+
+
+def _normalize_image_attachments(payload: dict) -> list[dict]:
+    normalized: list[dict] = []
+    seen: set[str] = set()
+
+    def add_candidate(item) -> None:
+        if item is None:
+            return
+        if isinstance(item, str):
+            url = item.strip()
+            if not url or url in seen:
+                return
+            seen.add(url)
+            normalized.append(
+                {
+                    "name": url.rsplit("/", 1)[-1] or "attachment",
+                    "type": _guess_attachment_type(url),
+                    "size": 0,
+                    "url": url,
+                }
+            )
+            return
+        if isinstance(item, dict):
+            url = _first_non_empty_string(
+                item.get("url"),
+                item.get("data_url"),
+                item.get("imageUrl"),
+                item.get("image_url"),
+                item.get("attachmentUrl"),
+                item.get("attachment_url"),
+                item.get("visualEvidence"),
+                item.get("visual_evidence"),
+                item.get("evidenceImageUrl"),
+                item.get("evidence_image_url"),
+                item.get("path"),
+                item.get("file"),
+            )
+            if not url or url in seen:
+                return
+            seen.add(url)
+            normalized.append(
+                {
+                    "name": _first_non_empty_string(
+                        item.get("name"), url.rsplit("/", 1)[-1], "attachment"
+                    ),
+                    "type": _first_non_empty_string(
+                        item.get("type"), _guess_attachment_type(url)
+                    ),
+                    "size": item.get("size") or 0,
+                    "url": item.get("url") or url,
+                    **({"data_url": item["data_url"]} if item.get("data_url") else {}),
+                }
+            )
+
+    existing = payload.get("image_attachments")
+    if isinstance(existing, list):
+        for item in existing:
+            add_candidate(item)
+
+    for candidate in _attachment_candidates(payload):
+        if isinstance(candidate, list):
+            for item in candidate:
+                add_candidate(item)
+        else:
+            add_candidate(candidate)
+
+    return normalized
 
 
 def get_all_comments(tour_id: str) -> dict:
@@ -221,6 +320,9 @@ def get_comments_for_pano(tour_id: str, pano_id: str, include_shared: bool = Fal
 
 def create_comment(payload: dict) -> dict:
     comment_data = {k: v for k, v in payload.items() if v is not None}
+    image_attachments = _normalize_image_attachments(comment_data)
+    if image_attachments:
+        comment_data["image_attachments"] = image_attachments
     comment_data["id"] = f"comment_{uuid.uuid4().hex}"
     comment_data["created_at"] = int(time.time() * 1000)
 
@@ -260,16 +362,51 @@ def delete_comment(comment_id: str) -> dict:
 
 
 def update_comment(comment_id: str, payload: dict) -> dict:
+    update_fields = {
+        "nodes.$[n].comments.$[b].updated_at": int(time.time() * 1000),
+    }
+
+    field_mapping = {
+        "title": "title",
+        "description": "description",
+        "severity": "severity",
+        "department": "department",
+        "discipline": "discipline",
+        "status": "status",
+        "issue_type": "issue_type",
+        "issueType": "issueType",
+        "type": "type",
+        "response": "response",
+        "action_required": "action_required",
+        "actionRequired": "actionRequired",
+        "action_request": "action_request",
+        "response_by": "response_by",
+        "responseBy": "responseBy",
+        "assigned_to": "assigned_to",
+        "assignedTo": "assignedTo",
+        "responsible_party": "responsible_party",
+        "attachment_url": "attachment_url",
+        "attachmentUrl": "attachmentUrl",
+        "image_url": "image_url",
+        "imageUrl": "imageUrl",
+        "evidence_image_url": "evidence_image_url",
+        "evidenceImageUrl": "evidenceImageUrl",
+        "visual_evidence": "visual_evidence",
+        "visualEvidence": "visualEvidence",
+    }
+    for payload_key, db_key in field_mapping.items():
+        if payload.get(payload_key) is not None:
+            update_fields[f"nodes.$[n].comments.$[b].{db_key}"] = payload.get(
+                payload_key
+            )
+
+    image_attachments = _normalize_image_attachments(payload)
+    if image_attachments:
+        update_fields["nodes.$[n].comments.$[b].image_attachments"] = image_attachments
+
     result = tours_collection.update_one(
         {"nodes.comments.id": comment_id},
-        {
-            "$set": {
-                "nodes.$[n].comments.$[b].status": payload.get("status"),
-                "nodes.$[n].comments.$[b].response": payload.get("response"),
-                "nodes.$[n].comments.$[b].response_by": payload.get("response_by"),
-                "nodes.$[n].comments.$[b].updated_at": int(time.time() * 1000),
-            }
-        },
+        {"$set": update_fields},
         array_filters=[
             {"n.comments": {"$exists": True}},
             {"b.id": comment_id},
