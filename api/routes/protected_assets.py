@@ -5,8 +5,9 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
+from core.auth_context import get_current_user
 from core.auth import require_authenticated_user
-from core.config import site_storage_roots, tour_storage_roots
+from core.config import DATA_DIR, site_storage_roots, tour_storage_roots
 from core.database import floorplans_collection, tours_collection
 
 
@@ -46,6 +47,39 @@ def _resolve_tour_doc_for_path(storage_key: str):
     return None
 
 
+def _append_unique_dir(base_dirs: list[str], candidate: str) -> None:
+    if candidate and candidate not in base_dirs:
+        base_dirs.append(candidate)
+
+
+def _tour_asset_roots(tour: dict) -> list[str]:
+    roots: list[str] = []
+
+    for base_dir in tour_storage_roots(
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+    ):
+        _append_unique_dir(roots, base_dir)
+
+    current_user = get_current_user()
+    if current_user:
+        for base_dir in tour_storage_roots(
+            owner_email=current_user.email,
+            owner_user_id=current_user.user_id,
+        ):
+            _append_unique_dir(roots, base_dir)
+
+    try:
+        for entry in os.listdir(DATA_DIR):
+            candidate = os.path.join(DATA_DIR, entry, "tours")
+            if os.path.isdir(candidate):
+                _append_unique_dir(roots, candidate)
+    except FileNotFoundError:
+        pass
+
+    return roots
+
+
 @router.get("/streetview/{asset_path:path}")
 def get_tour_asset(asset_path: str):
     normalized = asset_path.strip().lstrip("/")
@@ -59,10 +93,7 @@ def get_tour_asset(asset_path: str):
         raise HTTPException(status_code=404, detail="Tour asset not found.")
 
     file_path = _resolve_existing_file(
-        tour_storage_roots(
-            owner_email=tour.get("owner_email"),
-            owner_user_id=tour.get("owner_user_id"),
-        ),
+        _tour_asset_roots(tour),
         normalized,
     )
     return FileResponse(file_path, headers=_ASSET_CACHE_HEADERS)
