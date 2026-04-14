@@ -78,11 +78,13 @@ async def run_seg_ai_for_tour(
         tour_id,
         owner_email=owner_email,
         owner_user_id=owner_user_id,
+        site_name=site_name,
     )
     seg_dir = tour_detect_seg_dir(
         tour_id,
         owner_email=owner_email,
         owner_user_id=owner_user_id,
+        site_name=site_name,
     )
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(seg_dir, exist_ok=True)

@@ -4,6 +4,7 @@
 import base64
 import os
 import re
+import urllib.request
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
@@ -12,15 +13,16 @@ from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageFont
 
 from core.config import (
+    DATA_DIR,
     SITE_FLOORPLAN_DIRNAME,
     SITES_DIR,
     TOUR_DETECT_DIRNAME,
     TOUR_DETECT_SEG_DIRNAME,
+    TOUR_COMMENTS_DIRNAME,
     TOUR_RAW_DIRNAME,
     TOURS_DIR,
     site_storage_roots,
     tour_storage_roots,
-    tour_comments_dir,
 )
 
 
@@ -91,6 +93,31 @@ def _resolve_local_image_path(url_or_path: Optional[str]) -> Optional[str]:
     return None
 
 
+def _all_scoped_storage_roots(kind: str) -> list[str]:
+    roots: list[str] = []
+    base_root = TOURS_DIR if kind == "tours" else SITES_DIR
+    if base_root not in roots:
+        roots.append(base_root)
+    if os.path.isdir(DATA_DIR):
+        try:
+            for entry in os.listdir(DATA_DIR):
+                user_root = os.path.join(DATA_DIR, entry)
+                scoped_root = os.path.join(user_root, kind)
+                if os.path.isdir(scoped_root) and scoped_root not in roots:
+                    roots.append(scoped_root)
+                if kind == "tours":
+                    sites_root = os.path.join(user_root, "sites")
+                    if not os.path.isdir(sites_root):
+                        continue
+                    for site_name in os.listdir(sites_root):
+                        nested = os.path.join(sites_root, site_name, "tours")
+                        if os.path.isdir(nested) and nested not in roots:
+                            roots.append(nested)
+        except Exception:
+            pass
+    return roots
+
+
 def _resolve_local_image_path_for_owner(
     url_or_path: Optional[str],
     *,
@@ -108,7 +135,7 @@ def _resolve_local_image_path_for_owner(
 
     if raw_path.startswith("/streetview/"):
         rel = raw_path.replace("/streetview/", "").lstrip("/").replace("/", os.sep)
-        for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+        for root in [*tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id), *_all_scoped_storage_roots("tours")]:
             candidate = os.path.join(root, rel)
             if os.path.exists(candidate):
                 return candidate
@@ -117,16 +144,27 @@ def _resolve_local_image_path_for_owner(
         if len(parts) == 2 and parts[1].lower().endswith((".jpg", ".jpeg", ".png")):
             tour_id = parts[0]
             filename = parts[1]
-            for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+            for root in [*tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id), *_all_scoped_storage_roots("tours")]:
                 for subdir in (TOUR_RAW_DIRNAME, TOUR_DETECT_DIRNAME, TOUR_DETECT_SEG_DIRNAME):
                     alt = os.path.join(root, tour_id, subdir, filename)
                     if os.path.exists(alt):
                         return alt
+                try:
+                    for entry in os.listdir(root):
+                        candidate_dir = os.path.join(root, entry)
+                        if not os.path.isdir(candidate_dir) or not entry.endswith(f"__{tour_id}"):
+                            continue
+                        for subdir in (TOUR_RAW_DIRNAME, TOUR_DETECT_DIRNAME, TOUR_DETECT_SEG_DIRNAME):
+                            alt = os.path.join(candidate_dir, subdir, filename)
+                            if os.path.exists(alt):
+                                return alt
+                except Exception:
+                    continue
         return None
 
     if raw_path.startswith("/sites/"):
         rel = raw_path.replace("/sites/", "").lstrip("/").replace("/", os.sep)
-        for root in site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+        for root in [*site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id), *_all_scoped_storage_roots("sites")]:
             candidate = os.path.join(root, rel)
             if os.path.exists(candidate):
                 return candidate
@@ -135,7 +173,7 @@ def _resolve_local_image_path_for_owner(
     if raw_path.startswith("/floorplans/"):
         rel = raw_path.replace("/floorplans/", "").lstrip("/").replace("/", os.sep)
         filename = os.path.basename(rel)
-        for root in site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+        for root in [*site_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id), *_all_scoped_storage_roots("sites")]:
             candidate = os.path.join(root, rel)
             if os.path.exists(candidate):
                 return candidate
@@ -153,6 +191,28 @@ def _resolve_local_image_path_for_owner(
         return raw_path
 
     return _resolve_local_image_path(url_or_path)
+
+
+def _resolve_existing_tour_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> str:
+    suffix = f"__{tour_id}"
+    for root in [*tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id), *_all_scoped_storage_roots("tours")]:
+        direct = os.path.join(root, tour_id)
+        if os.path.isdir(direct):
+            return direct
+        try:
+            for entry in os.listdir(root):
+                candidate = os.path.join(root, entry)
+                if os.path.isdir(candidate) and entry.endswith(suffix):
+                    return candidate
+        except Exception:
+            continue
+    fallback_root = tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id)[0]
+    return os.path.join(fallback_root, tour_id)
 
 
 def _sanitize_filename(text: str) -> str:
@@ -265,7 +325,57 @@ def _decode_data_url_image(data_url: str, output_dir: str) -> Optional[str]:
     return path
 
 
-def _resolve_first_attachment_image(issue: dict, output_dir: str) -> Optional[str]:
+def _download_remote_image(url: str, output_dir: str) -> Optional[str]:
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    try:
+        parsed = urlparse(url)
+        ext = os.path.splitext(parsed.path)[1].lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+            ext = ".jpg"
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"remote_attachment_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}{ext}"
+        path = os.path.join(output_dir, filename)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "conscout-report-generator/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response, open(path, "wb") as handle:
+            handle.write(response.read())
+        return path if os.path.exists(path) else None
+    except Exception:
+        return None
+
+
+def _resolve_report_image_path(
+    candidate: Optional[str],
+    *,
+    output_dir: str,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> Optional[str]:
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    decoded = _decode_data_url_image(candidate, output_dir)
+    if decoded:
+        return decoded
+    resolved = _resolve_local_image_path_for_owner(
+        candidate,
+        owner_email=owner_email,
+        owner_user_id=owner_user_id,
+    )
+    if resolved:
+        return resolved
+    return _download_remote_image(candidate, output_dir)
+
+
+def _resolve_first_attachment_image(
+    issue: dict,
+    output_dir: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+) -> Optional[str]:
     attachments = issue.get("image_attachments") or []
     direct_candidates = [
         issue.get("attachment_url"),
@@ -293,20 +403,22 @@ def _resolve_first_attachment_image(issue: dict, output_dir: str) -> Optional[st
             data_url = attachment.get("data_url") or attachment.get("url")
             if not data_url:
                 continue
-            decoded = _decode_data_url_image(data_url, output_dir)
-            if decoded:
-                return decoded
-            resolved = _resolve_local_image_path(data_url)
+            resolved = _resolve_report_image_path(
+                data_url,
+                output_dir=output_dir,
+                owner_email=owner_email,
+                owner_user_id=owner_user_id,
+            )
             if resolved:
                 return resolved
 
     for candidate in direct_candidates:
-        if not isinstance(candidate, str):
-            continue
-        decoded = _decode_data_url_image(candidate, output_dir)
-        if decoded:
-            return decoded
-        resolved = _resolve_local_image_path(candidate)
+        resolved = _resolve_report_image_path(
+            candidate,
+            output_dir=output_dir,
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+        )
         if resolved:
             return resolved
 
@@ -357,7 +469,7 @@ def _annotate_pano_image(image_path: str, issue: dict, output_dir: str) -> str:
                 fill=(255, 0, 0),
             )
             draw.rectangle((x + radius + 6, y - 12, x + radius + 80, y + 8), fill=(255, 255, 255))
-            draw.text((x + radius + 10, y - 10), "ISSUE", fill=(220, 0, 0))
+            draw.text((x + radius + 10, y - 10), "COMMENT", fill=(220, 0, 0))
 
         out_path = os.path.join(output_dir, f"annotated_pano_{os.path.basename(safe_path)}")
         img.save(out_path, format="PNG")
@@ -673,10 +785,13 @@ def _add_image_with_caption(
 
 def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], floorplan: Optional[dict]) -> str:
     tour_id = tour.get("tour_id") or "tour_unknown"
-    output_dir = tour_comments_dir(
-        tour_id,
-        owner_email=tour.get("owner_email"),
-        owner_user_id=tour.get("owner_user_id"),
+    output_dir = os.path.join(
+        _resolve_existing_tour_dir(
+            tour_id,
+            owner_email=tour.get("owner_email"),
+            owner_user_id=tour.get("owner_user_id"),
+        ),
+        TOUR_COMMENTS_DIRNAME,
     )
     os.makedirs(output_dir, exist_ok=True)
 
@@ -706,6 +821,8 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
         owner_email=tour.get("owner_email"),
         owner_user_id=tour.get("owner_user_id"),
     )
+    if not pano_path:
+        pano_path = _download_remote_image(pano_url, output_dir)
 
     floorplan_url = floorplan.get("imageUrl") if floorplan else None
     floorplan_path = _resolve_local_image_path_for_owner(
@@ -713,6 +830,8 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
         owner_email=(floorplan or {}).get("owner_email"),
         owner_user_id=(floorplan or {}).get("owner_user_id"),
     )
+    if not floorplan_path:
+        floorplan_path = _download_remote_image(floorplan_url, output_dir)
 
     pano_annotated = _annotate_pano_image(pano_path, issue, output_dir) if pano_path else None
     floorplan_annotated = None
@@ -725,7 +844,12 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
     elif pano_path:
         pano_crop = _crop_issue_area(pano_path, issue, output_dir)
 
-    attachment_image = _resolve_first_attachment_image(issue, output_dir)
+    attachment_image = _resolve_first_attachment_image(
+        issue,
+        output_dir,
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+    )
 
     # Page 1 - Issue Overview (Combined)
     pdf.add_page()
@@ -798,15 +922,6 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
         max_height_ratio=0.28,
         output_dir=output_dir,
     )
-    if attachment_image:
-        _add_image_with_caption(
-            pdf,
-            "",
-            attachment_image,
-            "Additional photo evidence.",
-            max_height_ratio=0.25,
-            output_dir=output_dir,
-        )
     _end_section(pdf, section_start, pad_bottom=2)
 
     # Page 3 - Location Context

@@ -280,6 +280,11 @@ def save_indoor_tour_metadata(tour_id: str, payload: dict) -> dict:
     floorplan = floorplans_collection.find_one({"id": floorplan_id})
     if not floorplan:
         raise HTTPException(status_code=400, detail="Unknown floorplan_id")
+    site_name = (
+        floorplan.get("site_name")
+        or floorplan.get("dxf_project_id")
+        or floorplan.get("display_name")
+    )
     bounds = floorplan.get("bounds", {}) or {}
     bound_w = bounds.get("width")
     bound_h = bounds.get("height")
@@ -370,6 +375,7 @@ def save_indoor_tour_metadata(tour_id: str, payload: dict) -> dict:
                 "name": payload.get("tour_name") or "Indoor Video Tour",
                 "storage_key": desired_storage_key,
                 "floorplan_id": floorplan_id,
+                "site_name": site_name,
                 "created_at": int(created_at),
                 "nodes": nodes,
                 "panorama_url": build_streetview_url(desired_storage_key, "raw", "panorama.jpg"),

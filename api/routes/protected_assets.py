@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from core.auth_context import get_current_user
-from core.auth import require_authenticated_user
 from core.config import DATA_DIR, site_storage_roots, tour_storage_roots
 from core.database import floorplans_collection, tours_collection
 
 
-router = APIRouter(tags=["ProtectedAssets"], dependencies=[Depends(require_authenticated_user)])
+router = APIRouter(tags=["ProtectedAssets"])
 
 _ASSET_CACHE_HEADERS = {
     "Cache-Control": "private, max-age=86400, stale-while-revalidate=604800",
@@ -54,26 +52,27 @@ def _append_unique_dir(base_dirs: list[str], candidate: str) -> None:
 
 def _tour_asset_roots(tour: dict) -> list[str]:
     roots: list[str] = []
+    site_name = tour.get("site_name") or tour.get("site") or tour.get("project_id")
 
     for base_dir in tour_storage_roots(
         owner_email=tour.get("owner_email"),
         owner_user_id=tour.get("owner_user_id"),
+        site_name=site_name,
     ):
         _append_unique_dir(roots, base_dir)
-
-    current_user = get_current_user()
-    if current_user:
-        for base_dir in tour_storage_roots(
-            owner_email=current_user.email,
-            owner_user_id=current_user.user_id,
-        ):
-            _append_unique_dir(roots, base_dir)
 
     try:
         for entry in os.listdir(DATA_DIR):
             candidate = os.path.join(DATA_DIR, entry, "tours")
             if os.path.isdir(candidate):
                 _append_unique_dir(roots, candidate)
+            sites_root = os.path.join(DATA_DIR, entry, "sites")
+            if not os.path.isdir(sites_root):
+                continue
+            for site_entry in os.listdir(sites_root):
+                nested = os.path.join(sites_root, site_entry, "tours")
+                if os.path.isdir(nested):
+                    _append_unique_dir(roots, nested)
     except FileNotFoundError:
         pass
 

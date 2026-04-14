@@ -119,7 +119,18 @@ def user_sites_dir(*, owner_email: Optional[str] = None, owner_user_id: Optional
     )
 
 
-def user_tours_dir(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+def user_tours_dir(
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> str:
+    if site_name:
+        return os.path.join(
+            user_sites_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+            site_name,
+            "tours",
+        )
     return os.path.join(
         user_data_dir(owner_email=owner_email, owner_user_id=owner_user_id),
         "tours",
@@ -136,11 +147,27 @@ def site_storage_roots(*, owner_email: Optional[str] = None, owner_user_id: Opti
     return roots
 
 
-def tour_storage_roots(*, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> list[str]:
+def tour_storage_roots(
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> list[str]:
     roots: list[str] = []
-    scoped = user_tours_dir(owner_email=owner_email, owner_user_id=owner_user_id)
-    if scoped not in roots:
-        roots.append(scoped)
+    if site_name:
+        scoped_site = user_tours_dir(
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        )
+        if scoped_site not in roots:
+            roots.append(scoped_site)
+        global_site = os.path.join(SITES_DIR, site_name, "tours")
+        if global_site not in roots:
+            roots.append(global_site)
+    scoped_legacy = user_tours_dir(owner_email=owner_email, owner_user_id=owner_user_id)
+    if scoped_legacy not in roots:
+        roots.append(scoped_legacy)
     if TOURS_DIR not in roots:
         roots.append(TOURS_DIR)
     return roots
@@ -174,9 +201,14 @@ def tour_dir(
     *,
     owner_email: Optional[str] = None,
     owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
 ) -> str:
     suffix = f"__{tour_id}"
-    for root in tour_storage_roots(owner_email=owner_email, owner_user_id=owner_user_id):
+    for root in tour_storage_roots(
+        owner_email=owner_email,
+        owner_user_id=owner_user_id,
+        site_name=site_name,
+    ):
         direct = os.path.join(root, tour_id)
         if os.path.isdir(direct):
             return direct
@@ -188,31 +220,79 @@ def tour_dir(
         except FileNotFoundError:
             pass
     return os.path.join(
-        user_tours_dir(owner_email=owner_email, owner_user_id=owner_user_id),
+        user_tours_dir(
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        ),
         tour_id,
     )
 
-def tour_raw_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+def tour_raw_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> str:
     return os.path.join(
-        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        tour_dir(
+            tour_id,
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        ),
         TOUR_RAW_DIRNAME,
     )
 
-def tour_detect_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+def tour_detect_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> str:
     return os.path.join(
-        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        tour_dir(
+            tour_id,
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        ),
         TOUR_DETECT_DIRNAME,
     )
 
-def tour_detect_seg_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+def tour_detect_seg_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> str:
     return os.path.join(
-        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        tour_dir(
+            tour_id,
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        ),
         TOUR_DETECT_SEG_DIRNAME,
     )
 
-def tour_comments_dir(tour_id: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+def tour_comments_dir(
+    tour_id: str,
+    *,
+    owner_email: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    site_name: Optional[str] = None,
+) -> str:
     return os.path.join(
-        tour_dir(tour_id, owner_email=owner_email, owner_user_id=owner_user_id),
+        tour_dir(
+            tour_id,
+            owner_email=owner_email,
+            owner_user_id=owner_user_id,
+            site_name=site_name,
+        ),
         TOUR_COMMENTS_DIRNAME,
     )
 

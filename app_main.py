@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+load_dotenv()
+
 from api.router import api_router
 from core.auth import ensure_default_user_and_migrate_legacy_data
 from core.config import (
@@ -17,8 +19,6 @@ from core.config import (
     APP_VERSION,
     DATA_DIR,
 )
-
-load_dotenv()
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 

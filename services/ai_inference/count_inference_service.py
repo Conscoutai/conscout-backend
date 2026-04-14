@@ -56,11 +56,13 @@ async def run_count_ai_for_tour(
         tour_id,
         owner_email=owner_email,
         owner_user_id=owner_user_id,
+        site_name=site_name,
     )
     detect_dir = tour_detect_dir(
         tour_id,
         owner_email=owner_email,
         owner_user_id=owner_user_id,
+        site_name=site_name,
     )
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(detect_dir, exist_ok=True)

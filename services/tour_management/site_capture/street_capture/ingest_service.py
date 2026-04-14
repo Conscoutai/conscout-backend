@@ -242,6 +242,11 @@ def upload_streetview_image(
     floorplan = floorplans_collection.find_one({"id": floorplan_id})
     if not floorplan:
         raise HTTPException(400, "Unknown floorplan_id")
+    site_name = (
+        floorplan.get("site_name")
+        or floorplan.get("dxf_project_id")
+        or floorplan.get("display_name")
+    )
     x = y = None
     if _is_valid_lat_lon(lat, lon) and floorplan:
         x, y = gps_to_xy(lat, lon, floorplan)
@@ -269,6 +274,8 @@ def upload_streetview_image(
 
     if existing:
         update_set = {"storage_key": storage_key}
+        if site_name:
+            update_set["site_name"] = site_name
         if not existing.get("name") and tour_name:
             update_set["name"] = tour_name
         tours_collection.update_one(
@@ -281,6 +288,7 @@ def upload_streetview_image(
             "floorplan_id": floorplan["id"] if floorplan else None,
             "name": tour_name,
             "storage_key": storage_key,
+            "site_name": site_name,
             "created_at": int(time.time() * 1000),
             "nodes": [node],
         })

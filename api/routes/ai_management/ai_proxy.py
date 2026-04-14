@@ -14,6 +14,7 @@ from core.config import (
     AI_SYNC_TIMEOUT_SECONDS,
     tour_raw_dir,
 )
+from core.database import tours_collection
 
 router = APIRouter(tags=["AI"])
 logger = logging.getLogger(__name__)
@@ -25,7 +26,16 @@ def _ai_url(path: str) -> str:
 
 
 def _sync_streetview_images(tour_id: str) -> None:
-    tour_dir = tour_raw_dir(tour_id)
+    tour = tours_collection.find_one({"tour_id": tour_id})
+    if not tour:
+        raise HTTPException(404, f"Tour not found: {tour_id}")
+
+    tour_dir = tour_raw_dir(
+        tour_id,
+        owner_email=tour.get("owner_email"),
+        owner_user_id=tour.get("owner_user_id"),
+        site_name=tour.get("site_name") or tour.get("site") or tour.get("project_id"),
+    )
     if not os.path.isdir(tour_dir):
         raise HTTPException(404, f"Tour folder not found: {tour_id}")
 

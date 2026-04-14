@@ -68,6 +68,7 @@ async def sync_streetview_images(
         tour_id,
         owner_email=tour.get("owner_email"),
         owner_user_id=tour.get("owner_user_id"),
+        site_name=tour.get("site_name") or tour.get("site") or tour.get("project_id"),
     )
     os.makedirs(dest_dir, exist_ok=True)
 
