@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
 
+from core.auth import require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from core.config import DATA_DIR, site_storage_roots, tour_storage_roots
 from core.database import floorplans_collection, tours_collection
 
@@ -80,7 +82,10 @@ def _tour_asset_roots(tour: dict) -> list[str]:
 
 
 @router.get("/streetview/{asset_path:path}")
-def get_tour_asset(asset_path: str):
+def get_tour_asset(
+    asset_path: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     normalized = asset_path.strip().lstrip("/")
     parts = [part for part in normalized.split("/") if part]
     if len(parts) < 2:
@@ -99,7 +104,10 @@ def get_tour_asset(asset_path: str):
 
 
 @router.get("/sites/{asset_path:path}")
-def get_site_asset(asset_path: str):
+def get_site_asset(
+    asset_path: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     normalized = asset_path.strip().lstrip("/")
     parts = [part for part in normalized.split("/") if part]
     if len(parts) < 2:

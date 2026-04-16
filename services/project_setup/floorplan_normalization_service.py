@@ -16,6 +16,15 @@ def normalize_floorplan(fp: dict) -> dict:
     fp["site_config_exists"] = os.path.isfile(
         os.path.join(site_dir(site_name), "site_config.json")
     )
+    stakeholder_emails = fp.get("stakeholder_emails")
+    if isinstance(stakeholder_emails, list):
+        fp["stakeholder_emails"] = [
+            str(email).strip().lower()
+            for email in stakeholder_emails
+            if str(email).strip()
+        ]
+    else:
+        fp["stakeholder_emails"] = []
     if fp.get("capture_mode") not in {"outdoor", "indoor"}:
         fp["capture_mode"] = "outdoor"
     return fp

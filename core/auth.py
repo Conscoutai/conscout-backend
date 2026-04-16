@@ -29,6 +29,65 @@ DEFAULT_BOOTSTRAP_PASSWORD = "safwan123"
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def _resolve_stakeholder_projects_for_email(email: str) -> list[str]:
+    normalized_email = email.strip().lower()
+    if not normalized_email:
+        return []
+
+    projects: set[str] = set()
+    for floorplan in raw_floorplans_collection.find(
+        {"stakeholder_emails": normalized_email},
+        {"site_name": 1, "dxf_project_id": 1},
+    ):
+        site_name = (
+            str(
+                floorplan.get("site_name")
+                or floorplan.get("dxf_project_id")
+                or ""
+            ).strip()
+        )
+        if site_name:
+            projects.add(site_name)
+    return sorted(projects)
+
+
+def _resolve_accessible_floorplan_ids(project_names: list[str]) -> list[str]:
+    if not project_names:
+        return []
+    floorplan_ids: set[str] = set()
+    for floorplan in raw_floorplans_collection.find(
+        {
+            "$or": [
+                {"site_name": {"$in": project_names}},
+                {"dxf_project_id": {"$in": project_names}},
+            ]
+        },
+        {"id": 1},
+    ):
+        floorplan_id = str(floorplan.get("id") or "").strip()
+        if floorplan_id:
+            floorplan_ids.add(floorplan_id)
+    return sorted(floorplan_ids)
+
+
+def _build_user_access_payload(user: dict) -> dict:
+    invited_projects = _resolve_stakeholder_projects_for_email(user.get("email", ""))
+    role = "stakeholder" if invited_projects else "admin"
+    return {
+        "role": role,
+        "accessible_project_names": invited_projects,
+        "accessible_floorplan_ids": _resolve_accessible_floorplan_ids(invited_projects),
+    }
+
+
+def ensure_admin_user(user: AuthenticatedUser) -> None:
+    if user.role == "stakeholder":
+        raise HTTPException(
+            status_code=403,
+            detail="Stakeholders have read and comment access only.",
+        )
+
+
 def _hash_password(password: str, *, salt: Optional[str] = None) -> str:
     resolved_salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
@@ -72,6 +131,7 @@ def bootstrap_default_user() -> dict:
         "email": DEFAULT_BOOTSTRAP_EMAIL,
         "name": "Safwan",
         "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
+        "role": "admin",
         "session_token": "",
         "created_at": now,
         "updated_at": now,
@@ -200,11 +260,15 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
     return user
 
 
-def create_user(*, name: str, email: str, password: str) -> dict:
+def create_user(*, name: str, email: str, password: str, role: str = "admin") -> dict:
     normalized_email = email.strip().lower()
     existing = raw_users_collection.find_one({"email": normalized_email})
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    normalized_role = role.strip().lower()
+    if normalized_role not in {"admin", "stakeholder"}:
+        raise HTTPException(status_code=400, detail="Role must be admin or stakeholder.")
 
     now = int(__import__("time").time() * 1000)
     doc = {
@@ -212,6 +276,7 @@ def create_user(*, name: str, email: str, password: str) -> dict:
         "email": normalized_email,
         "name": name.strip(),
         "password_hash": _hash_password(password),
+        "role": normalized_role,
         "session_token": "",
         "created_at": now,
         "updated_at": now,
@@ -222,20 +287,31 @@ def create_user(*, name: str, email: str, password: str) -> dict:
 
 def start_user_session(user: dict) -> dict:
     token = issue_session_token()
+    access_payload = _build_user_access_payload(user)
     raw_users_collection.update_one(
         {"_id": user["_id"]},
-        {"$set": {"session_token": token, "updated_at": int(__import__("time").time() * 1000)}},
+        {
+            "$set": {
+                "session_token": token,
+                "role": access_payload["role"],
+                "updated_at": int(__import__("time").time() * 1000),
+            }
+        },
     )
     refreshed = raw_users_collection.find_one({"_id": user["_id"]}) or user
     refreshed["session_token"] = token
+    refreshed["role"] = access_payload["role"]
     return refreshed
 
 
 def sanitize_user_payload(user: dict) -> dict:
+    access_payload = _build_user_access_payload(user)
     return {
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
         "name": user.get("name", ""),
+        "role": access_payload["role"],
+        "accessible_project_names": access_payload["accessible_project_names"],
     }
 
 
@@ -253,10 +329,14 @@ async def require_authenticated_user(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session token.")
 
+    access_payload = _build_user_access_payload(user)
     auth_user = AuthenticatedUser(
         user_id=user.get("user_id", ""),
         email=user.get("email", ""),
         name=user.get("name", ""),
+        role=access_payload["role"],
+        accessible_project_names=tuple(access_payload["accessible_project_names"]),
+        accessible_floorplan_ids=tuple(access_payload["accessible_floorplan_ids"]),
     )
     context_token = set_current_user(auth_user)
     try:

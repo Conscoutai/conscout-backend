@@ -1,9 +1,11 @@
 from typing import Literal
 
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
-from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from core.database import floorplans_collection
+from core.auth import ensure_admin_user, require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from core.config import ENABLE_DXF_PROCESSING
 from services.project_setup.dxf_service import DXFService
 from services.project_setup.floorplan_normalization_service import (
@@ -35,6 +37,10 @@ class RenameProjectRequest(BaseModel):
 class CaptureModeRequest(BaseModel):
     capture_mode: Literal["outdoor", "indoor"]
 
+
+class StakeholderEmailRequest(BaseModel):
+    email: str
+
 #Lists projects
 @router.get("/projects")
 def list_projects():
@@ -64,7 +70,11 @@ def get_project_floorplan(site_name: str):
 
 #Deletes a project and related assets.
 @router.delete("/projects/{site_name}")
-def delete_project(site_name: str):
+def delete_project(
+    site_name: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     if not site_name:
         raise HTTPException(400, "Project name is required")
 
@@ -73,7 +83,12 @@ def delete_project(site_name: str):
 
 
 @router.patch("/projects/{site_name}/rename")
-def rename_project(site_name: str, payload: RenameProjectRequest):
+def rename_project(
+    site_name: str,
+    payload: RenameProjectRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     rename_project_service(site_name, payload.new_site_name)
     return {
         "status": "renamed",
@@ -83,7 +98,12 @@ def rename_project(site_name: str, payload: RenameProjectRequest):
 
 
 @router.patch("/projects/{site_name}/capture-mode")
-def update_project_capture_mode(site_name: str, payload: CaptureModeRequest):
+def update_project_capture_mode(
+    site_name: str,
+    payload: CaptureModeRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     if not site_name:
         raise HTTPException(400, "Project name is required")
 
@@ -103,7 +123,12 @@ def update_project_capture_mode(site_name: str, payload: CaptureModeRequest):
 
 #Uploads/updates site config JSON.
 @router.put("/projects/{site_name}/site-config")
-async def upload_site_config(site_name: str, site_config: UploadFile = File(...)):
+async def upload_site_config(
+    site_name: str,
+    site_config: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     if not site_name:
         raise HTTPException(400, "Site name is required")
     if not site_config.filename or not site_config.filename.lower().endswith(".json"):
@@ -119,7 +144,9 @@ async def update_project_assets(
     site_name: str,
     site_config: UploadFile = File(None),
     dxf_zip: UploadFile = File(None),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
+    ensure_admin_user(current_user)
     if not site_name:
         raise HTTPException(400, "Site name is required")
     if not site_config and not dxf_zip:
@@ -164,4 +191,64 @@ async def update_project_assets(
             "dxf": bool(dxf_zip),
         },
         "total_objects": len(site_objects),
+    }
+
+
+@router.get("/projects/{site_name}/stakeholders")
+def list_project_stakeholders(
+    site_name: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    floorplan = floorplans_collection.find_one(
+        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        sort=[("_id", -1)],
+    )
+    if not floorplan:
+        raise HTTPException(404, "No floorplan found for this project")
+    return {
+        "site_name": site_name,
+        "stakeholder_emails": floorplan.get("stakeholder_emails", []),
+    }
+
+
+@router.post("/projects/{site_name}/stakeholders")
+def add_project_stakeholder(
+    site_name: str,
+    payload: StakeholderEmailRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    normalized_email = payload.email.strip().lower()
+    update = floorplans_collection.update_many(
+        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        {"$addToSet": {"stakeholder_emails": normalized_email}},
+    )
+    if update.matched_count == 0:
+        raise HTTPException(404, "No floorplan found for this project")
+    return {
+        "message": "Stakeholder added",
+        "site_name": site_name,
+        "email": normalized_email,
+    }
+
+
+@router.delete("/projects/{site_name}/stakeholders")
+def remove_project_stakeholder(
+    site_name: str,
+    payload: StakeholderEmailRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    normalized_email = payload.email.strip().lower()
+    update = floorplans_collection.update_many(
+        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        {"$pull": {"stakeholder_emails": normalized_email}},
+    )
+    if update.matched_count == 0:
+        raise HTTPException(404, "No floorplan found for this project")
+    return {
+        "message": "Stakeholder removed",
+        "site_name": site_name,
+        "email": normalized_email,
     }

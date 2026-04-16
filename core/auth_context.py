@@ -10,6 +10,9 @@ class AuthenticatedUser:
     user_id: str
     email: str
     name: str = ""
+    role: str = "admin"
+    accessible_project_names: tuple[str, ...] = ()
+    accessible_floorplan_ids: tuple[str, ...] = ()
 
 
 _current_user: ContextVar[Optional[AuthenticatedUser]] = ContextVar(
@@ -35,14 +38,37 @@ def merge_owner_filter(filter_doc: Optional[dict[str, Any]] = None) -> dict[str,
     if user is None:
         return dict(filter_doc or {})
 
-    owner_clause = {"owner_user_id": user.user_id}
+    if user.role == "stakeholder":
+        access_clauses: list[dict[str, Any]] = []
+        if user.accessible_project_names:
+            access_clauses.extend(
+                [
+                    {"site_name": {"$in": list(user.accessible_project_names)}},
+                    {"dxf_project_id": {"$in": list(user.accessible_project_names)}},
+                    {"project_id": {"$in": list(user.accessible_project_names)}},
+                ]
+            )
+        if user.accessible_floorplan_ids:
+            access_clauses.append(
+                {"floorplan_id": {"$in": list(user.accessible_floorplan_ids)}}
+            )
+
+        if not access_clauses:
+            access_clause = {"_id": {"$exists": False}}
+        elif len(access_clauses) == 1:
+            access_clause = access_clauses[0]
+        else:
+            access_clause = {"$or": access_clauses}
+    else:
+        access_clause = {"owner_user_id": user.user_id}
+
     if not filter_doc:
-        return owner_clause
+        return access_clause
 
     scoped = dict(filter_doc)
     if "$and" in scoped and isinstance(scoped["$and"], list):
-        return {**scoped, "$and": [*scoped["$and"], owner_clause]}
-    return {"$and": [scoped, owner_clause]}
+        return {**scoped, "$and": [*scoped["$and"], access_clause]}
+    return {"$and": [scoped, access_clause]}
 
 
 def stamp_owned_document(document: dict[str, Any]) -> dict[str, Any]:

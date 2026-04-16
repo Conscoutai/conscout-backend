@@ -1,8 +1,10 @@
 from typing import Literal, Optional
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 
 from core.config import DEFAULT_SITE_NAME, ENABLE_DXF_PROCESSING
+from core.auth import ensure_admin_user, require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from services.project_setup.floorplan_service import create_floorplan
 from services.project_setup.site_config_service import (
     save_site_config_and_try_parse,
@@ -40,7 +42,9 @@ async def create_project_floorplan(
     site_config: Optional[UploadFile] = File(None),
     baseline_xer: Optional[UploadFile] = File(None),
     capture_mode: Literal["outdoor", "indoor"] = Form("outdoor"),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
+    ensure_admin_user(current_user)
     normalized_form_site = (site_name_form or "").strip()
     if normalized_form_site and normalized_form_site != site_name:
         raise HTTPException(400, "Path site_name and form site_name must match")

@@ -1,8 +1,10 @@
 import time
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
 
+from core.auth import ensure_admin_user, require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from core.database import floorplans_collection, tours_collection
 from services.progress.overall.coverage_service import build_coverage_payload
 from services.progress.overall.progress_engine import calculate_progress
@@ -25,7 +27,9 @@ async def upload_street_capture(
     image: UploadFile = File(...),
     tour_name: str = Form(""),
     floorplan_id: Optional[str] = Form(None),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
+    ensure_admin_user(current_user)
     return upload_street_capture_image(
         tour_id=tour_id,
         image=image,
@@ -54,13 +58,22 @@ def all_street_capture_tours():
 
 @router.delete("/site-capture/street-capture/delete/{tour_id}")
 @router.delete("/delete-streetview-tour/{tour_id}")
-def delete_street_capture(tour_id: str):
+def delete_street_capture(
+    tour_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     return delete_street_capture_tour(tour_id)
 
 
 @router.put("/site-capture/street-capture/rename/{tour_id}")
 @router.put("/rename-streetview-tour/{tour_id}")
-async def rename_street_capture(tour_id: str, payload: dict):
+async def rename_street_capture(
+    tour_id: str,
+    payload: dict,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     try:
         return rename_street_capture_tour(tour_id, payload.get("name", ""))
     except ValueError as error:
@@ -71,7 +84,12 @@ async def rename_street_capture(tour_id: str, payload: dict):
 
 @router.post("/site-capture/street-capture/save/{tour_id}")
 @router.post("/save-tour/{tour_id}")
-async def save_street_capture_tour(tour_id: str, payload: dict):
+async def save_street_capture_tour(
+    tour_id: str,
+    payload: dict,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     tour = tours_collection.find_one({"tour_id": tour_id})
     if not tour:
         raise HTTPException(404, "Tour not found")
@@ -112,7 +130,12 @@ async def save_street_capture_tour(tour_id: str, payload: dict):
 
 @router.post("/site-capture/street-capture/coverage/{tour_id}")
 @router.post("/tour-coverage/{tour_id}")
-async def save_street_capture_coverage(tour_id: str, payload: dict):
+async def save_street_capture_coverage(
+    tour_id: str,
+    payload: dict,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     tour = tours_collection.find_one({"tour_id": tour_id})
     if not tour:
         raise HTTPException(status_code=404, detail="Tour not found")

@@ -1,8 +1,10 @@
 from typing import List, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, validator
 
+from core.auth import ensure_admin_user, require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from services.progress.work_schedule.work_schedule_service import (
     latest_work_schedule as latest_work_schedule_service,
     list_work_schedules as list_work_schedules_service,
@@ -48,7 +50,11 @@ class WorkScheduleRequest(BaseModel):
 
 # Saves a work schedule (manual/csv source with activities).
 @router.post("/work-schedules")
-def save_work_schedule(payload: WorkScheduleRequest):
+def save_work_schedule(
+    payload: WorkScheduleRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
     return save_work_schedule_service(
         project_id=payload.project_id,
         source=payload.source,
