@@ -476,7 +476,7 @@ def _annotate_pano_image(image_path: str, issue: dict, output_dir: str) -> str:
         return out_path
 
 
-def _crop_issue_area(image_path: str, issue: dict, output_dir: str, crop_ratio: float = 0.25) -> Optional[str]:
+def _crop_issue_area(image_path: str, issue: dict, output_dir: str, crop_ratio: float = 0.14) -> Optional[str]:
     safe_path = _ensure_png(image_path, output_dir)
     with Image.open(safe_path) as img:
         img = img.convert("RGB")
@@ -495,8 +495,10 @@ def _crop_issue_area(image_path: str, issue: dict, output_dir: str, crop_ratio: 
         else:
             x, y = width // 2, height // 2
 
-        crop_w = int(width * crop_ratio)
-        crop_h = int(height * crop_ratio)
+        crop_w = max(120, int(width * crop_ratio))
+        crop_h = max(90, int(height * crop_ratio))
+        crop_w = min(crop_w, width)
+        crop_h = min(crop_h, height)
         half_w = max(1, crop_w // 2)
         half_h = max(1, crop_h // 2)
 
@@ -783,6 +785,367 @@ def _add_image_with_caption(
         _add_caption(pdf, caption)
 
 
+def _first_text(*values: Optional[str], default: str = "N/A") -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() != "null":
+            return text
+    return default
+
+
+def _format_role(value: Optional[str]) -> str:
+    text = _first_text(value, default="N/A")
+    return text.replace("_", " ").title()
+
+
+def _days_open(issue: dict) -> str:
+    raw_created = issue.get("created_at")
+    if not raw_created:
+        return "0"
+    try:
+        created = datetime.fromtimestamp(int(raw_created) / 1000)
+    except Exception:
+        return "0"
+    return str(max(0, (datetime.now() - created).days))
+
+
+def _add_report_header(
+    pdf: FPDF,
+    *,
+    report_id: str,
+    report_timestamp: str,
+) -> None:
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    left_w = 54
+    right_w = 64
+    center_w = page_w - left_w - right_w
+    y = pdf.get_y()
+
+    mark_x = pdf.l_margin + 3
+    mark_y = y + 2
+    pdf.set_draw_color(15, 72, 128)
+    pdf.set_fill_color(20, 88, 170)
+    pdf.rect(mark_x, mark_y, 13, 13, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_xy(mark_x, mark_y + 4)
+    pdf.cell(13, 4, "CM", align="C")
+
+    pdf.set_text_color(12, 29, 55)
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.set_xy(pdf.l_margin + 18, y + 3)
+    pdf.cell(left_w - 18, 4, _latin1("CONSTRUCTION"), ln=2)
+    pdf.cell(left_w - 18, 4, _latin1("MONITOR"))
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_xy(pdf.l_margin + left_w, y + 4)
+    pdf.cell(center_w, 7, _latin1("CONSTRUCTION ISSUE REPORT"), align="C")
+
+    pdf.set_draw_color(190, 196, 206)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_xy(pdf.l_margin + left_w + center_w, y + 1)
+    label_w = 25
+    pdf.set_font("Helvetica", "B", 6.8)
+    pdf.cell(label_w, 6, _latin1("Report ID"), border=1)
+    pdf.set_font("Helvetica", "", 6.8)
+    pdf.cell(right_w - label_w, 6, _latin1(report_id), border=1, ln=2)
+    pdf.set_x(pdf.l_margin + left_w + center_w)
+    pdf.set_font("Helvetica", "B", 6.8)
+    pdf.cell(label_w, 6, _latin1("Date Generated"), border=1)
+    pdf.set_font("Helvetica", "", 6.8)
+    pdf.cell(right_w - label_w, 6, _latin1(report_timestamp), border=1)
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(y + 20)
+
+
+def _add_info_row(pdf: FPDF, items: list[tuple[str, str]]) -> None:
+    available_w = pdf.w - pdf.l_margin - pdf.r_margin
+    cell_w = available_w / max(1, len(items))
+    start_y = pdf.get_y()
+    heights: list[float] = []
+    for label, value in items:
+        lines = _estimate_line_count(pdf, value, cell_w - 4)
+        heights.append(9 + (lines * 4))
+    row_h = max(18, max(heights))
+
+    pdf.set_draw_color(215, 220, 230)
+    for index, (label, value) in enumerate(items):
+        x = pdf.l_margin + (cell_w * index)
+        pdf.rect(x, start_y, cell_w, row_h)
+        pdf.set_xy(x + 2, start_y + 2)
+        pdf.set_font("Helvetica", "B", 7.5)
+        pdf.set_text_color(94, 105, 124)
+        pdf.cell(cell_w - 4, 4, _latin1(label.upper()), ln=2)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(25, 32, 45)
+        pdf.multi_cell(cell_w - 4, 4, _latin1(value))
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(start_y + row_h + 4)
+
+
+def _ensure_space(pdf: FPDF, required_h: float) -> None:
+    if pdf.get_y() + required_h > pdf.page_break_trigger:
+        pdf.add_page()
+
+
+def _add_card_title(pdf: FPDF, title: str, height: float = 7) -> None:
+    pdf.set_fill_color(239, 243, 248)
+    pdf.set_draw_color(207, 215, 226)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(30, 41, 59)
+    pdf.cell(0, height, _latin1(title.upper()), border=1, ln=True, fill=True)
+    pdf.set_text_color(0, 0, 0)
+
+
+def _estimate_line_count(pdf: FPDF, text: str, width: float) -> int:
+    pdf.set_font("Helvetica", "", 9)
+    total = 0
+    for paragraph in _latin1(text).replace("\r", "").split("\n"):
+        words = paragraph.split()
+        if not words:
+            total += 1
+            continue
+        lines = 1
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if pdf.get_string_width(candidate) <= width:
+                current = candidate
+                continue
+            lines += 1
+            current = word
+        total += lines
+    return max(1, total)
+
+
+def _add_text_card(pdf: FPDF, title: str, text: str, min_h: float = 20) -> None:
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    lines = _estimate_line_count(pdf, text, usable_w - 6)
+    card_h = max(min_h, 8 + (lines * 5))
+    _ensure_space(pdf, card_h + 7)
+    start_y = pdf.get_y()
+    _add_card_title(pdf, title)
+    pdf.set_xy(pdf.l_margin, start_y + 7)
+    pdf.set_draw_color(207, 215, 226)
+    pdf.rect(pdf.l_margin, start_y + 7, usable_w, card_h - 7)
+    pdf.set_xy(pdf.l_margin + 3, start_y + 10)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.multi_cell(usable_w - 6, 5, _latin1(text))
+    pdf.set_y(start_y + card_h + 4)
+
+
+def _add_issue_summary_card(
+    pdf: FPDF,
+    *,
+    issue_title: str,
+    issue_type: str,
+    severity: str,
+    priority: str,
+    days_open: str,
+) -> None:
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    _ensure_space(30)
+    y = pdf.get_y()
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(15, 72, 128)
+    pdf.cell(0, 5, _latin1("1. ISSUE SUMMARY"), ln=True)
+    y = pdf.get_y()
+    row_h = 21
+    pdf.set_draw_color(207, 215, 226)
+    pdf.rect(pdf.l_margin, y, usable_w, row_h)
+
+    icon_w = 18
+    x = pdf.l_margin + 3
+    pdf.set_fill_color(225, 112, 36)
+    pdf.ellipse(x, y + 5, 10, 10, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_xy(x, y + 7)
+    pdf.cell(10, 4, "!", align="C")
+
+    items = [
+        ("Issue Title", issue_title, 50),
+        ("Issue Type", issue_type, 36),
+        ("Severity", severity, 32),
+        ("Priority", priority, 32),
+        ("Days Open", days_open, usable_w - icon_w - 150),
+    ]
+    x = pdf.l_margin + icon_w
+    for index, (label, value, width) in enumerate(items):
+        if index > 0:
+            pdf.set_draw_color(207, 215, 226)
+            pdf.line(x, y + 3, x, y + row_h - 3)
+        pdf.set_xy(x + 3, y + 5)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(35, 45, 60)
+        pdf.cell(width - 6, 4, _latin1(label), ln=2)
+        pdf.set_font("Helvetica", "B", 8.5)
+        if label in {"Severity", "Priority"}:
+            pdf.set_text_color(225, 112, 36)
+        else:
+            pdf.set_text_color(12, 29, 55)
+        pdf.cell(width - 6, 5, _latin1(value))
+        x += width
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(y + row_h + 5)
+
+
+def _add_two_column_cards(
+    pdf: FPDF,
+    left: tuple[str, str],
+    right: tuple[str, str],
+    min_h: float = 22,
+) -> None:
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    gap = 4
+    card_w = (usable_w - gap) / 2
+    left_lines = _estimate_line_count(pdf, left[1], card_w - 6)
+    right_lines = _estimate_line_count(pdf, right[1], card_w - 6)
+    card_h = max(min_h, 8 + (max(left_lines, right_lines) * 5))
+    _ensure_space(pdf, card_h + 4)
+    y = pdf.get_y()
+
+    for x, (title, text) in ((pdf.l_margin, left), (pdf.l_margin + card_w + gap, right)):
+        pdf.set_xy(x, y)
+        pdf.set_fill_color(239, 243, 248)
+        pdf.set_draw_color(207, 215, 226)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(card_w, 7, _latin1(title.upper()), border=1, ln=True, fill=True)
+        pdf.set_xy(x, y + 7)
+        pdf.rect(x, y + 7, card_w, card_h - 7)
+        pdf.set_xy(x + 3, y + 10)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(card_w - 6, 5, _latin1(text))
+
+    pdf.set_y(y + card_h + 4)
+
+
+def _image_dims_for_box(image_path: Optional[str], box_w: float, box_h: float) -> tuple[float, float]:
+    if not image_path:
+        return box_w, box_h
+    try:
+        with Image.open(image_path) as img:
+            img_w, img_h = img.size
+            if img_w <= 0 or img_h <= 0:
+                return box_w, box_h
+            ratio = min(box_w / img_w, box_h / img_h)
+            return img_w * ratio, img_h * ratio
+    except Exception:
+        return box_w, box_h
+
+
+def _add_visual_evidence_row(
+    pdf: FPDF,
+    left_image: Optional[str],
+    right_image: Optional[str],
+    *,
+    output_dir: str,
+) -> None:
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    gap = 4
+    card_w = (usable_w - gap) / 2
+    title_h = 7
+    box_h = 54
+    card_h = title_h + box_h + 9
+    _ensure_space(card_h + 4)
+    y = pdf.get_y()
+
+    for x, title, image_path, caption in (
+        (pdf.l_margin, "Visual Evidence", left_image, "360 capture with issue marker"),
+        (pdf.l_margin + card_w + gap, "Issue Area", right_image, "Focused view of issue area"),
+    ):
+        pdf.set_xy(x, y)
+        pdf.set_fill_color(239, 243, 248)
+        pdf.set_draw_color(207, 215, 226)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(card_w, title_h, _latin1(title.upper()), border=1, ln=True, fill=True)
+        pdf.set_xy(x, y + title_h)
+        pdf.rect(x, y + title_h, card_w, box_h + 9)
+        if image_path:
+            safe_path = _ensure_png(image_path, output_dir)
+            img_w, img_h = _image_dims_for_box(safe_path, card_w - 6, box_h - 4)
+            pdf.image(safe_path, x=x + (card_w - img_w) / 2, y=y + title_h + 2, w=img_w, h=img_h)
+        else:
+            pdf.set_xy(x + 3, y + title_h + 20)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(card_w - 6, 5, _latin1("Image not available."), align="C")
+        pdf.set_xy(x + 3, y + title_h + box_h + 2)
+        pdf.set_font("Helvetica", "I", 7.5)
+        pdf.set_text_color(94, 105, 124)
+        pdf.cell(card_w - 6, 4, _latin1(caption), align="C")
+        pdf.set_text_color(0, 0, 0)
+
+    pdf.set_y(y + card_h + 4)
+
+
+def _add_location_details(
+    pdf: FPDF,
+    *,
+    issue: dict,
+    floorplan_annotated: Optional[str],
+    output_dir: str,
+) -> None:
+    _ensure_space(62)
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    y = pdf.get_y()
+    _add_card_title(pdf, "Location Details")
+    body_y = y + 7
+    body_h = 55
+    left_w = 72
+    pdf.rect(pdf.l_margin, body_y, usable_w, body_h)
+    pdf.set_xy(pdf.l_margin + 3, body_y + 4)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(28, 5, _latin1("Area"), ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(left_w - 31, 5, _latin1(_first_text(issue.get("area"), issue.get("location_area"), issue.get("locationArea"))))
+    pdf.set_x(pdf.l_margin + 3)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(28, 5, _latin1("Pano ID"), ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(left_w - 31, 5, _latin1(_first_text(issue.get("pano_id"))))
+    pdf.set_x(pdf.l_margin + 3)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(28, 5, _latin1("Orientation"), ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(left_w - 31, 5, _latin1(_format_view(issue) or "N/A"))
+
+    img_x = pdf.l_margin + left_w + 3
+    img_w = usable_w - left_w - 6
+    if floorplan_annotated:
+        safe_path = _ensure_png(floorplan_annotated, output_dir)
+        draw_w, draw_h = _image_dims_for_box(safe_path, img_w, body_h - 6)
+        pdf.image(safe_path, x=img_x + (img_w - draw_w) / 2, y=body_y + 3, w=draw_w, h=draw_h)
+    else:
+        pdf.set_xy(img_x, body_y + 20)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(img_w, 5, _latin1("Floorplan not available."), align="C")
+    pdf.set_y(body_y + body_h + 4)
+
+
+def _add_activity_log(pdf: FPDF, rows: list[tuple[str, str, str]]) -> None:
+    _ensure_space(40)
+    _add_card_title(pdf, "Activity Log")
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+    col_event = 48
+    col_user = 60
+    col_time = usable_w - col_event - col_user
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_fill_color(248, 250, 252)
+    pdf.cell(col_event, 6, _latin1("Event"), border=1, fill=True)
+    pdf.cell(col_user, 6, _latin1("User"), border=1, fill=True)
+    pdf.cell(col_time, 6, _latin1("Timestamp"), border=1, fill=True, ln=True)
+    pdf.set_font("Helvetica", "", 8)
+    for event, user, timestamp in rows:
+        pdf.cell(col_event, 6, _latin1(event), border=1)
+        pdf.cell(col_user, 6, _latin1(user or "N/A"), border=1)
+        pdf.cell(col_time, 6, _latin1(timestamp), border=1, ln=True)
+    pdf.ln(4)
+
+
 def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], floorplan: Optional[dict]) -> str:
     tour_id = tour.get("tour_id") or "tour_unknown"
     output_dir = os.path.join(
@@ -850,146 +1213,165 @@ def generate_issue_report_pdf(*, issue: dict, tour: dict, node: Optional[dict], 
         owner_email=tour.get("owner_email"),
         owner_user_id=tour.get("owner_user_id"),
     )
+    zoomed_issue_image = pano_crop
+    if not zoomed_issue_image and attachment_image:
+        zoomed_issue_image = _crop_issue_area(attachment_image, issue, output_dir)
+    if not zoomed_issue_image and pano_path:
+        zoomed_issue_image = _crop_issue_area(pano_path, issue, output_dir)
 
-    # Page 1 - Issue Overview (Combined)
-    pdf.add_page()
-    _add_page_title(pdf, "Issue Overview")
-    section_start = _begin_section(pdf, "Executive Summary")
-    _add_kv_row(pdf, "Project Name", tour.get("project_name") or tour.get("name") or tour.get("tour_id") or "N/A")
-    _add_kv_row(pdf, "Location / Tour Name", tour.get("name") or tour.get("tour_id") or "N/A")
-    _add_kv_row(pdf, "Issue Title", issue_name)
-    _add_kv_row(pdf, "Issue ID", issue_id)
-    _add_kv_row(pdf, "Issue Type", issue_type)
-    _add_priority_row(pdf, "Priority", priority)
-    _add_kv_row(pdf, "Current Status", status)
-    _add_kv_row(pdf, "Report Generated", report_timestamp)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(
-        0,
-        5,
-        _latin1(
-            "This report documents a site issue identified through 360° site capture, "
-            "including visual evidence, corrective action, and current status."
-        ),
+    project_name = _first_text(
+        tour.get("site_name"),
+        tour.get("siteName"),
+        (floorplan or {}).get("site_name"),
+        (floorplan or {}).get("siteName"),
+        tour.get("project_name"),
+        default="N/A",
     )
-    _end_section(pdf, section_start, pad_bottom=3)
-
-    section_start = _begin_section(pdf, "Issue Details")
-    _add_section_title(pdf, "Problem Description")
-    _add_paragraph(pdf, issue.get("problem_description") or issue.get("description") or "N/A")
-    _add_section_title(pdf, "Impact (Safety / Quality / Progress)")
-    _add_paragraph(pdf, _normalize_impact(issue))
-    _add_section_title(pdf, "Action Required")
-    _add_paragraph(pdf, issue.get("action_required") or "N/A")
-    _add_section_title(pdf, "Target Completion Date")
-    _add_paragraph(pdf, issue.get("target_completion_date") or issue.get("completion_date") or "N/A")
-
-    _end_section(pdf, section_start, pad_bottom=3)
-
-    section_start = _begin_section(pdf, "Responsibility & Accountability")
-    _add_kv_row(pdf, "Discipline", issue.get("department") or issue.get("discipline") or "N/A")
-    _add_kv_row(pdf, "Responsible Party", issue.get("assigned_to_type") or "Internal")
-    _add_kv_row(pdf, "Assigned To", assigned_to)
-    _add_kv_row(pdf, "Created By", f"{created_by} ({created_by_dept})")
-    _add_kv_row(pdf, "Created Date", _format_timestamp(issue.get("created_at")))
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(
-        0,
-        5,
-        _latin1(
-            "The above party is responsible for addressing the identified issue within the specified timeline."
-        ),
+    location_name = _first_text(
+        issue.get("area"),
+        issue.get("location_area"),
+        issue.get("locationArea"),
+        issue.get("location"),
+        default="N/A",
     )
-    _end_section(pdf, section_start, pad_bottom=2)
+    generated_by = _first_text(
+        issue.get("report_generated_by"),
+        issue.get("reportGeneratedBy"),
+        issue.get("generated_by"),
+        issue.get("generatedBy"),
+        issue.get("created_by"),
+        issue.get("author"),
+        created_by,
+    )
+    company = _first_text(issue.get("company"), issue.get("company_name"), issue.get("companyName"))
+    company_role = _format_role(
+        issue.get("company_role")
+        or issue.get("companyRole")
+        or issue.get("stakeholder_role")
+        or issue.get("stakeholderRole")
+        or issue.get("role")
+    )
+    schedule = _first_text(
+        issue.get("target_completion_date"),
+        issue.get("target_completion"),
+        issue.get("due_date"),
+        issue.get("dueDate"),
+        issue.get("completion_date"),
+    )
+    description = _first_text(
+        issue.get("problem_description"),
+        issue.get("description"),
+        issue.get("comment"),
+        default="No issue description provided.",
+    )
+    action_required = _first_text(
+        issue.get("action_required"),
+        issue.get("actionRequired"),
+        issue.get("action_request"),
+        issue.get("actionRequest"),
+        issue.get("response"),
+    )
+    action_taken = _first_text(
+        issue.get("action_taken"),
+        issue.get("actionTaken"),
+        issue.get("action_description"),
+        issue.get("actionDescription"),
+        issue.get("response"),
+        default="No action recorded.",
+    )
+    action_taken_by = _first_text(
+        issue.get("action_taken_by"),
+        issue.get("actionTakenBy"),
+        issue.get("updated_by"),
+        issue.get("updatedBy"),
+        issue.get("response_by"),
+        assigned_to,
+    )
+    action_updated_at = issue.get("action_updated_at") or issue.get("actionUpdatedAt") or issue.get("response_at") or issue.get("updated_at")
+    closure_notes = _first_text(
+        issue.get("verification_notes"),
+        issue.get("verification_note"),
+        issue.get("notes"),
+        issue.get("note"),
+    )
 
-    # Page 2 - Visual Evidence
     pdf.add_page()
-    _add_page_title(pdf, "Visual Evidence")
-    section_start = _begin_section(pdf, "Visual Evidence")
-    _add_image_with_caption(
+    _add_report_header(pdf, report_id=issue_id, report_timestamp=report_timestamp)
+    _add_info_row(
         pdf,
-        "",
-        pano_annotated,
-        "Issue location as captured on site.",
-        max_height_ratio=0.62,
+        [
+            ("Project Name", project_name),
+            ("Location", location_name),
+            ("Report Generated By", generated_by),
+            ("Status", status),
+        ],
+    )
+    _add_info_row(
+        pdf,
+        [
+            ("Issue ID", issue_id),
+            ("Issue Type", issue_type),
+            ("Priority", priority),
+            ("Discipline", _first_text(issue.get("department"), issue.get("discipline"))),
+        ],
+    )
+
+    _add_issue_summary_card(
+        pdf,
+        issue_title=issue_name,
+        issue_type=issue_type,
+        severity=str(issue.get("severity") or priority),
+        priority=str(priority),
+        days_open=_days_open(issue),
+    )
+    _add_text_card(pdf, "Issue Description", description, min_h=26)
+    _add_two_column_cards(
+        pdf,
+        ("Action Required", action_required),
+        ("Responsibility", f"Assigned To: {assigned_to}\nCompany: {company}\nRole: {company_role}"),
+        min_h=30,
+    )
+    _add_text_card(pdf, "Schedule", schedule, min_h=18)
+    _add_visual_evidence_row(
+        pdf,
+        pano_annotated or attachment_image,
+        zoomed_issue_image,
         output_dir=output_dir,
     )
-    _add_image_with_caption(
+    _add_location_details(
         pdf,
-        "",
-        pano_crop,
-        "Auto-generated crop of the issue area.",
-        max_height_ratio=0.28,
+        issue=issue,
+        floorplan_annotated=floorplan_annotated,
         output_dir=output_dir,
     )
-    _end_section(pdf, section_start, pad_bottom=2)
 
-    # Page 3 - Location Context
-    pdf.add_page()
-    _add_page_title(pdf, "Location Context")
-    section_start = _begin_section(pdf, "Location Context")
-    _add_kv_row(pdf, "Pano ID", issue.get("pano_id") or "N/A")
-    _add_kv_row(pdf, "Camera Orientation", _format_view(issue) or "N/A")
-    _add_image_with_caption(
-        pdf,
-        "",
-        floorplan_annotated,
-        "Spatial reference for the reported issue.",
-        max_height_ratio=0.68,
-        output_dir=output_dir,
-    )
-    _add_paragraph(pdf, "Floorplan highlights the issue location relative to site coverage.")
-    _end_section(pdf, section_start, pad_bottom=2)
-
-    # Page 4 - Closure & Audit
-    pdf.add_page()
-    _add_page_title(pdf, "Closure & Audit")
-    section_start = _begin_section(pdf, "Action Taken & Verification")
-    _add_section_title(pdf, "Action Taken")
-    _add_paragraph(pdf, issue.get("response") or "No action recorded.")
-    _add_section_title(pdf, "Verification Status")
-    _add_paragraph(pdf, _normalize_verification_status(issue.get("status")))
-    _add_section_title(pdf, "Verified By")
-    _add_paragraph(pdf, issue.get("verified_by") or "N/A")
-    _add_section_title(pdf, "Verification Date")
-    _add_paragraph(pdf, _format_timestamp(issue.get("verified_at")))
-    _add_section_title(pdf, "Verification Notes")
-    _add_paragraph(pdf, issue.get("verification_notes") or issue.get("verification_note") or "N/A")
-    _end_section(pdf, section_start, pad_bottom=3)
-
-    section_start = _begin_section(pdf, "Timeline & Audit Trail")
-    pdf.set_font("Helvetica", "B", 10)
-    col_event = 55
-    col_user = 55
-    col_time = pdf.w - pdf.l_margin - pdf.r_margin - col_event - col_user
-    pdf.set_fill_color(235, 235, 235)
-    pdf.cell(col_event, 7, _latin1("Event"), border=1, fill=True)
-    pdf.cell(col_user, 7, _latin1("User"), border=1, fill=True)
-    pdf.cell(col_time, 7, _latin1("Timestamp"), border=1, fill=True, ln=True)
-    pdf.set_font("Helvetica", "", 9)
     timeline_rows = [
         ("Issue Created", created_by, _format_timestamp(issue.get("created_at"))),
         ("Assigned", assigned_to, _format_timestamp(issue.get("assigned_at"))),
-        ("Action Updated", issue.get("response_by") or assigned_to, _format_timestamp(issue.get("response_at") or issue.get("updated_at"))),
+        ("Action Updated", action_taken_by or "N/A", _format_timestamp(action_updated_at)),
         ("Verified", issue.get("verified_by") or "N/A", _format_timestamp(issue.get("verified_at"))),
         ("Closed", issue.get("closed_by") or "N/A", _format_timestamp(issue.get("closed_at"))),
     ]
-    for event, user, timestamp in timeline_rows:
-        pdf.cell(col_event, 7, _latin1(event), border=1)
-        pdf.cell(col_user, 7, _latin1(user or "N/A"), border=1)
-        pdf.cell(col_time, 7, _latin1(timestamp), border=1, ln=True)
-
-    _end_section(pdf, section_start, pad_bottom=3)
-
-    section_start = _begin_section(pdf, "System Declaration")
-    _add_paragraph(
+    _add_two_column_cards(
         pdf,
-        "This report is system-generated from Construction Monitor using time-stamped site imagery and recorded user actions.",
+        (
+            "Action & Closure",
+            (
+                f"Action Taken: {action_taken}\n"
+                f"Verification Status: {_normalize_verification_status(issue.get('status'))}\n"
+                f"Verified By: {_first_text(issue.get('verified_by'), action_taken_by)}\n"
+                f"Verification Date: {_format_timestamp(issue.get('verified_at') or action_updated_at)}"
+            ),
+        ),
+        ("Notes", closure_notes),
+        min_h=35,
     )
-    _add_kv_row(pdf, "Platform Name", "Construction Monitor")
-    _add_kv_row(pdf, "Report ID", issue_id)
-    _add_kv_row(pdf, "Generation Timestamp", report_timestamp)
-    _end_section(pdf, section_start, pad_bottom=2)
-
+    _add_activity_log(pdf, timeline_rows)
+    _add_text_card(
+        pdf,
+        "Notes",
+        "This report is system-generated from Construction Monitor using time-stamped site imagery and recorded user actions.",
+        min_h=18,
+    )
     pdf.output(pdf_path)
     return pdf_path

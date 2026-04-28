@@ -37,6 +37,9 @@ async def create_project_floorplan(
     pointB_lon: Optional[float] = Form(None),
     calibration_points: Optional[str] = Form(None),
     dxf_project_id: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    project_location: Optional[str] = Form(None),
+    area_location: Optional[str] = Form(None),
     site_name_form: Optional[str] = Form(None, alias="site_name"),
     dxf_zip: Optional[UploadFile] = File(None),
     site_config: Optional[UploadFile] = File(None),
@@ -91,6 +94,7 @@ async def create_project_floorplan(
         baseline_xer_url=baseline_xer_url,
         baseline_xer_name=baseline_xer_name,
         capture_mode=capture_mode,
+        location=location or project_location or area_location,
     )
     if isinstance(parsed_site_config, dict):
         floorplan_id = result.get("floorPlan", {}).get("id")

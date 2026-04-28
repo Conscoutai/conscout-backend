@@ -39,6 +39,7 @@ def create_floorplan(
     baseline_xer_url: Optional[str] = None,
     baseline_xer_name: Optional[str] = None,
     capture_mode: Literal["outdoor", "indoor"] = "outdoor",
+    location: Optional[str] = None,
 ):
     try:
         ext = file.filename.split(".")[-1].lower()
@@ -75,6 +76,14 @@ def create_floorplan(
         width, height = img.size
 
         safe_capture_mode = capture_mode if capture_mode in {"outdoor", "indoor"} else "outdoor"
+        project_location = (location or "").strip()
+        if not project_location and existing_floorplan:
+            project_location = str(
+                existing_floorplan.get("location")
+                or existing_floorplan.get("project_location")
+                or existing_floorplan.get("area_location")
+                or ""
+            ).strip()
         has_calibration = all(
             value is not None
             for value in (
@@ -161,6 +170,9 @@ def create_floorplan(
             "imageUrl": f"/sites/{site_name}/floorplan/{save_as}",
             "bounds": {"width": width, "height": height},
             "site_name": site_name,
+            "location": project_location,
+            "project_location": project_location,
+            "area_location": project_location,
             "capture_mode": safe_capture_mode,
             "created_at": existing_floorplan.get("created_at") if existing_floorplan else now,
             "updated_at": now,
