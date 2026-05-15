@@ -40,6 +40,9 @@ def create_floorplan(
     baseline_xer_name: Optional[str] = None,
     capture_mode: Literal["outdoor", "indoor"] = "outdoor",
     location: Optional[str] = None,
+    owner_user_id: Optional[str] = None,
+    owner_email: Optional[str] = None,
+    owner_name: Optional[str] = None,
 ):
     try:
         ext = file.filename.split(".")[-1].lower()
@@ -164,6 +167,29 @@ def create_floorplan(
         # ---- Save metadata ----
         effective_name = site_name or name
         now = datetime.now(timezone.utc)
+        existing_owner_user_id = (
+            str(existing_floorplan.get("owner_user_id") or existing_floorplan.get("owner_id") or "").strip()
+            if existing_floorplan
+            else ""
+        )
+        existing_owner_email = (
+            str(
+                existing_floorplan.get("owner_email")
+                or existing_floorplan.get("created_by_email")
+                or ""
+            ).strip()
+            if existing_floorplan
+            else ""
+        )
+        existing_owner_name = (
+            str(
+                existing_floorplan.get("owner_name")
+                or existing_floorplan.get("created_by")
+                or ""
+            ).strip()
+            if existing_floorplan
+            else ""
+        )
         floorplan_metadata = {
             "id": floorplan_id,
             "name": effective_name,
@@ -176,6 +202,12 @@ def create_floorplan(
             "capture_mode": safe_capture_mode,
             "created_at": existing_floorplan.get("created_at") if existing_floorplan else now,
             "updated_at": now,
+            "owner_user_id": (owner_user_id or existing_owner_user_id),
+            "owner_email": (owner_email or existing_owner_email),
+            "owner_name": (owner_name or existing_owner_name),
+            "created_by": (owner_name or existing_owner_name),
+            "created_by_email": (owner_email or existing_owner_email),
+            "owner_id": (owner_user_id or existing_owner_user_id),
         }
         if scale is not None:
             floorplan_metadata["scale"] = scale

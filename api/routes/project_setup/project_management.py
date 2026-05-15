@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
 
-from core.database import floorplans_collection
+from core.database import floorplans_collection, raw_floorplans_collection
 from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
 from core.config import ENABLE_DXF_PROCESSING
@@ -43,15 +43,38 @@ class StakeholderEmailRequest(BaseModel):
 
 #Lists projects
 @router.get("/projects")
-def list_projects():
-    floorplans = list(floorplans_collection.find().sort("_id", -1))
+def list_projects(
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    project_names = {
+        name.strip().lower()
+        for name in current_user.accessible_project_names
+        if name.strip()
+    }
+    query = {
+        "$or": [
+            {"owner_user_id": current_user.user_id},
+            {"owner_email": current_user.email.strip().lower()},
+        ]
+    }
+    if project_names:
+        query["$or"].extend(
+            [
+                {"site_name": {"$in": list(project_names)}},
+                {"dxf_project_id": {"$in": list(project_names)}},
+                {"stakeholder_emails": current_user.email.strip().lower()},
+            ]
+        )
+
+    floorplans = list(raw_floorplans_collection.find(query).sort("_id", -1))
     seen_sites = set()
     projects = []
     for fp in floorplans:
-        site_name = fp.get("site_name") or fp.get("dxf_project_id")
-        if not site_name or site_name in seen_sites:
+        site_name = str(fp.get("site_name") or fp.get("dxf_project_id") or "").strip()
+        site_key = site_name.lower()
+        if not site_name or site_key in seen_sites:
             continue
-        seen_sites.add(site_name)
+        seen_sites.add(site_key)
         fp["_id"] = str(fp["_id"])
         projects.append(normalize_floorplan(fp))
     return projects

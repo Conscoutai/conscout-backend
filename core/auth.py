@@ -72,7 +72,8 @@ def _resolve_accessible_floorplan_ids(project_names: list[str]) -> list[str]:
 
 def _build_user_access_payload(user: dict) -> dict:
     invited_projects = _resolve_stakeholder_projects_for_email(user.get("email", ""))
-    role = "stakeholder" if invited_projects else "admin"
+    stored_role = str(user.get("role") or "admin").strip().lower()
+    role = stored_role if stored_role in {"admin", "stakeholder"} else "admin"
     return {
         "role": role,
         "accessible_project_names": invited_projects,
@@ -293,14 +294,12 @@ def start_user_session(user: dict) -> dict:
         {
             "$set": {
                 "session_token": token,
-                "role": access_payload["role"],
                 "updated_at": int(__import__("time").time() * 1000),
             }
         },
     )
     refreshed = raw_users_collection.find_one({"_id": user["_id"]}) or user
     refreshed["session_token"] = token
-    refreshed["role"] = access_payload["role"]
     return refreshed
 
 

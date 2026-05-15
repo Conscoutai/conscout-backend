@@ -27,4 +27,15 @@ def normalize_floorplan(fp: dict) -> dict:
         fp["stakeholder_emails"] = []
     if fp.get("capture_mode") not in {"outdoor", "indoor"}:
         fp["capture_mode"] = "outdoor"
+    owner_user_id = str(fp.get("owner_user_id") or fp.get("owner_id") or "").strip()
+    owner_email = str(
+        fp.get("owner_email") or fp.get("created_by_email") or ""
+    ).strip().lower()
+    owner_name = str(fp.get("owner_name") or fp.get("created_by") or "").strip()
+    fp["owner_user_id"] = owner_user_id
+    fp["owner_id"] = owner_user_id
+    fp["owner_email"] = owner_email
+    fp["owner_name"] = owner_name
+    fp["created_by_email"] = owner_email
+    fp["created_by"] = owner_name
     return fp

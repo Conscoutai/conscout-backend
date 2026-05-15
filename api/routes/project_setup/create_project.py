@@ -95,6 +95,9 @@ async def create_project_floorplan(
         baseline_xer_name=baseline_xer_name,
         capture_mode=capture_mode,
         location=location or project_location or area_location,
+        owner_user_id=current_user.user_id,
+        owner_email=current_user.email,
+        owner_name=current_user.name,
     )
     if isinstance(parsed_site_config, dict):
         floorplan_id = result.get("floorPlan", {}).get("id")
