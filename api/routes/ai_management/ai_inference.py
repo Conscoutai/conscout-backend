@@ -4,13 +4,16 @@
 # api/ai.py
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 import asyncio
 import hashlib
 import os
+import tempfile
+import zipfile
 
 from ultralytics import YOLO
 
-from core.config import MODEL_DIR, tour_raw_dir
+from core.config import MODEL_DIR, tour_detect_dir, tour_detect_seg_dir, tour_raw_dir
 from core.database import tours_collection
 
 from services.ai_inference.count_inference_service import run_count_ai_for_tour
@@ -52,6 +55,14 @@ count_lock = asyncio.Lock()
 seg_lock = asyncio.Lock()
 
 
+def _tour_storage_kwargs(tour: dict) -> dict:
+    return {
+        "owner_email": tour.get("owner_email"),
+        "owner_user_id": tour.get("owner_user_id"),
+        "site_name": tour.get("site_name") or tour.get("site") or tour.get("project_id"),
+    }
+
+
 @router.post("/sync-streetview/{tour_id}")
 async def sync_streetview_images(
     tour_id: str,
@@ -64,12 +75,7 @@ async def sync_streetview_images(
     if not tour:
         raise HTTPException(404, "Tour not found")
 
-    dest_dir = tour_raw_dir(
-        tour_id,
-        owner_email=tour.get("owner_email"),
-        owner_user_id=tour.get("owner_user_id"),
-        site_name=tour.get("site_name") or tour.get("site") or tour.get("project_id"),
-    )
+    dest_dir = tour_raw_dir(tour_id, **_tour_storage_kwargs(tour))
     os.makedirs(dest_dir, exist_ok=True)
 
     saved = 0
@@ -83,6 +89,49 @@ async def sync_streetview_images(
         saved += 1
 
     return {"message": "Streetview images synced", "saved": saved}
+
+
+@router.get("/export-streetview-assets/{tour_id}")
+async def export_streetview_assets(tour_id: str, kind: str = "all"):
+    tour = tours_collection.find_one({"tour_id": tour_id})
+    if not tour:
+        raise HTTPException(404, "Tour not found")
+
+    storage_kwargs = _tour_storage_kwargs(tour)
+    export_roots: list[tuple[str, str]] = []
+    if kind in {"all", "count"}:
+        export_roots.append(("detect", tour_detect_dir(tour_id, **storage_kwargs)))
+    if kind in {"all", "seg"}:
+        export_roots.append(("detect+seg", tour_detect_seg_dir(tour_id, **storage_kwargs)))
+    if not export_roots:
+        raise HTTPException(400, "Invalid export kind")
+
+    fd, archive_path = tempfile.mkstemp(prefix=f"{tour_id}_", suffix=".zip")
+    os.close(fd)
+    file_count = 0
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for prefix, root in export_roots:
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                source = os.path.join(root, name)
+                if not os.path.isfile(source):
+                    continue
+                archive.write(source, arcname=f"{prefix}/{name}")
+                file_count += 1
+
+    if file_count == 0:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise HTTPException(404, "No processed assets found")
+
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=f"{tour_id}_{kind}.zip",
+    )
 
 
 # =========================================================
