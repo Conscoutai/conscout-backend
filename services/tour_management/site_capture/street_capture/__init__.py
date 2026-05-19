@@ -8,12 +8,26 @@ from .lifecycle_service import (
 )
 
 
-def upload_street_capture_image(*, tour_id, image, tour_name, floorplan_id):
+def upload_street_capture_image(
+    *,
+    tour_id,
+    image,
+    tour_name,
+    floorplan_id,
+    latitude=None,
+    longitude=None,
+    captured_at=None,
+    metadata=None,
+):
     return upload_streetview_image(
         tour_id=tour_id,
         image=image,
         tour_name=tour_name,
         floorplan_id=floorplan_id,
+        latitude=latitude,
+        longitude=longitude,
+        captured_at=captured_at,
+        metadata=metadata,
     )
 
 

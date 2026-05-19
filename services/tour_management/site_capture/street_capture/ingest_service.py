@@ -205,6 +205,10 @@ def upload_streetview_image(
     image: UploadFile,
     tour_name: str,
     floorplan_id: Optional[str],
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    captured_at: Optional[str] = None,
+    metadata: Optional[dict] = None,
 ):
     filename = image.filename or ""
     filename_lower = filename.lower()
@@ -233,7 +237,18 @@ def upload_streetview_image(
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
 
-    lat, lon, yaw = _extract_exif_gps_yaw(save_path)
+    exif_lat, exif_lon, yaw = _extract_exif_gps_yaw(save_path)
+    lat, lon = exif_lat, exif_lon
+    has_exif_gps = _is_valid_lat_lon(exif_lat, exif_lon)
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metadata_lat = metadata.get("latitude")
+    metadata_lon = metadata.get("longitude")
+    fallback_lat = metadata_lat if metadata_lat is not None else latitude
+    fallback_lon = metadata_lon if metadata_lon is not None else longitude
+    if not _is_valid_lat_lon(lat, lon) and _is_valid_lat_lon(fallback_lat, fallback_lon):
+        lat = float(fallback_lat)
+        lon = float(fallback_lon)
 
     # Require an explicit, valid floorplan_id - do not silently fall back.
     if not floorplan_id:
@@ -262,14 +277,21 @@ def upload_streetview_image(
         "lon": lon,
         "x": x,
         "y": y,
-        "has_exif_gps": _is_valid_lat_lon(lat, lon),
+        "has_exif_gps": has_exif_gps,
         "has_location": _is_valid_lat_lon(lat, lon),
-        "location_source": "exif" if _is_valid_lat_lon(lat, lon) else "unlocated",
+        "location_source": (
+            "exif"
+            if has_exif_gps and _is_valid_lat_lon(lat, lon)
+            else "app"
+            if _is_valid_lat_lon(lat, lon)
+            else "unlocated"
+        ),
         "location_confidence": 1.0 if _is_valid_lat_lon(lat, lon) else 0.0,
         "floorplan_id": floorplan["id"] if floorplan else None,
         "object_counts": {},
         "camera_yaw": yaw,
         "comments": [],
+        "captured_at": captured_at or metadata.get("capturedAt"),
     }
 
     if existing:

@@ -1,4 +1,5 @@
 import time
+import json
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
@@ -27,14 +28,31 @@ async def upload_street_capture(
     image: UploadFile = File(...),
     tour_name: str = Form(""),
     floorplan_id: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+    captured_at: Optional[str] = Form(None),
+    metadata_json: Optional[str] = Form(None),
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
+    metadata = None
+    if metadata_json:
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError as error:
+            raise HTTPException(
+                status_code=400,
+                detail="metadata_json must be valid JSON",
+            ) from error
     return upload_street_capture_image(
         tour_id=tour_id,
         image=image,
         tour_name=tour_name,
         floorplan_id=floorplan_id,
+        latitude=latitude,
+        longitude=longitude,
+        captured_at=captured_at,
+        metadata=metadata,
     )
 
 
