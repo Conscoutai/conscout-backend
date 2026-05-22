@@ -20,9 +20,18 @@ def list_all_tours():
         floorplan = None
         if doc.get("floorplan_id"):
             floorplan = floorplans_collection.find_one({"id": doc.get("floorplan_id")})
-        site_name = None
+        site_name = (
+            doc.get("site_name")
+            or doc.get("site")
+            or doc.get("project_id")
+            or doc.get("dxf_project_id")
+        )
         if floorplan:
-            site_name = floorplan.get("site_name") or floorplan.get("dxf_project_id")
+            site_name = (
+                floorplan.get("site_name")
+                or floorplan.get("dxf_project_id")
+                or site_name
+            )
 
         storage_key = resolve_storage_key_for_tour(doc.get("tour_id"), doc)
         nodes = [normalize_node_paths(doc.get("tour_id"), n.copy(), storage_key=storage_key) for n in doc.get("nodes", [])]

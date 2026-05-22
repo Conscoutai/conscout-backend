@@ -13,6 +13,23 @@ class ScopedCollection:
     def __init__(self, raw_collection):
         self._raw = raw_collection
 
+    def _stamp_upsert_update(self, update):
+        if not isinstance(update, dict):
+            return update
+
+        set_on_insert = update.get("$setOnInsert")
+        if isinstance(set_on_insert, dict):
+            stamped_insert = stamp_owned_document(set_on_insert)
+        else:
+            stamped_insert = stamp_owned_document({})
+
+        if set_on_insert == stamped_insert:
+            return update
+
+        merged_update = dict(update)
+        merged_update["$setOnInsert"] = stamped_insert
+        return merged_update
+
     def find_one(self, filter=None, *args, **kwargs):
         scoped_filter = merge_owner_filter(filter)
         return self._raw.find_one(scoped_filter, *args, **kwargs)
@@ -23,10 +40,14 @@ class ScopedCollection:
 
     def update_one(self, filter, update, *args, **kwargs):
         scoped_filter = merge_owner_filter(filter)
+        if kwargs.get("upsert"):
+            update = self._stamp_upsert_update(update)
         return self._raw.update_one(scoped_filter, update, *args, **kwargs)
 
     def update_many(self, filter, update, *args, **kwargs):
         scoped_filter = merge_owner_filter(filter)
+        if kwargs.get("upsert"):
+            update = self._stamp_upsert_update(update)
         return self._raw.update_many(scoped_filter, update, *args, **kwargs)
 
     def delete_one(self, filter, *args, **kwargs):
@@ -57,6 +78,7 @@ raw_floorplans_collection = db["sites"]
 raw_tours_collection = db["tours"]
 raw_work_schedules_collection = db["work_schedules"]
 raw_users_collection = db["users"]
+raw_inspections_collection = db["inspections"]
 
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.
@@ -64,3 +86,4 @@ floorplans_collection = ScopedCollection(raw_floorplans_collection)
 tours_collection = ScopedCollection(raw_tours_collection)
 work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
 users_collection = raw_users_collection
+inspections_collection = ScopedCollection(raw_inspections_collection)

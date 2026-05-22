@@ -26,7 +26,6 @@ class SignupRequest(BaseModel):
     name: str
     email: str
     password: str
-    role: str = "admin"
 
 
 @router.post("/login")
@@ -52,7 +51,6 @@ def signup(payload: SignupRequest):
         name=payload.name,
         email=payload.email,
         password=payload.password,
-        role=payload.role,
     )
     user = start_user_session(user)
     return {

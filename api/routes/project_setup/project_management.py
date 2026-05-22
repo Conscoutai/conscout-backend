@@ -3,7 +3,11 @@ from typing import Literal
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
 
-from core.database import floorplans_collection, raw_floorplans_collection
+from core.database import (
+    floorplans_collection,
+    raw_floorplans_collection,
+    users_collection,
+)
 from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
 from core.config import ENABLE_DXF_PROCESSING
@@ -41,6 +45,49 @@ class CaptureModeRequest(BaseModel):
 class StakeholderEmailRequest(BaseModel):
     email: str
 
+
+def _normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def _email_username(email: str) -> str:
+    normalized = _normalize_email(email)
+    if "@" in normalized:
+        return normalized.split("@", 1)[0]
+    return normalized
+
+
+def _build_stakeholder_members(stakeholder_emails: list[str]) -> list[dict]:
+    normalized_emails = []
+    seen = set()
+    for email in stakeholder_emails:
+        normalized = _normalize_email(str(email))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_emails.append(normalized)
+
+    if not normalized_emails:
+        return []
+
+    user_lookup = {}
+    for user in users_collection.find(
+        {"email": {"$in": normalized_emails}},
+        {"email": 1, "name": 1, "role": 1},
+    ):
+        email = _normalize_email(str(user.get("email") or ""))
+        if not email:
+            continue
+        user_lookup[email] = user
+
+    members = []
+    for email in normalized_emails:
+        user = user_lookup.get(email, {})
+        name = str(user.get("name") or "").strip() or _email_username(email)
+        role = str(user.get("role") or "stakeholder").strip() or "stakeholder"
+        members.append({"email": email, "name": name, "role": role})
+    return members
+
 #Lists projects
 @router.get("/projects")
 def list_projects(
@@ -76,7 +123,11 @@ def list_projects(
             continue
         seen_sites.add(site_key)
         fp["_id"] = str(fp["_id"])
-        projects.append(normalize_floorplan(fp))
+        normalized = normalize_floorplan(fp)
+        normalized["stakeholder_members"] = _build_stakeholder_members(
+            normalized.get("stakeholder_emails", [])
+        )
+        projects.append(normalized)
     return projects
 
 # Fetches latest floorplan for that site.
@@ -89,7 +140,11 @@ def get_project_floorplan(site_name: str):
     if not fp:
         raise HTTPException(404, "No floorplan found for this project")
     fp["_id"] = str(fp["_id"])
-    return normalize_floorplan(fp)
+    normalized = normalize_floorplan(fp)
+    normalized["stakeholder_members"] = _build_stakeholder_members(
+        normalized.get("stakeholder_emails", [])
+    )
+    return normalized
 
 #Deletes a project and related assets.
 @router.delete("/projects/{site_name}")
@@ -229,9 +284,11 @@ def list_project_stakeholders(
     )
     if not floorplan:
         raise HTTPException(404, "No floorplan found for this project")
+    stakeholder_emails = floorplan.get("stakeholder_emails", [])
     return {
         "site_name": site_name,
-        "stakeholder_emails": floorplan.get("stakeholder_emails", []),
+        "stakeholder_emails": stakeholder_emails,
+        "stakeholder_members": _build_stakeholder_members(stakeholder_emails),
     }
 
 

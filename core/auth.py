@@ -51,6 +51,34 @@ def _resolve_stakeholder_projects_for_email(email: str) -> list[str]:
     return sorted(projects)
 
 
+def _resolve_owned_projects_for_user(user: dict) -> list[str]:
+    user_id = str(user.get("user_id") or "").strip()
+    email = str(user.get("email") or "").strip().lower()
+    if not user_id and not email:
+        return []
+
+    owner_query = {"$or": []}
+    if user_id:
+        owner_query["$or"].append({"owner_user_id": user_id})
+    if email:
+        owner_query["$or"].append({"owner_email": email})
+        owner_query["$or"].append({"created_by_email": email})
+    if not owner_query["$or"]:
+        return []
+
+    projects: set[str] = set()
+    for floorplan in raw_floorplans_collection.find(
+        owner_query,
+        {"site_name": 1, "dxf_project_id": 1},
+    ):
+        site_name = str(
+            floorplan.get("site_name") or floorplan.get("dxf_project_id") or ""
+        ).strip()
+        if site_name:
+            projects.add(site_name)
+    return sorted(projects)
+
+
 def _resolve_accessible_floorplan_ids(project_names: list[str]) -> list[str]:
     if not project_names:
         return []
@@ -72,12 +100,14 @@ def _resolve_accessible_floorplan_ids(project_names: list[str]) -> list[str]:
 
 def _build_user_access_payload(user: dict) -> dict:
     invited_projects = _resolve_stakeholder_projects_for_email(user.get("email", ""))
+    owned_projects = _resolve_owned_projects_for_user(user)
+    accessible_projects = sorted({*invited_projects, *owned_projects})
     stored_role = str(user.get("role") or "admin").strip().lower()
     role = stored_role if stored_role in {"admin", "stakeholder"} else "admin"
     return {
         "role": role,
-        "accessible_project_names": invited_projects,
-        "accessible_floorplan_ids": _resolve_accessible_floorplan_ids(invited_projects),
+        "accessible_project_names": accessible_projects,
+        "accessible_floorplan_ids": _resolve_accessible_floorplan_ids(accessible_projects),
     }
 
 
@@ -261,15 +291,11 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
     return user
 
 
-def create_user(*, name: str, email: str, password: str, role: str = "admin") -> dict:
+def create_user(*, name: str, email: str, password: str) -> dict:
     normalized_email = email.strip().lower()
     existing = raw_users_collection.find_one({"email": normalized_email})
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
-
-    normalized_role = role.strip().lower()
-    if normalized_role not in {"admin", "stakeholder"}:
-        raise HTTPException(status_code=400, detail="Role must be admin or stakeholder.")
 
     now = int(__import__("time").time() * 1000)
     doc = {
@@ -277,7 +303,7 @@ def create_user(*, name: str, email: str, password: str, role: str = "admin") ->
         "email": normalized_email,
         "name": name.strip(),
         "password_hash": _hash_password(password),
-        "role": normalized_role,
+        "role": "admin",
         "session_token": "",
         "created_at": now,
         "updated_at": now,
@@ -309,7 +335,6 @@ def sanitize_user_payload(user: dict) -> dict:
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
         "name": user.get("name", ""),
-        "role": access_payload["role"],
         "accessible_project_names": access_payload["accessible_project_names"],
     }
 

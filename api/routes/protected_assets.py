@@ -103,7 +103,12 @@ def _tour_asset_roots(tour: dict) -> list[str]:
 
 
 def _user_can_access_tour(user: AuthenticatedUser, tour: dict) -> bool:
-    if user.role != "stakeholder":
+    owner_user_id = str(tour.get("owner_user_id") or "").strip()
+    owner_email = str(tour.get("owner_email") or "").strip().lower()
+    if (
+        (owner_user_id and owner_user_id == user.user_id)
+        or (owner_email and owner_email == user.email.strip().lower())
+    ):
         return True
 
     project_names = set(user.accessible_project_names)
@@ -122,7 +127,12 @@ def _user_can_access_tour(user: AuthenticatedUser, tour: dict) -> bool:
 
 
 def _user_can_access_site(user: AuthenticatedUser, floorplan: dict) -> bool:
-    if user.role != "stakeholder":
+    owner_user_id = str(floorplan.get("owner_user_id") or "").strip()
+    owner_email = str(floorplan.get("owner_email") or "").strip().lower()
+    if (
+        (owner_user_id and owner_user_id == user.user_id)
+        or (owner_email and owner_email == user.email.strip().lower())
+    ):
         return True
 
     project_names = set(user.accessible_project_names)
