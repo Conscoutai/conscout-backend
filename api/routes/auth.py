@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from core.auth import (
     authenticate_user,
+    change_user_password,
     create_user,
     require_authenticated_user,
     sanitize_user_payload,
@@ -26,6 +27,11 @@ class SignupRequest(BaseModel):
     name: str
     email: str
     password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 @router.post("/login")
@@ -65,3 +71,28 @@ def me(current_user: AuthenticatedUser = Depends(require_authenticated_user)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"user": sanitize_user_payload(user)}
+
+
+@router.post("/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    current_password = payload.current_password.strip()
+    new_password = payload.new_password.strip()
+    if not current_password or not new_password:
+        raise HTTPException(status_code=400, detail="Both password fields are required.")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if current_password == new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from current password.",
+        )
+
+    change_user_password(
+        user_id=current_user.user_id,
+        current_password=current_password,
+        new_password=new_password,
+    )
+    return {"message": "Password updated successfully."}

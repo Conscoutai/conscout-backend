@@ -312,6 +312,27 @@ def create_user(*, name: str, email: str, password: str) -> dict:
     return raw_users_collection.find_one({"email": normalized_email}) or doc
 
 
+def change_user_password(*, user_id: str, current_password: str, new_password: str) -> dict:
+    user = raw_users_collection.find_one({"user_id": user_id.strip()})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if not verify_password(current_password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    now = int(__import__("time").time() * 1000)
+    new_hash = _hash_password(new_password)
+    raw_users_collection.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "password_hash": new_hash,
+                "updated_at": now,
+            }
+        },
+    )
+    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+
+
 def start_user_session(user: dict) -> dict:
     token = issue_session_token()
     access_payload = _build_user_access_payload(user)
