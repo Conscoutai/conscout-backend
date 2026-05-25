@@ -79,6 +79,7 @@ raw_tours_collection = db["tours"]
 raw_work_schedules_collection = db["work_schedules"]
 raw_users_collection = db["users"]
 raw_inspections_collection = db["inspections"]
+raw_notifications_collection = db["notifications"]
 
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.
@@ -87,3 +88,4 @@ tours_collection = ScopedCollection(raw_tours_collection)
 work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
 users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
+notifications_collection = raw_notifications_collection

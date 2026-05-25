@@ -12,6 +12,7 @@ from api.routes.progress import router as progress_router
 from api.routes.tour_management import router as tour_management_router
 from api.routes.features import router as features_router
 from api.routes.ai_management import router as ai_management_router
+from api.routes.notifications import router as notifications_router
 from core.auth import require_authenticated_user
 
 api_router = APIRouter()
@@ -19,6 +20,7 @@ api_router = APIRouter()
 api_router.include_router(auth_router)
 api_router.include_router(chatbot_router)
 api_router.include_router(project_setup_router, dependencies=[Depends(require_authenticated_user)])
+api_router.include_router(notifications_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(progress_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(tour_management_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(features_router, dependencies=[Depends(require_authenticated_user)])
