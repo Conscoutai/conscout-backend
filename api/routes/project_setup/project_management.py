@@ -57,6 +57,19 @@ def _email_username(email: str) -> str:
     return normalized
 
 
+def _registered_user_exists(email: str) -> bool:
+    normalized_email = _normalize_email(email)
+    if not normalized_email:
+        return False
+    return (
+        users_collection.find_one(
+            {"email": normalized_email},
+            {"_id": 1},
+        )
+        is not None
+    )
+
+
 def _build_stakeholder_members(stakeholder_emails: list[str]) -> list[dict]:
     normalized_emails = []
     seen = set()
@@ -300,6 +313,8 @@ def add_project_stakeholder(
 ):
     ensure_admin_user(current_user)
     normalized_email = payload.email.strip().lower()
+    if not _registered_user_exists(normalized_email):
+        raise HTTPException(404, "No registered user found for this email")
     update = floorplans_collection.update_many(
         {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
         {"$addToSet": {"stakeholder_emails": normalized_email}},
