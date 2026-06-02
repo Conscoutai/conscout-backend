@@ -19,6 +19,9 @@ from services.project_setup.site_config_service import (
     save_site_config_strict,
     upsert_floorplan_site_config,
 )
+from services.project_setup.site_config_generation_service import (
+    generate_site_config_from_saved_dxfs,
+)
 from services.project_setup.project_assets_service import (
     replace_site_dxfs_from_zip,
     persist_project_assets_update,
@@ -256,6 +259,9 @@ async def update_project_assets(
         parsed = save_site_config_strict(site_name, await site_config.read())
     if dxf_zip:
         replace_site_dxfs_from_zip(site_name, await dxf_zip.read(), require_dxf=True)
+        if not isinstance(parsed, dict):
+            generated = generate_site_config_from_saved_dxfs(site_name)
+            parsed = generated["site_config"]
     parsed_for_reprocess = resolve_site_config_for_reprocess(site_name, parsed)
 
     latest_floorplan = floorplans_collection.find_one(
@@ -282,6 +288,32 @@ async def update_project_assets(
             "dxf": bool(dxf_zip),
         },
         "total_objects": len(site_objects),
+    }
+
+
+@router.post("/projects/{site_name}/site-config/generate")
+async def generate_site_config(
+    site_name: str,
+    dxf_zip: UploadFile = File(None),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    if not site_name:
+        raise HTTPException(400, "Site name is required")
+    if dxf_zip and (not dxf_zip.filename or not dxf_zip.filename.lower().endswith(".zip")):
+        raise HTTPException(400, "DXF upload must be a .zip file")
+    if not ENABLE_DXF_PROCESSING:
+        raise HTTPException(400, "DXF processing is disabled")
+
+    if dxf_zip:
+        replace_site_dxfs_from_zip(site_name, await dxf_zip.read(), require_dxf=True)
+
+    generated = generate_site_config_from_saved_dxfs(site_name)
+    upsert_floorplan_site_config(site_name, generated["site_config"])
+
+    return {
+        "message": "Site config generated successfully",
+        **generated,
     }
 
 

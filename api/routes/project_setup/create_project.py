@@ -10,6 +10,9 @@ from services.project_setup.site_config_service import (
     save_site_config_and_try_parse,
     upsert_floorplan_site_config,
 )
+from services.project_setup.site_config_generation_service import (
+    generate_site_config_from_saved_dxfs,
+)
 from services.project_setup.project_assets_service import (
     replace_site_dxfs_from_zip,
     save_baseline_xer,
@@ -62,6 +65,9 @@ async def create_project_floorplan(
 
     if dxf_zip and ENABLE_DXF_PROCESSING:
         replace_site_dxfs_from_zip(effective_site, await dxf_zip.read(), require_dxf=False)
+        if not isinstance(parsed_site_config, dict):
+            generated = generate_site_config_from_saved_dxfs(effective_site)
+            parsed_site_config = generated["site_config"]
         dxf_project_id = effective_site
     else:
         dxf_project_id = None
