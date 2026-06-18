@@ -39,6 +39,7 @@ def create_floorplan(
     baseline_xer_url: Optional[str] = None,
     baseline_xer_name: Optional[str] = None,
     capture_mode: Literal["outdoor", "indoor"] = "outdoor",
+    currency_code: Optional[str] = None,
     location: Optional[str] = None,
     owner_user_id: Optional[str] = None,
     owner_email: Optional[str] = None,
@@ -79,6 +80,13 @@ def create_floorplan(
         width, height = img.size
 
         safe_capture_mode = capture_mode if capture_mode in {"outdoor", "indoor"} else "outdoor"
+        project_currency_code = (currency_code or "").strip().upper()
+        if not project_currency_code and existing_floorplan:
+            project_currency_code = str(
+                existing_floorplan.get("currency_code")
+                or existing_floorplan.get("currency")
+                or ""
+            ).strip().upper()
         project_location = (location or "").strip()
         if not project_location and existing_floorplan:
             project_location = str(
@@ -200,6 +208,8 @@ def create_floorplan(
             "project_location": project_location,
             "area_location": project_location,
             "capture_mode": safe_capture_mode,
+            "currency_code": project_currency_code,
+            "currency": project_currency_code,
             "created_at": existing_floorplan.get("created_at") if existing_floorplan else now,
             "updated_at": now,
             "owner_user_id": (owner_user_id or existing_owner_user_id),

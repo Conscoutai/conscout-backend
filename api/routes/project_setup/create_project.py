@@ -48,6 +48,8 @@ async def create_project_floorplan(
     site_config: Optional[UploadFile] = File(None),
     baseline_xer: Optional[UploadFile] = File(None),
     capture_mode: Literal["outdoor", "indoor"] = Form("outdoor"),
+    currency_code: Optional[str] = Form(None),
+    currency: Optional[str] = Form(None),
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
@@ -100,6 +102,7 @@ async def create_project_floorplan(
         baseline_xer_url=baseline_xer_url,
         baseline_xer_name=baseline_xer_name,
         capture_mode=capture_mode,
+        currency_code=currency_code or currency,
         location=location or project_location or area_location,
         owner_user_id=current_user.user_id,
         owner_email=current_user.email,
