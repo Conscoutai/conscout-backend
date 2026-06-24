@@ -26,8 +26,8 @@ from core.database import (
 
 DEFAULT_BOOTSTRAP_EMAIL = "saf@gmail.com"
 DEFAULT_BOOTSTRAP_PASSWORD = "safwan123"
-DEFAULT_ALLOWED_APP = "main"
 SUPPORTED_APPS = {"main", "lite"}
+DEFAULT_ALLOWED_APPS = sorted(SUPPORTED_APPS)
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -122,14 +122,16 @@ def normalize_allowed_apps(
     values: list[str] | tuple[str, ...] | set[str] | str | None,
 ) -> list[str]:
     candidates = values if isinstance(values, (list, tuple, set)) else [values]
-    normalized = sorted(
-        {
-            str(item).strip().lower()
-            for item in candidates
-            if str(item or "").strip().lower() in SUPPORTED_APPS
-        }
-    )
-    return normalized or [DEFAULT_ALLOWED_APP]
+    normalized = {
+        str(item).strip().lower()
+        for item in candidates
+        if str(item or "").strip().lower() in SUPPORTED_APPS
+    }
+    if normalized:
+        # Main and lite now share the same account pool, so any valid app
+        # assignment should unlock both surfaces for the same user.
+        return DEFAULT_ALLOWED_APPS.copy()
+    return DEFAULT_ALLOWED_APPS.copy()
 
 
 def user_can_access_app(user: dict, app_name: str) -> bool:
@@ -197,7 +199,7 @@ def bootstrap_default_user() -> dict:
         "name": "Safwan",
         "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
         "role": "admin",
-        "allowed_apps": [DEFAULT_ALLOWED_APP],
+        "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
         "session_token": "",
         "created_at": now,
         "updated_at": now,
