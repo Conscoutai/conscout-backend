@@ -82,6 +82,7 @@ class SignupRequest(BaseModel):
     name: str
     email: str
     password: str
+    workspace: str = ""
     app: str
     role: str | None = None
 
@@ -117,6 +118,7 @@ def signup(payload: SignupRequest):
         name=payload.name,
         email=payload.email,
         password=payload.password,
+        workspace=payload.workspace,
         role=normalize_user_role(payload.role),
         allowed_apps=[app_name],
     )

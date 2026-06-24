@@ -331,6 +331,7 @@ def create_user(
     name: str,
     email: str,
     password: str,
+    workspace: str = "",
     role: str = "admin",
     allowed_apps: list[str] | None = None,
 ) -> dict:
@@ -344,6 +345,7 @@ def create_user(
         "user_id": uuid.uuid4().hex,
         "email": normalized_email,
         "name": name.strip(),
+        "workspace": workspace.strip(),
         "password_hash": _hash_password(password),
         "role": normalize_user_role(role),
         "allowed_apps": normalize_allowed_apps(allowed_apps),
@@ -400,13 +402,16 @@ def start_user_session(user: dict, *, app_name: str | None = None) -> dict:
 
 def sanitize_user_payload(user: dict) -> dict:
     access_payload = _build_user_access_payload(user)
+    subscription = user.get("subscription")
     return {
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
         "name": user.get("name", ""),
+        "workspace": user.get("workspace", ""),
         "role": normalize_user_role(user.get("role")),
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "accessible_project_names": access_payload["accessible_project_names"],
+        "subscription": subscription if isinstance(subscription, dict) else {},
     }
 
 
