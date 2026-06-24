@@ -8,6 +8,8 @@ from core.auth import (
     authenticate_user,
     change_user_password,
     create_user,
+    ensure_user_allowed_for_app,
+    normalize_user_role,
     require_authenticated_user,
     sanitize_user_payload,
     start_user_session,
@@ -18,10 +20,18 @@ from services.account_deletion_service import delete_user_account
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+_SUPPORTED_APPS = {"main", "lite"}
 
 
 def _normalize_email(value: str) -> str:
     return value.strip().lower()
+
+
+def _normalize_app(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in _SUPPORTED_APPS:
+        raise HTTPException(status_code=400, detail="Invalid app identifier.")
+    return normalized
 
 
 def _delete_account_page(*, message: str = "", is_error: bool = False) -> str:
@@ -65,12 +75,15 @@ def _delete_account_page(*, message: str = "", is_error: bool = False) -> str:
 class LoginRequest(BaseModel):
     email: str
     password: str
+    app: str
 
 
 class SignupRequest(BaseModel):
     name: str
     email: str
     password: str
+    app: str
+    role: str | None = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -80,10 +93,12 @@ class ChangePasswordRequest(BaseModel):
 
 @router.post("/login")
 def login(payload: LoginRequest):
+    app_name = _normalize_app(payload.app)
     user = authenticate_user(payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
-    user = start_user_session(user)
+    ensure_user_allowed_for_app(user, app_name)
+    user = start_user_session(user, app_name=app_name)
     return {
         "token": user.get("session_token", ""),
         "user": sanitize_user_payload(user),
@@ -92,6 +107,7 @@ def login(payload: LoginRequest):
 
 @router.post("/signup")
 def signup(payload: SignupRequest):
+    app_name = _normalize_app(payload.app)
     if len(payload.password.strip()) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     if not payload.name.strip():
@@ -101,8 +117,10 @@ def signup(payload: SignupRequest):
         name=payload.name,
         email=payload.email,
         password=payload.password,
+        role=normalize_user_role(payload.role),
+        allowed_apps=[app_name],
     )
-    user = start_user_session(user)
+    user = start_user_session(user, app_name=app_name)
     return {
         "token": user.get("session_token", ""),
         "user": sanitize_user_payload(user),

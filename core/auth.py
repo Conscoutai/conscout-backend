@@ -26,6 +26,8 @@ from core.database import (
 
 DEFAULT_BOOTSTRAP_EMAIL = "saf@gmail.com"
 DEFAULT_BOOTSTRAP_PASSWORD = "safwan123"
+DEFAULT_ALLOWED_APP = "main"
+SUPPORTED_APPS = {"main", "lite"}
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -111,6 +113,38 @@ def _build_user_access_payload(user: dict) -> dict:
     }
 
 
+def normalize_user_role(value: str | None) -> str:
+    normalized = str(value or "admin").strip().lower()
+    return normalized if normalized in {"admin", "stakeholder"} else "admin"
+
+
+def normalize_allowed_apps(
+    values: list[str] | tuple[str, ...] | set[str] | str | None,
+) -> list[str]:
+    candidates = values if isinstance(values, (list, tuple, set)) else [values]
+    normalized = sorted(
+        {
+            str(item).strip().lower()
+            for item in candidates
+            if str(item or "").strip().lower() in SUPPORTED_APPS
+        }
+    )
+    return normalized or [DEFAULT_ALLOWED_APP]
+
+
+def user_can_access_app(user: dict, app_name: str) -> bool:
+    return app_name in normalize_allowed_apps(user.get("allowed_apps"))
+
+
+def ensure_user_allowed_for_app(user: dict, app_name: str) -> None:
+    if user_can_access_app(user, app_name):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"This account is not allowed to access the {app_name} app.",
+    )
+
+
 def ensure_admin_user(user: AuthenticatedUser) -> None:
     if user.role == "stakeholder":
         raise HTTPException(
@@ -163,6 +197,7 @@ def bootstrap_default_user() -> dict:
         "name": "Safwan",
         "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
         "role": "admin",
+        "allowed_apps": [DEFAULT_ALLOWED_APP],
         "session_token": "",
         "created_at": now,
         "updated_at": now,
@@ -291,7 +326,14 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
     return user
 
 
-def create_user(*, name: str, email: str, password: str) -> dict:
+def create_user(
+    *,
+    name: str,
+    email: str,
+    password: str,
+    role: str = "admin",
+    allowed_apps: list[str] | None = None,
+) -> dict:
     normalized_email = email.strip().lower()
     existing = raw_users_collection.find_one({"email": normalized_email})
     if existing:
@@ -303,7 +345,8 @@ def create_user(*, name: str, email: str, password: str) -> dict:
         "email": normalized_email,
         "name": name.strip(),
         "password_hash": _hash_password(password),
-        "role": "admin",
+        "role": normalize_user_role(role),
+        "allowed_apps": normalize_allowed_apps(allowed_apps),
         "session_token": "",
         "created_at": now,
         "updated_at": now,
@@ -333,16 +376,21 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
     return raw_users_collection.find_one({"_id": user["_id"]}) or user
 
 
-def start_user_session(user: dict) -> dict:
+def start_user_session(user: dict, *, app_name: str | None = None) -> dict:
     token = issue_session_token()
     access_payload = _build_user_access_payload(user)
+    allowed_apps = normalize_allowed_apps(user.get("allowed_apps"))
+    update_fields = {
+        "session_token": token,
+        "updated_at": int(__import__("time").time() * 1000),
+        "allowed_apps": allowed_apps,
+    }
+    if app_name:
+        update_fields["last_login_app"] = app_name
     raw_users_collection.update_one(
         {"_id": user["_id"]},
         {
-            "$set": {
-                "session_token": token,
-                "updated_at": int(__import__("time").time() * 1000),
-            }
+            "$set": update_fields
         },
     )
     refreshed = raw_users_collection.find_one({"_id": user["_id"]}) or user
@@ -356,6 +404,8 @@ def sanitize_user_payload(user: dict) -> dict:
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
         "name": user.get("name", ""),
+        "role": normalize_user_role(user.get("role")),
+        "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "accessible_project_names": access_payload["accessible_project_names"],
     }
 
