@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -10,7 +11,9 @@ from core.auth import (
     create_user,
     ensure_user_allowed_for_app,
     normalize_user_role,
+    refresh_user_session,
     require_authenticated_user,
+    revoke_user_session,
     sanitize_user_payload,
     start_user_session,
 )
@@ -21,6 +24,7 @@ from services.account_deletion_service import delete_user_account
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 _SUPPORTED_APPS = {"main", "lite"}
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _normalize_email(value: str) -> str:
@@ -92,6 +96,15 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class RefreshSessionRequest(BaseModel):
+    refresh_token: str
+    app: str | None = None
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str | None = None
+
+
 @router.post("/login")
 def login(payload: LoginRequest):
     app_name = _normalize_app(payload.app)
@@ -102,6 +115,9 @@ def login(payload: LoginRequest):
     user = start_user_session(user, app_name=app_name)
     return {
         "token": user.get("session_token", ""),
+        "refresh_token": user.get("refresh_token", ""),
+        "token_expires_at": user.get("session_expires_at"),
+        "refresh_token_expires_at": user.get("refresh_expires_at"),
         "user": sanitize_user_payload(user),
     }
 
@@ -125,6 +141,22 @@ def signup(payload: SignupRequest):
     user = start_user_session(user, app_name=app_name)
     return {
         "token": user.get("session_token", ""),
+        "refresh_token": user.get("refresh_token", ""),
+        "token_expires_at": user.get("session_expires_at"),
+        "refresh_token_expires_at": user.get("refresh_expires_at"),
+        "user": sanitize_user_payload(user),
+    }
+
+
+@router.post("/refresh")
+def refresh_session(payload: RefreshSessionRequest):
+    app_name = _normalize_app(payload.app or "lite")
+    user = refresh_user_session(payload.refresh_token, app_name=app_name)
+    return {
+        "token": user.get("session_token", ""),
+        "refresh_token": user.get("refresh_token", ""),
+        "token_expires_at": user.get("session_expires_at"),
+        "refresh_token_expires_at": user.get("refresh_expires_at"),
         "user": sanitize_user_payload(user),
     }
 
@@ -192,6 +224,19 @@ def delete_account(current_user: AuthenticatedUser = Depends(require_authenticat
         "message": "Account deleted successfully.",
         "deleted": deleted,
     }
+
+
+@router.post("/logout")
+def logout(
+    payload: LogoutRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+):
+    access_token = credentials.credentials.strip() if credentials else ""
+    revoke_user_session(
+        access_token=access_token,
+        refresh_token=payload.refresh_token,
+    )
+    return {"message": "Logged out successfully."}
 
 
 @router.get("/delete-account", response_class=HTMLResponse)

@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import time
 import uuid
 from typing import Generator, Optional
 
@@ -29,6 +30,13 @@ DEFAULT_BOOTSTRAP_PASSWORD = "safwan123"
 SUPPORTED_APPS = {"main", "lite"}
 DEFAULT_ALLOWED_APPS = sorted(SUPPORTED_APPS)
 _bearer_scheme = HTTPBearer(auto_error=False)
+ACCESS_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
+REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
+MAX_ACTIVE_SESSIONS = 12
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _resolve_stakeholder_projects_for_email(email: str) -> list[str]:
@@ -177,6 +185,94 @@ def issue_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def issue_refresh_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def _normalize_auth_sessions(user: dict) -> list[dict]:
+    raw_sessions = user.get("auth_sessions")
+    if not isinstance(raw_sessions, list):
+        return []
+
+    normalized: list[dict] = []
+    for item in raw_sessions:
+        if not isinstance(item, dict):
+            continue
+        access_token = str(item.get("access_token") or "").strip()
+        refresh_token = str(item.get("refresh_token") or "").strip()
+        session_id = str(item.get("session_id") or "").strip()
+        if not access_token or not refresh_token or not session_id:
+            continue
+        normalized.append(
+            {
+                "session_id": session_id,
+                "app_name": str(item.get("app_name") or "").strip().lower(),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "access_expires_at": int(item.get("access_expires_at") or 0),
+                "refresh_expires_at": int(item.get("refresh_expires_at") or 0),
+                "created_at": int(item.get("created_at") or 0),
+                "updated_at": int(item.get("updated_at") or 0),
+                "last_used_at": int(item.get("last_used_at") or 0),
+            }
+        )
+    return normalized
+
+
+def _prune_auth_sessions(sessions: list[dict], *, now_ms: Optional[int] = None) -> list[dict]:
+    current_ms = now_ms if now_ms is not None else _now_ms()
+    active = [
+        session
+        for session in sessions
+        if int(session.get("refresh_expires_at") or 0) > current_ms
+    ]
+    active.sort(key=lambda session: int(session.get("updated_at") or 0), reverse=True)
+    return active[:MAX_ACTIVE_SESSIONS]
+
+
+def _build_auth_session(*, app_name: str | None = None) -> dict:
+    current_ms = _now_ms()
+    return {
+        "session_id": uuid.uuid4().hex,
+        "app_name": (app_name or "").strip().lower(),
+        "access_token": issue_session_token(),
+        "refresh_token": issue_refresh_token(),
+        "access_expires_at": current_ms + ACCESS_TOKEN_TTL_MS,
+        "refresh_expires_at": current_ms + REFRESH_TOKEN_TTL_MS,
+        "created_at": current_ms,
+        "updated_at": current_ms,
+        "last_used_at": current_ms,
+    }
+
+
+def _save_auth_sessions(user: dict, sessions: list[dict], *, app_name: str | None = None) -> dict:
+    pruned_sessions = _prune_auth_sessions(sessions)
+    update_fields = {
+        "auth_sessions": pruned_sessions,
+        "session_token": pruned_sessions[0]["access_token"] if pruned_sessions else "",
+        "updated_at": _now_ms(),
+        "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
+    }
+    if app_name:
+        update_fields["last_login_app"] = app_name
+    raw_users_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
+    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+
+
+def _find_session_by_access_token(user: dict, token: str) -> Optional[dict]:
+    for session in _normalize_auth_sessions(user):
+        if session.get("access_token") == token:
+            return session
+    return None
+
+
+def _find_session_by_refresh_token(user: dict, token: str) -> Optional[dict]:
+    for session in _normalize_auth_sessions(user):
+        if session.get("refresh_token") == token:
+            return session
+    return None
+
+
 def bootstrap_default_user() -> dict:
     existing = raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL})
     if existing:
@@ -186,13 +282,13 @@ def bootstrap_default_user() -> dict:
                 "$set": {
                     "name": "Safwan",
                     "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
-                    "updated_at": int(__import__("time").time() * 1000),
+                    "updated_at": _now_ms(),
                 }
             },
         )
         return raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL}) or existing
 
-    now = int(__import__("time").time() * 1000)
+    now = _now_ms()
     doc = {
         "user_id": uuid.uuid4().hex,
         "email": DEFAULT_BOOTSTRAP_EMAIL,
@@ -201,6 +297,7 @@ def bootstrap_default_user() -> dict:
         "role": "admin",
         "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
         "session_token": "",
+        "auth_sessions": [],
         "created_at": now,
         "updated_at": now,
     }
@@ -342,7 +439,7 @@ def create_user(
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
 
-    now = int(__import__("time").time() * 1000)
+    now = _now_ms()
     doc = {
         "user_id": uuid.uuid4().hex,
         "email": normalized_email,
@@ -352,6 +449,7 @@ def create_user(
         "role": normalize_user_role(role),
         "allowed_apps": normalize_allowed_apps(allowed_apps),
         "session_token": "",
+        "auth_sessions": [],
         "created_at": now,
         "updated_at": now,
     }
@@ -366,7 +464,7 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
     if not verify_password(current_password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
 
-    now = int(__import__("time").time() * 1000)
+    now = _now_ms()
     new_hash = _hash_password(new_password)
     raw_users_collection.update_one(
         {"_id": user["_id"]},
@@ -381,25 +479,90 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
 
 
 def start_user_session(user: dict, *, app_name: str | None = None) -> dict:
-    token = issue_session_token()
-    access_payload = _build_user_access_payload(user)
-    allowed_apps = normalize_allowed_apps(user.get("allowed_apps"))
-    update_fields = {
-        "session_token": token,
-        "updated_at": int(__import__("time").time() * 1000),
-        "allowed_apps": allowed_apps,
-    }
-    if app_name:
-        update_fields["last_login_app"] = app_name
-    raw_users_collection.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": update_fields
-        },
-    )
-    refreshed = raw_users_collection.find_one({"_id": user["_id"]}) or user
-    refreshed["session_token"] = token
+    sessions = _normalize_auth_sessions(user)
+    sessions.insert(0, _build_auth_session(app_name=app_name))
+    refreshed = _save_auth_sessions(user, sessions, app_name=app_name)
+    latest_session = _normalize_auth_sessions(refreshed)[0]
+    refreshed["session_token"] = latest_session["access_token"]
+    refreshed["refresh_token"] = latest_session["refresh_token"]
+    refreshed["session_expires_at"] = latest_session["access_expires_at"]
+    refreshed["refresh_expires_at"] = latest_session["refresh_expires_at"]
     return refreshed
+
+
+def refresh_user_session(refresh_token: str, *, app_name: str | None = None) -> dict:
+    normalized_refresh_token = refresh_token.strip()
+    if not normalized_refresh_token:
+        raise HTTPException(status_code=401, detail="Refresh token is required.")
+
+    user = raw_users_collection.find_one({"auth_sessions.refresh_token": normalized_refresh_token})
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token.")
+
+    sessions = _normalize_auth_sessions(user)
+    matching_session = _find_session_by_refresh_token(user, normalized_refresh_token)
+    if not matching_session:
+        raise HTTPException(status_code=401, detail="Invalid refresh token.")
+
+    current_ms = _now_ms()
+    if int(matching_session.get("refresh_expires_at") or 0) <= current_ms:
+        remaining_sessions = [
+            session
+            for session in sessions
+            if session.get("session_id") != matching_session.get("session_id")
+        ]
+        _save_auth_sessions(user, remaining_sessions)
+        raise HTTPException(status_code=401, detail="Refresh token expired.")
+
+    rotated_session = {
+        **matching_session,
+        "app_name": (app_name or matching_session.get("app_name") or "").strip().lower(),
+        "access_token": issue_session_token(),
+        "refresh_token": issue_refresh_token(),
+        "access_expires_at": current_ms + ACCESS_TOKEN_TTL_MS,
+        "refresh_expires_at": current_ms + REFRESH_TOKEN_TTL_MS,
+        "updated_at": current_ms,
+        "last_used_at": current_ms,
+    }
+    updated_sessions = [
+        rotated_session if session.get("session_id") == rotated_session["session_id"] else session
+        for session in sessions
+    ]
+    refreshed = _save_auth_sessions(user, updated_sessions, app_name=app_name)
+    refreshed["session_token"] = rotated_session["access_token"]
+    refreshed["refresh_token"] = rotated_session["refresh_token"]
+    refreshed["session_expires_at"] = rotated_session["access_expires_at"]
+    refreshed["refresh_expires_at"] = rotated_session["refresh_expires_at"]
+    return refreshed
+
+
+def revoke_user_session(
+    *,
+    access_token: str | None = None,
+    refresh_token: str | None = None,
+) -> None:
+    normalized_access = (access_token or "").strip()
+    normalized_refresh = (refresh_token or "").strip()
+    if not normalized_access and not normalized_refresh:
+        return
+
+    user = None
+    if normalized_access:
+        user = raw_users_collection.find_one({"auth_sessions.access_token": normalized_access})
+        if not user:
+            user = raw_users_collection.find_one({"session_token": normalized_access})
+    if user is None and normalized_refresh:
+        user = raw_users_collection.find_one({"auth_sessions.refresh_token": normalized_refresh})
+    if not user:
+        return
+
+    sessions = [
+        session
+        for session in _normalize_auth_sessions(user)
+        if session.get("access_token") != normalized_access
+        and session.get("refresh_token") != normalized_refresh
+    ]
+    _save_auth_sessions(user, sessions)
 
 
 def sanitize_user_payload(user: dict) -> dict:
@@ -414,6 +577,8 @@ def sanitize_user_payload(user: dict) -> dict:
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "accessible_project_names": access_payload["accessible_project_names"],
         "subscription": subscription if isinstance(subscription, dict) else {},
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
     }
 
 
@@ -426,6 +591,30 @@ async def require_authenticated_user(
         token = access_token.strip()
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required.")
+
+    user = raw_users_collection.find_one({"auth_sessions.access_token": token})
+    if user:
+        session = _find_session_by_access_token(user, token)
+        if session:
+            current_ms = _now_ms()
+            if int(session.get("access_expires_at") or 0) <= current_ms:
+                raise HTTPException(status_code=401, detail="Access token expired.")
+
+            access_payload = _build_user_access_payload(user)
+            auth_user = AuthenticatedUser(
+                user_id=user.get("user_id", ""),
+                email=user.get("email", ""),
+                name=user.get("name", ""),
+                role=access_payload["role"],
+                accessible_project_names=tuple(access_payload["accessible_project_names"]),
+                accessible_floorplan_ids=tuple(access_payload["accessible_floorplan_ids"]),
+            )
+            context_token = set_current_user(auth_user)
+            try:
+                yield auth_user
+            finally:
+                reset_current_user(context_token)
+            return
 
     user = raw_users_collection.find_one({"session_token": token})
     if not user:
