@@ -6,7 +6,7 @@ import secrets
 import shutil
 import time
 import uuid
-from typing import Generator, Optional
+from typing import Generator, Optional, Union
 
 from fastapi import Depends, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -121,13 +121,13 @@ def _build_user_access_payload(user: dict) -> dict:
     }
 
 
-def normalize_user_role(value: str | None) -> str:
+def normalize_user_role(value: Optional[str]) -> str:
     normalized = str(value or "admin").strip().lower()
     return normalized if normalized in {"admin", "stakeholder"} else "admin"
 
 
 def normalize_allowed_apps(
-    values: list[str] | tuple[str, ...] | set[str] | str | None,
+    values: Optional[Union[list[str], tuple[str, ...], set[str], str]],
 ) -> list[str]:
     candidates = values if isinstance(values, (list, tuple, set)) else [values]
     normalized = {
@@ -230,7 +230,7 @@ def _prune_auth_sessions(sessions: list[dict], *, now_ms: Optional[int] = None) 
     return active[:MAX_ACTIVE_SESSIONS]
 
 
-def _build_auth_session(*, app_name: str | None = None) -> dict:
+def _build_auth_session(*, app_name: Optional[str] = None) -> dict:
     current_ms = _now_ms()
     return {
         "session_id": uuid.uuid4().hex,
@@ -245,7 +245,14 @@ def _build_auth_session(*, app_name: str | None = None) -> dict:
     }
 
 
-def _save_auth_sessions(user: dict, sessions: list[dict], *, app_name: str | None = None) -> dict:
+def _save_auth_sessions(
+    user: dict,
+    sessions: list[dict],
+    *,
+    app_name: Optional[str] = None,
+    record_login: bool = False,
+    login_at: Optional[int] = None,
+) -> dict:
     pruned_sessions = _prune_auth_sessions(sessions)
     update_fields = {
         "auth_sessions": pruned_sessions,
@@ -253,7 +260,10 @@ def _save_auth_sessions(user: dict, sessions: list[dict], *, app_name: str | Non
         "updated_at": _now_ms(),
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
     }
-    if app_name:
+    if record_login:
+        resolved_login_at = login_at if login_at is not None else _now_ms()
+        update_fields["last_login_at"] = resolved_login_at
+    if app_name and record_login:
         update_fields["last_login_app"] = app_name
     raw_users_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
     return raw_users_collection.find_one({"_id": user["_id"]}) or user
@@ -298,6 +308,7 @@ def bootstrap_default_user() -> dict:
         "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
         "session_token": "",
         "auth_sessions": [],
+        "last_login_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -432,7 +443,7 @@ def create_user(
     password: str,
     workspace: str = "",
     role: str = "admin",
-    allowed_apps: list[str] | None = None,
+    allowed_apps: Optional[list[str]] = None,
 ) -> dict:
     normalized_email = email.strip().lower()
     existing = raw_users_collection.find_one({"email": normalized_email})
@@ -450,6 +461,7 @@ def create_user(
         "allowed_apps": normalize_allowed_apps(allowed_apps),
         "session_token": "",
         "auth_sessions": [],
+        "last_login_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -478,10 +490,17 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
     return raw_users_collection.find_one({"_id": user["_id"]}) or user
 
 
-def start_user_session(user: dict, *, app_name: str | None = None) -> dict:
+def start_user_session(user: dict, *, app_name: Optional[str] = None) -> dict:
     sessions = _normalize_auth_sessions(user)
-    sessions.insert(0, _build_auth_session(app_name=app_name))
-    refreshed = _save_auth_sessions(user, sessions, app_name=app_name)
+    new_session = _build_auth_session(app_name=app_name)
+    sessions.insert(0, new_session)
+    refreshed = _save_auth_sessions(
+        user,
+        sessions,
+        app_name=app_name,
+        record_login=True,
+        login_at=new_session["created_at"],
+    )
     latest_session = _normalize_auth_sessions(refreshed)[0]
     refreshed["session_token"] = latest_session["access_token"]
     refreshed["refresh_token"] = latest_session["refresh_token"]
@@ -490,7 +509,7 @@ def start_user_session(user: dict, *, app_name: str | None = None) -> dict:
     return refreshed
 
 
-def refresh_user_session(refresh_token: str, *, app_name: str | None = None) -> dict:
+def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) -> dict:
     normalized_refresh_token = refresh_token.strip()
     if not normalized_refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token is required.")
@@ -538,8 +557,8 @@ def refresh_user_session(refresh_token: str, *, app_name: str | None = None) -> 
 
 def revoke_user_session(
     *,
-    access_token: str | None = None,
-    refresh_token: str | None = None,
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
 ) -> None:
     normalized_access = (access_token or "").strip()
     normalized_refresh = (refresh_token or "").strip()
@@ -577,6 +596,9 @@ def sanitize_user_payload(user: dict) -> dict:
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "accessible_project_names": access_payload["accessible_project_names"],
         "subscription": subscription if isinstance(subscription, dict) else {},
+        "last_login_at": user.get("last_login_at"),
+        "last_login_app": user.get("last_login_app", ""),
+        "last_login_platform": user.get("last_login_platform", ""),
         "created_at": user.get("created_at"),
         "updated_at": user.get("updated_at"),
     }

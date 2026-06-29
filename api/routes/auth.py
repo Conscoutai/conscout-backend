@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import secrets
+import time
+from typing import Optional
+
+import requests
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse
@@ -18,6 +23,7 @@ from core.auth import (
     start_user_session,
 )
 from core.auth_context import AuthenticatedUser
+from core.config import GOOGLE_OAUTH_CLIENT_IDS, GOOGLE_OAUTH_HOSTED_DOMAIN
 from core.database import raw_users_collection
 from services.account_deletion_service import delete_user_account
 
@@ -88,7 +94,7 @@ class SignupRequest(BaseModel):
     password: str
     workspace: str = ""
     app: str
-    role: str | None = None
+    role: Optional[str] = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -98,19 +104,72 @@ class ChangePasswordRequest(BaseModel):
 
 class RefreshSessionRequest(BaseModel):
     refresh_token: str
-    app: str | None = None
+    app: Optional[str] = None
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str | None = None
+    refresh_token: Optional[str] = None
 
 
-@router.post("/login")
-def login(payload: LoginRequest):
-    app_name = _normalize_app(payload.app)
-    user = authenticate_user(payload.email, payload.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+    provider: str = "google"
+    intent: str = "login"
+    app: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+    google_user_id: Optional[str] = None
+    photo_url: Optional[str] = None
+    workspace: Optional[str] = None
+    platform: Optional[str] = None
+
+
+def _verify_google_id_token(id_token: str) -> dict:
+    token = id_token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Google ID token is required.")
+
+    try:
+        response = requests.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": token},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to verify Google sign-in right now.",
+        ) from exc
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token.")
+
+    payload = response.json()
+    issuer = str(payload.get("iss") or "").strip()
+    if issuer not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=401, detail="Invalid Google token issuer.")
+
+    audience = str(payload.get("aud") or "").strip()
+    if GOOGLE_OAUTH_CLIENT_IDS and audience not in GOOGLE_OAUTH_CLIENT_IDS:
+        raise HTTPException(status_code=401, detail="Google token audience mismatch.")
+
+    email_verified = str(payload.get("email_verified") or "").strip().lower()
+    if email_verified != "true":
+        raise HTTPException(status_code=403, detail="Google email is not verified.")
+
+    hosted_domain = GOOGLE_OAUTH_HOSTED_DOMAIN
+    if hosted_domain:
+        token_domain = str(payload.get("hd") or "").strip().lower()
+        if token_domain != hosted_domain:
+            raise HTTPException(
+                status_code=403,
+                detail="This Google account is not allowed for this workspace.",
+            )
+
+    return payload
+
+
+def _finalize_auth_response(user: dict, *, app_name: str) -> dict:
     ensure_user_allowed_for_app(user, app_name)
     user = start_user_session(user, app_name=app_name)
     return {
@@ -120,6 +179,15 @@ def login(payload: LoginRequest):
         "refresh_token_expires_at": user.get("refresh_expires_at"),
         "user": sanitize_user_payload(user),
     }
+
+
+@router.post("/login")
+def login(payload: LoginRequest):
+    app_name = _normalize_app(payload.app)
+    user = authenticate_user(payload.email, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    return _finalize_auth_response(user, app_name=app_name)
 
 
 @router.post("/signup")
@@ -138,14 +206,69 @@ def signup(payload: SignupRequest):
         role=normalize_user_role(payload.role),
         allowed_apps=[app_name],
     )
-    user = start_user_session(user, app_name=app_name)
-    return {
-        "token": user.get("session_token", ""),
-        "refresh_token": user.get("refresh_token", ""),
-        "token_expires_at": user.get("session_expires_at"),
-        "refresh_token_expires_at": user.get("refresh_expires_at"),
-        "user": sanitize_user_payload(user),
+    return _finalize_auth_response(user, app_name=app_name)
+
+
+@router.post("/google")
+def google_auth(payload: GoogleAuthRequest):
+    if payload.provider.strip().lower() != "google":
+        raise HTTPException(status_code=400, detail="Unsupported auth provider.")
+
+    app_name = _normalize_app(payload.app)
+    token_payload = _verify_google_id_token(payload.id_token)
+
+    email = _normalize_email(
+        str(token_payload.get("email") or payload.email or "")
+    )
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account email is missing.")
+
+    display_name = str(
+        payload.name
+        or token_payload.get("name")
+        or email.split("@", 1)[0]
+    ).strip()
+    workspace = str(payload.workspace or "").strip()
+    google_user_id = str(
+        token_payload.get("sub") or payload.google_user_id or ""
+    ).strip()
+    photo_url = str(
+        payload.photo_url
+        or token_payload.get("picture")
+        or ""
+    ).strip()
+
+    user = raw_users_collection.find_one({"email": email})
+    if not user:
+        user = create_user(
+            name=display_name or "Google User",
+            email=email,
+            password=secrets.token_urlsafe(32),
+            workspace=workspace,
+            role="admin",
+            allowed_apps=[app_name],
+        )
+
+    update_fields = {
+        "updated_at": int(time.time() * 1000),
+        "name": display_name or user.get("name", ""),
+        "workspace": workspace or user.get("workspace", ""),
+        "allowed_apps": [app_name],
+        "auth_provider": "google",
+        "google_user_id": google_user_id,
+        "google_photo_url": photo_url,
+        "google_email_verified": True,
     }
+    if payload.platform:
+        update_fields["last_login_platform"] = payload.platform.strip().lower()
+    if payload.intent:
+        update_fields["last_google_intent"] = payload.intent.strip().lower()
+    raw_users_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": update_fields},
+    )
+    user = raw_users_collection.find_one({"_id": user["_id"]}) or user
+    return _finalize_auth_response(user, app_name=app_name)
 
 
 @router.post("/refresh")
@@ -229,7 +352,7 @@ def delete_account(current_user: AuthenticatedUser = Depends(require_authenticat
 @router.post("/logout")
 def logout(
     payload: LogoutRequest,
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ):
     access_token = credentials.credentials.strip() if credentials else ""
     revoke_user_session(

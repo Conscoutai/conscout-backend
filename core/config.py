@@ -49,6 +49,11 @@ def _env_bool(key: str, default: bool) -> bool:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+def _env_list(key: str, default: str = "") -> list[str]:
+    value = os.getenv(key)
+    raw = value if value is not None else default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
 def _port(default_key: str, default_value: int) -> int:
     port = _env_int("PORT", 0)
     if port > 0:
@@ -348,4 +353,6 @@ AI_PORT = _port("AI_PORT", 8001)
 # ---------------------------------------------------------
 APP_TITLE = _env("APP_TITLE", "Construction Monitor Stitching Service")
 APP_VERSION = _env("APP_VERSION", "1.3")
+GOOGLE_OAUTH_CLIENT_IDS = _env_list("GOOGLE_OAUTH_CLIENT_IDS")
+GOOGLE_OAUTH_HOSTED_DOMAIN = _env("GOOGLE_OAUTH_HOSTED_DOMAIN", "").strip().lower()
 

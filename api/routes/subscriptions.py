@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -17,10 +18,10 @@ class SubscriptionRequestPayload(BaseModel):
     plan_code: str = Field(..., min_length=1)
     plan_name: str = Field(..., min_length=1)
     monthly_price_usd: int = Field(..., ge=0)
-    project_limit: int | None = Field(default=None, ge=1)
+    project_limit: Optional[int] = Field(default=None, ge=1)
     company_name: str = Field(..., min_length=1)
     phone: str = ""
-    requested_project_count: int | None = Field(default=None, ge=1)
+    requested_project_count: Optional[int] = Field(default=None, ge=1)
     notes: str = ""
 
 
