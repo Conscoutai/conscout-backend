@@ -18,6 +18,7 @@ from core.auth import (
     normalize_user_role,
     refresh_user_session,
     require_authenticated_user,
+    reset_user_password_by_email,
     revoke_user_session,
     sanitize_user_payload,
     start_user_session,
@@ -99,6 +100,11 @@ class SignupRequest(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
+    new_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
     new_password: str
 
 
@@ -332,6 +338,15 @@ def change_password(
         user_id=current_user.user_id,
         current_password=current_password,
         new_password=new_password,
+    )
+    return {"message": "Password updated successfully."}
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: ForgotPasswordRequest):
+    reset_user_password_by_email(
+        email=payload.email,
+        new_password=payload.new_password,
     )
     return {"message": "Password updated successfully."}
 

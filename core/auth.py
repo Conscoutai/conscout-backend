@@ -490,6 +490,40 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
     return raw_users_collection.find_one({"_id": user["_id"]}) or user
 
 
+def reset_user_password_by_email(*, email: str, new_password: str) -> dict:
+    normalized_email = email.strip().lower()
+    if not normalized_email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    user = raw_users_collection.find_one({"email": normalized_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if str(user.get("auth_provider") or "").strip().lower() == "google":
+        raise HTTPException(
+            status_code=400,
+            detail="This account uses Google Sign-In. Continue with Google instead.",
+        )
+    if len(new_password.strip()) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters.",
+        )
+
+    now = _now_ms()
+    new_hash = _hash_password(new_password.strip())
+    raw_users_collection.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "password_hash": new_hash,
+                "session_token": "",
+                "auth_sessions": [],
+                "updated_at": now,
+            }
+        },
+    )
+    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+
+
 def start_user_session(user: dict, *, app_name: Optional[str] = None) -> dict:
     sessions = _normalize_auth_sessions(user)
     new_session = _build_auth_session(app_name=app_name)
