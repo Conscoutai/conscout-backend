@@ -7,7 +7,7 @@ Use this when the website runs on `https://conscout.com` but the backend still r
 Make sure `.env` contains:
 
 ```env
-ALLOWED_ORIGINS=https://conscout.com,https://www.conscout.com,https://conscout-web.pages.dev
+ALLOWED_ORIGINS=https://conscout.com,https://www.conscout.com,https://conscout-web.pages.dev,http://localhost:3000,http://127.0.0.1:3000
 ```
 
 Then restart the backend service.

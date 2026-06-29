@@ -80,6 +80,7 @@ raw_work_schedules_collection = db["work_schedules"]
 raw_users_collection = db["users"]
 raw_inspections_collection = db["inspections"]
 raw_notifications_collection = db["notifications"]
+raw_subscription_requests_collection = db["subscription_requests"]
 
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.

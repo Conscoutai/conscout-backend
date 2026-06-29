@@ -25,8 +25,9 @@ from core.database import (
 )
 
 
-DEFAULT_BOOTSTRAP_EMAIL = "saf@gmail.com"
-DEFAULT_BOOTSTRAP_PASSWORD = "safwan123"
+DEFAULT_BOOTSTRAP_EMAIL = "safwanc189@gmail.com"
+DEFAULT_BOOTSTRAP_PASSWORD = "1234567890"
+SUBSCRIPTION_ADMIN_EMAIL = "safwanc189@gmail.com"
 SUPPORTED_APPS = {"main", "lite"}
 DEFAULT_ALLOWED_APPS = sorted(SUPPORTED_APPS)
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -163,6 +164,16 @@ def ensure_admin_user(user: AuthenticatedUser) -> None:
         )
 
 
+def ensure_subscription_admin_user(user: AuthenticatedUser) -> None:
+    ensure_admin_user(user)
+    normalized_email = str(user.email or "").strip().lower()
+    if normalized_email != SUBSCRIPTION_ADMIN_EMAIL:
+        raise HTTPException(
+            status_code=403,
+            detail="This page is restricted to the designated subscription admin account.",
+        )
+
+
 def _hash_password(password: str, *, salt: Optional[str] = None) -> str:
     resolved_salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
@@ -290,8 +301,10 @@ def bootstrap_default_user() -> dict:
             {"_id": existing["_id"]},
             {
                 "$set": {
-                    "name": "Safwan",
+                    "name": "Conscout Admin",
                     "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
+                    "role": "admin",
+                    "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
                     "updated_at": _now_ms(),
                 }
             },
@@ -302,7 +315,7 @@ def bootstrap_default_user() -> dict:
     doc = {
         "user_id": uuid.uuid4().hex,
         "email": DEFAULT_BOOTSTRAP_EMAIL,
-        "name": "Safwan",
+        "name": "Conscout Admin",
         "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
         "role": "admin",
         "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
@@ -621,6 +634,10 @@ def revoke_user_session(
 def sanitize_user_payload(user: dict) -> dict:
     access_payload = _build_user_access_payload(user)
     subscription = user.get("subscription")
+    pending_subscription_request = user.get("pending_subscription_request")
+    active_plan_code = ""
+    if isinstance(subscription, dict):
+        active_plan_code = str(subscription.get("plan_code") or "").strip().lower()
     return {
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
@@ -629,7 +646,11 @@ def sanitize_user_payload(user: dict) -> dict:
         "role": normalize_user_role(user.get("role")),
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "accessible_project_names": access_payload["accessible_project_names"],
+        "plan_code": active_plan_code,
         "subscription": subscription if isinstance(subscription, dict) else {},
+        "pending_subscription_request": pending_subscription_request
+        if isinstance(pending_subscription_request, dict)
+        else {},
         "last_login_at": user.get("last_login_at"),
         "last_login_app": user.get("last_login_app", ""),
         "last_login_platform": user.get("last_login_platform", ""),
