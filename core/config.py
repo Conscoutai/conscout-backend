@@ -356,3 +356,21 @@ APP_VERSION = _env("APP_VERSION", "1.3")
 GOOGLE_OAUTH_CLIENT_IDS = _env_list("GOOGLE_OAUTH_CLIENT_IDS")
 GOOGLE_OAUTH_HOSTED_DOMAIN = _env("GOOGLE_OAUTH_HOSTED_DOMAIN", "").strip().lower()
 
+# ---------------------------------------------------------
+# Payments
+# ---------------------------------------------------------
+PUBLIC_API_BASE_URL = _env("PUBLIC_API_BASE_URL", "").rstrip("/")
+MOYASAR_PUBLISHABLE_KEY = _env("MOYASAR_PUBLISHABLE_KEY", "").strip()
+MOYASAR_SECRET_KEY = _env("MOYASAR_SECRET_KEY", "").strip()
+MOYASAR_FORM_SCRIPT_URL = _env(
+    "MOYASAR_FORM_SCRIPT_URL",
+    "https://cdn.moyasar.com/mpf/1.15.0/moyasar.js",
+).strip()
+MOYASAR_FORM_CSS_URL = _env(
+    "MOYASAR_FORM_CSS_URL",
+    "https://cdn.moyasar.com/mpf/1.15.0/moyasar.css",
+).strip()
+SUBSCRIPTION_PAYMENT_CURRENCY = _env("SUBSCRIPTION_PAYMENT_CURRENCY", "USD").strip().upper()
+MOYASAR_APPLE_PAY_COUNTRY = _env("MOYASAR_APPLE_PAY_COUNTRY", "SA").strip().upper()
+MOYASAR_APPLE_PAY_LABEL = _env("MOYASAR_APPLE_PAY_LABEL", "ConScout").strip() or "ConScout"
+

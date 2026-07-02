@@ -19,7 +19,7 @@ from core.auth import require_authenticated_user
 api_router = APIRouter()
 
 api_router.include_router(auth_router)
-api_router.include_router(subscriptions_router, dependencies=[Depends(require_authenticated_user)])
+api_router.include_router(subscriptions_router)
 api_router.include_router(chatbot_router)
 api_router.include_router(project_setup_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(notifications_router, dependencies=[Depends(require_authenticated_user)])

@@ -503,6 +503,38 @@ def change_user_password(*, user_id: str, current_password: str, new_password: s
     return raw_users_collection.find_one({"_id": user["_id"]}) or user
 
 
+def update_user_profile(
+    *,
+    user_id: str,
+    name: str,
+    workspace: Optional[str] = None,
+) -> dict:
+    normalized_user_id = user_id.strip()
+    if not normalized_user_id:
+        raise HTTPException(status_code=400, detail="User ID is required.")
+
+    resolved_name = name.strip()
+    if not resolved_name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+
+    user = raw_users_collection.find_one({"user_id": normalized_user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    update_fields = {
+        "name": resolved_name,
+        "updated_at": _now_ms(),
+    }
+    if workspace is not None:
+        update_fields["workspace"] = workspace.strip()
+
+    raw_users_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": update_fields},
+    )
+    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+
+
 def reset_user_password_by_email(*, email: str, new_password: str) -> dict:
     normalized_email = email.strip().lower()
     if not normalized_email:

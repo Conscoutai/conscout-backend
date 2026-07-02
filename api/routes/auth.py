@@ -22,6 +22,7 @@ from core.auth import (
     revoke_user_session,
     sanitize_user_payload,
     start_user_session,
+    update_user_profile,
 )
 from core.auth_context import AuthenticatedUser
 from core.config import GOOGLE_OAUTH_CLIENT_IDS, GOOGLE_OAUTH_HOSTED_DOMAIN
@@ -101,6 +102,11 @@ class SignupRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class UpdateProfileRequest(BaseModel):
+    name: str
+    workspace: Optional[str] = None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -296,6 +302,22 @@ def me(current_user: AuthenticatedUser = Depends(require_authenticated_user)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"user": sanitize_user_payload(user)}
+
+
+@router.put("/profile")
+def update_profile(
+    payload: UpdateProfileRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    user = update_user_profile(
+        user_id=current_user.user_id,
+        name=payload.name,
+        workspace=payload.workspace,
+    )
+    return {
+        "message": "Profile updated successfully.",
+        "user": sanitize_user_payload(user),
+    }
 
 
 @router.get("/users/exists")
