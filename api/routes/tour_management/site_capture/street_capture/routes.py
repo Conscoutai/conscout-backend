@@ -58,19 +58,26 @@ async def upload_street_capture(
 
 @router.get("/site-capture/street-capture/graph")
 @router.get("/streetview-graph")
-def street_capture_graph(tour_id: str):
+def street_capture_graph(
+    tour_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     return build_street_capture_graph(tour_id)
 
 
 @router.get("/site-capture/street-capture/latest-tour")
 @router.get("/latest-tour")
-def latest_street_capture_tour():
+def latest_street_capture_tour(
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     return get_latest_street_capture_tour_id()
 
 
 @router.get("/site-capture/street-capture/all-tours")
 @router.get("/all-streetview-tours")
-def all_street_capture_tours():
+def all_street_capture_tours(
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     return list_all_street_capture_tours()
 
 

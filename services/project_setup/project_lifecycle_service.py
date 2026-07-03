@@ -3,12 +3,22 @@ import shutil
 
 from fastapi import HTTPException
 
-from core.database import floorplans_collection, tours_collection, work_schedules_collection
+from core.database import (
+    floorplans_collection,
+    inspections_collection,
+    notifications_collection,
+    tours_collection,
+    work_schedules_collection,
+)
 from core.config import (
+    SITES_DIR,
     DEFAULT_SITE_NAME,
     site_dir,
     site_floorplan_dir,
     site_storage_roots,
+)
+from services.tour_management.site_capture.shared.storage_service import (
+    resolve_storage_dir_for_tour,
 )
 
 
@@ -32,12 +42,73 @@ def delete_floorplan_image(fp: dict) -> None:
 
 
 def delete_project(site_name: str) -> None:
-    floorplans_collection.delete_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]}
+    normalized_site = (site_name or "").strip()
+    if not normalized_site:
+        raise HTTPException(400, "Project name is required")
+
+    site_filter = {"$or": [{"site_name": normalized_site}, {"dxf_project_id": normalized_site}]}
+    floorplans = list(floorplans_collection.find(site_filter))
+    floorplan_ids = [
+        str(doc.get("id") or "").strip()
+        for doc in floorplans
+        if str(doc.get("id") or "").strip()
+    ]
+    tour_filter = {
+        "$or": [
+            {"site_name": normalized_site},
+            {"site": normalized_site},
+            {"project_id": normalized_site},
+            {"dxf_project_id": normalized_site},
+            *([{"floorplan_id": {"$in": floorplan_ids}}] if floorplan_ids else []),
+        ]
+    }
+    tours = list(
+        tours_collection.find(tour_filter)
     )
-    project_dir = site_dir(site_name)
-    if os.path.isdir(project_dir):
-        shutil.rmtree(project_dir, ignore_errors=True)
+
+    removed_dirs: set[str] = set()
+
+    for tour in tours:
+        tour_id = str(tour.get("tour_id") or "").strip()
+        if not tour_id:
+            continue
+        tour_dir = os.path.abspath(resolve_storage_dir_for_tour(tour_id, tour))
+        if tour_dir in removed_dirs:
+            continue
+        if os.path.isdir(tour_dir):
+            shutil.rmtree(tour_dir, ignore_errors=True)
+            removed_dirs.add(tour_dir)
+
+    site_dirs_to_remove: set[str] = set()
+    site_dirs_to_remove.add(os.path.abspath(site_dir(normalized_site)))
+    site_dirs_to_remove.add(os.path.abspath(os.path.join(SITES_DIR, normalized_site)))
+
+    for doc in [*floorplans, *tours]:
+        site_dirs_to_remove.add(
+            os.path.abspath(
+                site_dir(
+                    normalized_site,
+                    owner_email=doc.get("owner_email"),
+                    owner_user_id=doc.get("owner_user_id"),
+                )
+            )
+        )
+
+    floorplans_collection.delete_many(
+        site_filter
+    )
+    tours_collection.delete_many(
+        tour_filter
+    )
+    work_schedules_collection.delete_many(
+        {"$or": [{"project_id": normalized_site}, {"site_name": normalized_site}]}
+    )
+    inspections_collection.delete_many({"site_name": normalized_site})
+    notifications_collection.delete_many({"site_name": normalized_site})
+
+    for project_dir in site_dirs_to_remove:
+        if os.path.isdir(project_dir):
+            shutil.rmtree(project_dir, ignore_errors=True)
 
 
 def _rewrite_site_path(value: str, old_site_name: str, new_site_name: str) -> str:

@@ -42,17 +42,13 @@ def merge_owner_filter(filter_doc: Optional[dict[str, Any]] = None) -> dict[str,
         {"owner_user_id": user.user_id},
         {"owner_email": user.email.strip().lower()},
     ]
-    if user.accessible_project_names:
+    if user.accessible_floorplan_ids:
+        floorplan_ids = list(user.accessible_floorplan_ids)
         access_clauses.extend(
             [
-                {"site_name": {"$in": list(user.accessible_project_names)}},
-                {"dxf_project_id": {"$in": list(user.accessible_project_names)}},
-                {"project_id": {"$in": list(user.accessible_project_names)}},
+                {"id": {"$in": floorplan_ids}},
+                {"floorplan_id": {"$in": floorplan_ids}},
             ]
-        )
-    if user.accessible_floorplan_ids:
-        access_clauses.append(
-            {"floorplan_id": {"$in": list(user.accessible_floorplan_ids)}}
         )
 
     if len(access_clauses) == 1:

@@ -113,25 +113,20 @@ def _build_stakeholder_members(stakeholder_emails: list[str]) -> list[dict]:
 def list_projects(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
-    project_names = {
-        name.strip().lower()
-        for name in current_user.accessible_project_names
-        if name.strip()
+    floorplan_ids = {
+        floorplan_id.strip()
+        for floorplan_id in current_user.accessible_floorplan_ids
+        if floorplan_id.strip()
     }
     query = {
         "$or": [
             {"owner_user_id": current_user.user_id},
             {"owner_email": current_user.email.strip().lower()},
+            {"stakeholder_emails": current_user.email.strip().lower()},
         ]
     }
-    if project_names:
-        query["$or"].extend(
-            [
-                {"site_name": {"$in": list(project_names)}},
-                {"dxf_project_id": {"$in": list(project_names)}},
-                {"stakeholder_emails": current_user.email.strip().lower()},
-            ]
-        )
+    if floorplan_ids:
+        query["$or"].append({"id": {"$in": list(floorplan_ids)}})
 
     floorplans = list(raw_floorplans_collection.find(query).sort("_id", -1))
     seen_sites = set()
@@ -152,7 +147,10 @@ def list_projects(
 
 # Fetches latest floorplan for that site.
 @router.get("/projects/{site_name}/floorplan")
-def get_project_floorplan(site_name: str):
+def get_project_floorplan(
+    site_name: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     fp = floorplans_collection.find_one(
         {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
         sort=[("_id", -1)],

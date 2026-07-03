@@ -40,29 +40,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _resolve_stakeholder_projects_for_email(email: str) -> list[str]:
-    normalized_email = email.strip().lower()
-    if not normalized_email:
-        return []
-
-    projects: set[str] = set()
-    for floorplan in raw_floorplans_collection.find(
-        {"stakeholder_emails": normalized_email},
-        {"site_name": 1, "dxf_project_id": 1},
-    ):
-        site_name = (
-            str(
-                floorplan.get("site_name")
-                or floorplan.get("dxf_project_id")
-                or ""
-            ).strip()
-        )
-        if site_name:
-            projects.add(site_name)
-    return sorted(projects)
-
-
-def _resolve_owned_projects_for_user(user: dict) -> list[str]:
+def _resolve_accessible_floorplans_for_user(user: dict) -> list[dict]:
     user_id = str(user.get("user_id") or "").strip()
     email = str(user.get("email") or "").strip().lower()
     if not user_id and not email:
@@ -74,51 +52,52 @@ def _resolve_owned_projects_for_user(user: dict) -> list[str]:
     if email:
         owner_query["$or"].append({"owner_email": email})
         owner_query["$or"].append({"created_by_email": email})
+        owner_query["$or"].append({"stakeholder_emails": email})
     if not owner_query["$or"]:
         return []
 
-    projects: set[str] = set()
+    floorplans: list[dict] = []
     for floorplan in raw_floorplans_collection.find(
         owner_query,
-        {"site_name": 1, "dxf_project_id": 1},
+        {"id": 1, "site_name": 1, "dxf_project_id": 1},
     ):
+        floorplan_id = str(floorplan.get("id") or "").strip()
         site_name = str(
             floorplan.get("site_name") or floorplan.get("dxf_project_id") or ""
         ).strip()
-        if site_name:
-            projects.add(site_name)
-    return sorted(projects)
-
-
-def _resolve_accessible_floorplan_ids(project_names: list[str]) -> list[str]:
-    if not project_names:
-        return []
-    floorplan_ids: set[str] = set()
-    for floorplan in raw_floorplans_collection.find(
-        {
-            "$or": [
-                {"site_name": {"$in": project_names}},
-                {"dxf_project_id": {"$in": project_names}},
-            ]
-        },
-        {"id": 1},
-    ):
-        floorplan_id = str(floorplan.get("id") or "").strip()
-        if floorplan_id:
-            floorplan_ids.add(floorplan_id)
-    return sorted(floorplan_ids)
+        if not floorplan_id and not site_name:
+            continue
+        floorplans.append(
+            {
+                "id": floorplan_id,
+                "site_name": site_name,
+            }
+        )
+    return floorplans
 
 
 def _build_user_access_payload(user: dict) -> dict:
-    invited_projects = _resolve_stakeholder_projects_for_email(user.get("email", ""))
-    owned_projects = _resolve_owned_projects_for_user(user)
-    accessible_projects = sorted({*invited_projects, *owned_projects})
+    accessible_floorplans = _resolve_accessible_floorplans_for_user(user)
+    accessible_projects = sorted(
+        {
+            floorplan["site_name"]
+            for floorplan in accessible_floorplans
+            if str(floorplan.get("site_name") or "").strip()
+        }
+    )
+    accessible_floorplan_ids = sorted(
+        {
+            floorplan["id"]
+            for floorplan in accessible_floorplans
+            if str(floorplan.get("id") or "").strip()
+        }
+    )
     stored_role = str(user.get("role") or "admin").strip().lower()
     role = stored_role if stored_role in {"admin", "stakeholder"} else "admin"
     return {
         "role": role,
         "accessible_project_names": accessible_projects,
-        "accessible_floorplan_ids": _resolve_accessible_floorplan_ids(accessible_projects),
+        "accessible_floorplan_ids": accessible_floorplan_ids,
     }
 
 
