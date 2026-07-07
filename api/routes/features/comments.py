@@ -5,11 +5,13 @@
 
 import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
+from core.auth import require_authenticated_user
+from core.auth_context import AuthenticatedUser
 from services.features.comments import comments_service
 
 router = APIRouter(prefix="/api/comments", tags=["Comments"])
@@ -92,15 +94,25 @@ def get_comments(tour_id: str, pano_id: str, include_shared: bool = False, radiu
 # Save single comment
 # =========================================================
 @router.post("")
-def save_comment(issue: IssueCreate):
-    return comments_service.create_comment(issue.dict(exclude_none=True))
+def save_comment(
+    issue: IssueCreate,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return comments_service.create_comment(
+        issue.dict(exclude_none=True),
+        current_user=current_user,
+    )
 
 
 # =========================================================
 # Delete single comment
 # =========================================================
 @router.delete("/{comment_id}")
-def delete_comment_route(comment_id: str):
+def delete_comment_route(
+    comment_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    del current_user
     return comments_service.delete_comment(comment_id)
 
 
@@ -108,5 +120,13 @@ def delete_comment_route(comment_id: str):
 # Update comment
 # =========================================================
 @router.put("/update/{comment_id}")
-def update_comment_route(comment_id: str, payload: dict):
-    return comments_service.update_comment(comment_id, payload)
+def update_comment_route(
+    comment_id: str,
+    payload: dict,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return comments_service.update_comment(
+        comment_id,
+        payload,
+        current_user=current_user,
+    )

@@ -1,4 +1,4 @@
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, validator
@@ -11,8 +11,33 @@ from services.progress.work_schedule.work_schedule_service import (
     save_work_schedule as save_work_schedule_service,
     work_schedule_comparison as work_schedule_comparison_service,
 )
+from services.progress.work_schedule.work_schedule_notification_service import (
+    sync_schedule_delay_notifications as sync_schedule_delay_notifications_service,
+)
 
 router = APIRouter(tags=["WorkSchedule"])
+
+
+def _best_effort_schedule_notification_sync(
+    project_id: str,
+    current_user: Optional[AuthenticatedUser] = None,
+) -> dict:
+    try:
+        result = sync_schedule_delay_notifications_service(
+            project_id=project_id,
+            current_user=current_user,
+        )
+        return {
+            "status": "synced",
+            "created_count": int(result.get("created_count") or 0),
+            "updated_count": int(result.get("updated_count") or 0),
+            "resolved_count": int(result.get("resolved_count") or 0),
+        }
+    except Exception as error:
+        return {
+            "status": "skipped",
+            "detail": str(error),
+        }
 
 
 class WorkScheduleActivity(BaseModel):
@@ -48,6 +73,16 @@ class WorkScheduleRequest(BaseModel):
         return value
 
 
+class WorkScheduleNotificationSyncRequest(BaseModel):
+    project_id: str
+
+    @validator("project_id")
+    def _project_required(cls, value: str):
+        if not value or not value.strip():
+            raise ValueError("project_id is required")
+        return value.strip()
+
+
 # Saves a work schedule (manual/csv source with activities).
 @router.post("/work-schedules")
 def save_work_schedule(
@@ -55,11 +90,18 @@ def save_work_schedule(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
-    return save_work_schedule_service(
+    save_result = save_work_schedule_service(
         project_id=payload.project_id,
         source=payload.source,
         activities=[activity.dict() for activity in payload.activities],
     )
+    return {
+        **save_result,
+        "notification_sync": _best_effort_schedule_notification_sync(
+            payload.project_id,
+            current_user=current_user,
+        ),
+    }
 
 
 # Lists schedules for a project.
@@ -77,4 +119,20 @@ def latest_work_schedule(project_id: str):
 # Returns comparison output for schedules of a project.
 @router.get("/work-schedules/comparison")
 def work_schedule_comparison(project_id: str):
-    return work_schedule_comparison_service(project_id)
+    comparison = work_schedule_comparison_service(project_id)
+    comparison["notification_sync"] = _best_effort_schedule_notification_sync(
+        project_id,
+    )
+    return comparison
+
+
+@router.post("/work-schedules/notifications/sync")
+def sync_work_schedule_notifications(
+    payload: WorkScheduleNotificationSyncRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return sync_schedule_delay_notifications_service(
+        project_id=payload.project_id,
+        current_user=current_user,
+    )

@@ -13,6 +13,12 @@ from core.database import (
     raw_floorplans_collection,
     raw_users_collection,
 )
+from services.features.comments.comment_notification_service import (
+    sync_comment_delay_notifications,
+)
+from services.project_setup.inspection_notification_service import (
+    sync_inspection_delay_notifications,
+)
 
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
@@ -52,8 +58,79 @@ def _serialize_notification(doc: dict) -> dict:
         "sender_email": str(doc.get("sender_email") or ""),
         "sender_name": str(doc.get("sender_name") or ""),
         "status": str(doc.get("status") or "pending"),
+        "severity": str(doc.get("severity") or ""),
+        "is_read": bool(doc.get("is_read") is True),
         "created_at": int(doc.get("created_at") or 0),
+        "updated_at": int(doc.get("updated_at") or doc.get("created_at") or 0),
         "acted_at": int(doc.get("acted_at") or 0),
+        "primary_action_label": str(doc.get("primary_action_label") or ""),
+        "primary_action_type": str(doc.get("primary_action_type") or ""),
+        "secondary_action_label": str(doc.get("secondary_action_label") or ""),
+        "secondary_action_type": str(doc.get("secondary_action_type") or ""),
+        "entity_id": str(doc.get("entity_id") or ""),
+        "entity_type": str(doc.get("entity_type") or ""),
+        "route": str(doc.get("route") or ""),
+        "metadata": doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {},
+    }
+
+
+def _best_effort_inspection_notification_sync(
+    current_user: AuthenticatedUser,
+) -> dict:
+    synced_projects = 0
+    created_count = 0
+    updated_count = 0
+    resolved_count = 0
+    for project_name in current_user.accessible_project_names:
+        normalized_project_name = str(project_name or "").strip()
+        if not normalized_project_name:
+            continue
+        try:
+            result = sync_inspection_delay_notifications(
+                project_id=normalized_project_name,
+                current_user=current_user,
+            )
+            synced_projects += 1
+            created_count += int(result.get("created_count") or 0)
+            updated_count += int(result.get("updated_count") or 0)
+            resolved_count += int(result.get("resolved_count") or 0)
+        except Exception:
+            continue
+    return {
+        "synced_projects": synced_projects,
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "resolved_count": resolved_count,
+    }
+
+
+def _best_effort_comment_notification_sync(
+    current_user: AuthenticatedUser,
+) -> dict:
+    synced_projects = 0
+    created_count = 0
+    updated_count = 0
+    resolved_count = 0
+    for project_name in current_user.accessible_project_names:
+        normalized_project_name = str(project_name or "").strip()
+        if not normalized_project_name:
+            continue
+        try:
+            result = sync_comment_delay_notifications(
+                project_id=normalized_project_name,
+                current_user=current_user,
+            )
+            synced_projects += 1
+            created_count += int(result.get("created_count") or 0)
+            updated_count += int(result.get("updated_count") or 0)
+            resolved_count += int(result.get("resolved_count") or 0)
+        except Exception:
+            continue
+    return {
+        "synced_projects": synced_projects,
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "resolved_count": resolved_count,
     }
 
 
@@ -91,6 +168,8 @@ def _find_notification_for_current_user(
 def list_notifications(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
+    _best_effort_inspection_notification_sync(current_user)
+    _best_effort_comment_notification_sync(current_user)
     records = list(
         notifications_collection.find(_recipient_filter(current_user)).sort(
             "created_at",
@@ -108,9 +187,33 @@ def unread_notification_count(
         {
             **_recipient_filter(current_user),
             "status": "pending",
+            "is_read": {"$ne": True},
         }
     )
     return {"count": count}
+
+
+@router.post("/{notification_id}/read")
+def mark_notification_as_read(
+    notification_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    notification = _find_notification_for_current_user(notification_id, current_user)
+    notifications_collection.update_one(
+        {"_id": notification["_id"]},
+        {
+            "$set": {
+                "is_read": True,
+                "read_at": _now_ms(),
+                "updated_at": _now_ms(),
+            }
+        },
+    )
+    updated = notifications_collection.find_one({"_id": notification["_id"]}) or notification
+    return {
+        "message": "Notification marked as read",
+        "notification": _serialize_notification(updated),
+    }
 
 
 @router.post("/project-invites")
@@ -176,7 +279,18 @@ def create_project_invite_notification(
         "sender_email": _normalize_email(current_user.email),
         "sender_name": _display_name(current_user),
         "status": "pending",
+        "severity": "info",
+        "is_read": False,
+        "primary_action_label": "Accept access",
+        "primary_action_type": "accept_invite",
+        "secondary_action_label": "Decline",
+        "secondary_action_type": "reject_invite",
+        "entity_id": site_name,
+        "entity_type": "project",
+        "route": f"/projects/{site_name}",
+        "metadata": {"project_name": site_name},
         "created_at": _now_ms(),
+        "updated_at": _now_ms(),
         "acted_at": 0,
     }
     inserted = notifications_collection.insert_one(notification)
@@ -214,7 +328,9 @@ def accept_project_invite(
         {
             "$set": {
                 "status": "accepted",
+                "is_read": True,
                 "acted_at": _now_ms(),
+                "updated_at": _now_ms(),
             }
         },
     )
@@ -242,7 +358,9 @@ def reject_project_invite(
         {
             "$set": {
                 "status": "rejected",
+                "is_read": True,
                 "acted_at": _now_ms(),
+                "updated_at": _now_ms(),
             }
         },
     )

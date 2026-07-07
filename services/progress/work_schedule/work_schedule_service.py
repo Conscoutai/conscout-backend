@@ -6,12 +6,56 @@ from fastapi import HTTPException
 from core.database import work_schedules_collection, floorplans_collection, tours_collection
 
 
+SUPPORTED_WORK_SCHEDULE_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%d-%m-%Y",
+    "%d/%m/%Y",
+    "%Y/%m/%d",
+)
+
+
 def _project_filter(project_id: str) -> dict:
     return {"$or": [{"site_name": project_id}, {"dxf_project_id": project_id}]}
 
 
+def parse_work_schedule_date(value: str) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        pass
+
+    for fmt in SUPPORTED_WORK_SCHEDULE_DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_work_schedule_date(value: str) -> str:
+    parsed = parse_work_schedule_date(value)
+    if parsed is None:
+        raise HTTPException(
+            400,
+            "Invalid work schedule date. Use YYYY-MM-DD or DD-MM-YYYY format",
+        )
+    return parsed.date().isoformat()
+
+
+def _normalize_schedule_activity(activity: dict) -> dict:
+    normalized = dict(activity)
+    normalized["start_date"] = normalize_work_schedule_date(activity.get("start_date", ""))
+    normalized["end_date"] = normalize_work_schedule_date(activity.get("end_date", ""))
+    return normalized
+
+
 def save_work_schedule(project_id: str, source: str, activities: List[dict]) -> dict:
     now = datetime.now(timezone.utc)
+    normalized_activities = [_normalize_schedule_activity(activity) for activity in activities]
     floorplans_collection.update_many(
         _project_filter(project_id),
         {
@@ -19,7 +63,7 @@ def save_work_schedule(project_id: str, source: str, activities: List[dict]) -> 
                 "site_name": project_id,
                 "work_schedule": {
                     "source": source,
-                    "activities": activities,
+                    "activities": normalized_activities,
                     "updated_at": now,
                 },
                 "updated_at": now,
@@ -64,10 +108,44 @@ def latest_work_schedule(project_id: str) -> dict:
 
 
 def _parse_date(value: str) -> Optional[datetime]:
+    return parse_work_schedule_date(value)
+
+
+def _parse_timestamp(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1000000000000:
+            timestamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    parsed_schedule_date = parse_work_schedule_date(raw)
+    if parsed_schedule_date is not None:
+        return parsed_schedule_date
+
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _tour_observed_datetime(tour: dict) -> Optional[datetime]:
+    captured_at = _parse_timestamp(tour.get("captured_at"))
+    if captured_at is not None:
+        return captured_at
+    return _parse_timestamp(tour.get("created_at"))
 
 
 def _fetch_tours_for_project(project_id: str):
@@ -109,6 +187,7 @@ def _collect_activity_evidence(activity_name: str, tours: list, site_name: str, 
     for tour in tours:
         tour_id = tour.get("tour_id")
         tour_name = tour.get("name") or "Tour"
+        observed_at = _tour_observed_datetime(tour)
         nodes = tour.get("nodes", []) or []
         total_nodes = len(nodes)
         for idx, node in enumerate(nodes):
@@ -125,6 +204,7 @@ def _collect_activity_evidence(activity_name: str, tours: list, site_name: str, 
                 "tour_id": tour_id,
                 "tour_name": tour_name,
                 "site_name": site_name,
+                "observed_at": observed_at.date().isoformat() if observed_at is not None else "",
                 "node_id": node.get("id"),
                 "node_index": node.get("index") or idx + 1,
                 "total_nodes": total_nodes,
@@ -134,6 +214,23 @@ def _collect_activity_evidence(activity_name: str, tours: list, site_name: str, 
             if len(matches) >= limit:
                 return matches
     return matches
+
+
+def _evidence_observed_range(evidence: list) -> tuple[str, str]:
+    observed_dates = []
+    for item in evidence:
+        parsed = _parse_timestamp(item.get("observed_at"))
+        if parsed is not None:
+            observed_dates.append(parsed)
+
+    if not observed_dates:
+        return "", ""
+
+    observed_dates.sort()
+    return (
+        observed_dates[0].date().isoformat(),
+        observed_dates[-1].date().isoformat(),
+    )
 
 
 def work_schedule_comparison(project_id: str) -> dict:
@@ -157,6 +254,7 @@ def work_schedule_comparison(project_id: str) -> dict:
         start_date = _parse_date(activity.get("start_date", ""))
         end_date = _parse_date(activity.get("end_date", ""))
         evidence = _collect_activity_evidence(activity.get("activity_name", ""), tours, project_id)
+        observed_start_date, observed_end_date = _evidence_observed_range(evidence)
         matched_nodes = len(evidence)
         actual_percent = min(matched_nodes, 5) * 20
 
@@ -176,6 +274,8 @@ def work_schedule_comparison(project_id: str) -> dict:
             "status": primary_status,
             "primary_status": primary_status,
             "is_critical": is_critical,
+            "observed_start_date": observed_start_date,
+            "observed_end_date": observed_end_date,
             "related_tour_ids": tour_ids,
             "evidence": evidence,
         })

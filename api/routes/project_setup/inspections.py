@@ -7,7 +7,12 @@ from pydantic import BaseModel, Field
 
 from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
-from core.database import inspections_collection
+from core.database import raw_floorplans_collection, raw_inspections_collection
+from services.project_setup.inspection_notification_service import (
+    create_inspection_assignment_notification,
+    create_inspection_completion_notification,
+    sync_inspection_delay_notifications,
+)
 
 
 router = APIRouter(tags=["Inspections"])
@@ -76,6 +81,51 @@ def _normalize_string_list(values: list[str]) -> list[str]:
     return normalized
 
 
+def _normalized_site_name(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _can_user_access_site(current_user: AuthenticatedUser, site_name: str) -> bool:
+    normalized_site_name = _normalized_site_name(site_name)
+    if not normalized_site_name:
+        return False
+
+    accessible_sites = {
+        _normalized_site_name(value)
+        for value in current_user.accessible_project_names
+        if str(value or "").strip()
+    }
+    if normalized_site_name in accessible_sites:
+        return True
+
+    floorplan_ids = [
+        floorplan_id.strip()
+        for floorplan_id in current_user.accessible_floorplan_ids
+        if floorplan_id.strip()
+    ]
+    query = {
+        "$and": [
+            {
+                "$or": [
+                    {"site_name": site_name.strip()},
+                    {"dxf_project_id": site_name.strip()},
+                ]
+            },
+            {
+                "$or": [
+                    {"owner_user_id": current_user.user_id},
+                    {"owner_email": current_user.email.strip().lower()},
+                    {"stakeholder_emails": current_user.email.strip().lower()},
+                ]
+            },
+        ]
+    }
+    if floorplan_ids:
+        query["$and"][1]["$or"].append({"id": {"$in": floorplan_ids}})
+
+    return raw_floorplans_collection.find_one(query, {"_id": 1}) is not None
+
+
 def _normalize_replies(
     replies: Union[List[InspectionReplyItem], List[Dict]]
 ) -> List[Dict]:
@@ -141,14 +191,38 @@ def _serialize_inspection(doc: dict) -> dict:
     return serialized
 
 
+def _best_effort_inspection_delay_sync(
+    site_name: str,
+    current_user: Optional[AuthenticatedUser] = None,
+) -> dict:
+    try:
+        result = sync_inspection_delay_notifications(
+            project_id=site_name,
+            current_user=current_user,
+        )
+        return {
+            "status": "synced",
+            "created_count": int(result.get("created_count") or 0),
+            "updated_count": int(result.get("updated_count") or 0),
+            "resolved_count": int(result.get("resolved_count") or 0),
+        }
+    except Exception as error:
+        return {
+            "status": "skipped",
+            "detail": str(error),
+        }
+
+
 @router.get("/projects/{site_name}/inspections")
 def list_project_inspections(
     site_name: str,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
-    del current_user
+    if not _can_user_access_site(current_user, site_name):
+        raise HTTPException(status_code=403, detail="Not allowed to access this project")
+    _best_effort_inspection_delay_sync(site_name, current_user=current_user)
     docs = list(
-        inspections_collection.find({"site_name": site_name}).sort(
+        raw_inspections_collection.find({"site_name": site_name}).sort(
             [("updated_at", -1), ("created_at", -1)]
         )
     )
@@ -162,6 +236,8 @@ def create_project_inspection(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
+    if not _can_user_access_site(current_user, site_name):
+        raise HTTPException(status_code=403, detail="Not allowed to access this project")
     now = int(time.time() * 1000)
     linked_tours = _normalize_string_list(
         [*payload.linked_tours, *(([payload.linked_tour]) if payload.linked_tour else [])]
@@ -188,11 +264,21 @@ def create_project_inspection(
         "created_by": current_user.name.strip()
         or current_user.email.split("@")[0].strip(),
         "created_by_email": current_user.email.strip().lower(),
+        "owner_user_id": current_user.user_id,
+        "owner_email": current_user.email.strip().lower(),
         "created_at": now,
         "updated_at": now,
     }
-    result = inspections_collection.insert_one(inspection)
+    result = raw_inspections_collection.insert_one(inspection)
     inspection["_id"] = str(result.inserted_id)
+    create_inspection_assignment_notification(
+        project_id=site_name,
+        inspection=inspection,
+        sender_email=current_user.email,
+        sender_name=current_user.name.strip() or current_user.email.split("@")[0].strip(),
+        current_user=current_user,
+    )
+    _best_effort_inspection_delay_sync(site_name, current_user=current_user)
     return _serialize_inspection(inspection)
 
 
@@ -203,7 +289,10 @@ def update_project_inspection(
     payload: InspectionUpdateRequest,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
-    existing = inspections_collection.find_one(
+    if not _can_user_access_site(current_user, site_name):
+        raise HTTPException(status_code=403, detail="Not allowed to access this project")
+
+    existing = raw_inspections_collection.find_one(
         {
             "site_name": site_name,
             "inspection_id": inspection_id,
@@ -238,7 +327,7 @@ def update_project_inspection(
 
     update_fields["updated_at"] = int(time.time() * 1000)
 
-    result = inspections_collection.update_one(
+    result = raw_inspections_collection.update_one(
         {
             "site_name": site_name,
             "inspection_id": inspection_id,
@@ -248,11 +337,36 @@ def update_project_inspection(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Inspection not found")
 
-    updated = inspections_collection.find_one(
+    updated = raw_inspections_collection.find_one(
         {"site_name": site_name, "inspection_id": inspection_id}
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Inspection not found")
+
+    assignment_changed = (
+        str(existing.get("assigned_to") or "").strip().lower()
+        != str(updated.get("assigned_to") or "").strip().lower()
+    )
+    completed_before = str(existing.get("status") or "").strip().lower() == "completed"
+    completed_after = str(updated.get("status") or "").strip().lower() == "completed"
+    actor_name = current_user.name.strip() or current_user.email.split("@")[0].strip()
+    if assignment_changed:
+        create_inspection_assignment_notification(
+            project_id=site_name,
+            inspection=updated,
+            sender_email=current_user.email,
+            sender_name=actor_name,
+            current_user=current_user,
+        )
+    if completed_after and not completed_before:
+        create_inspection_completion_notification(
+            project_id=site_name,
+            inspection=updated,
+            sender_email=current_user.email,
+            sender_name=actor_name,
+            current_user=current_user,
+        )
+    _best_effort_inspection_delay_sync(site_name, current_user=current_user)
     return _serialize_inspection(updated)
 
 
@@ -263,7 +377,10 @@ def delete_project_inspection(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
-    result = inspections_collection.delete_one(
+    if not _can_user_access_site(current_user, site_name):
+        raise HTTPException(status_code=403, detail="Not allowed to access this project")
+
+    result = raw_inspections_collection.delete_one(
         {"site_name": site_name, "inspection_id": inspection_id}
     )
     if result.deleted_count == 0:

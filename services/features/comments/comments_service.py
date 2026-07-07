@@ -8,7 +8,13 @@ import mimetypes
 
 from fastapi import HTTPException
 
+from core.auth_context import AuthenticatedUser
 from core.database import floorplans_collection, tours_collection
+from services.features.comments.comment_notification_service import (
+    create_comment_closed_notification,
+    create_comment_open_notification,
+    sync_comment_delay_notifications,
+)
 from services.features.comments.report_generation import generate_issue_report_pdf
 
 
@@ -108,6 +114,28 @@ def _normalize_image_attachments(payload: dict) -> list[dict]:
             add_candidate(candidate)
 
     return normalized
+
+
+def _current_user_display_name(current_user: AuthenticatedUser) -> str:
+    name = str(current_user.name or "").strip()
+    if name:
+        return name
+    email = str(current_user.email or "").strip().lower()
+    if "@" in email:
+        return email.split("@", 1)[0]
+    return "Team member"
+
+
+def _find_comment_record(comment_id: str):
+    tour = tours_collection.find_one({"nodes.comments.id": comment_id})
+    if not tour:
+        return None, None, None
+
+    for node in tour.get("nodes", []) or []:
+        for comment in node.get("comments", []) or []:
+            if isinstance(comment, dict) and comment.get("id") == comment_id:
+                return tour, node, comment
+    return tour, None, None
 
 
 def get_all_comments(tour_id: str) -> dict:
@@ -318,13 +346,15 @@ def get_comments_for_pano(tour_id: str, pano_id: str, include_shared: bool = Fal
     return {"comments": merged}
 
 
-def create_comment(payload: dict) -> dict:
+def create_comment(payload: dict, *, current_user: AuthenticatedUser) -> dict:
     comment_data = {k: v for k, v in payload.items() if v is not None}
     image_attachments = _normalize_image_attachments(comment_data)
     if image_attachments:
         comment_data["image_attachments"] = image_attachments
     comment_data["id"] = f"comment_{uuid.uuid4().hex}"
     comment_data["created_at"] = int(time.time() * 1000)
+    comment_data.setdefault("created_by", _current_user_display_name(current_user))
+    comment_data.setdefault("created_by_email", str(current_user.email or "").strip().lower())
 
     result = tours_collection.update_one(
         {
@@ -338,6 +368,24 @@ def create_comment(payload: dict) -> dict:
 
     if result.modified_count == 0:
         raise HTTPException(404, "Failed to save comment")
+
+    tour = tours_collection.find_one({"tour_id": comment_data["tour_id"]})
+    if tour is not None:
+        create_comment_open_notification(
+            tour_doc=tour,
+            comment=comment_data,
+            sender_email=current_user.email,
+            sender_name=_current_user_display_name(current_user),
+            current_user=current_user,
+        )
+        site_name = str(
+            tour.get("site_name") or tour.get("site") or tour.get("project_id") or ""
+        ).strip()
+        if site_name:
+            sync_comment_delay_notifications(
+                project_id=site_name,
+                current_user=current_user,
+            )
 
     return {"message": "Comment saved", "comment": comment_data}
 
@@ -361,7 +409,11 @@ def delete_comment(comment_id: str) -> dict:
     return {"status": "deleted", "comment_id": comment_id}
 
 
-def update_comment(comment_id: str, payload: dict) -> dict:
+def update_comment(comment_id: str, payload: dict, *, current_user: AuthenticatedUser) -> dict:
+    existing_tour, _, existing_comment = _find_comment_record(comment_id)
+    if existing_comment is None:
+        raise HTTPException(404, "Comment not found")
+
     update_fields = {
         "nodes.$[n].comments.$[b].updated_at": int(time.time() * 1000),
     }
@@ -439,4 +491,37 @@ def update_comment(comment_id: str, payload: dict) -> dict:
     if result.modified_count == 0:
         raise HTTPException(400, "Comment update failed")
 
-    return {"message": "Comment updated"}
+    updated_tour, _, updated_comment = _find_comment_record(comment_id)
+    if updated_comment is None:
+        return {"message": "Comment updated"}
+
+    previous_status = str(existing_comment.get("status") or "").strip().lower()
+    updated_status = str(updated_comment.get("status") or "").strip().lower()
+    if updated_status in {"closed", "completed", "complete", "done", "resolved"} and previous_status not in {
+        "closed",
+        "completed",
+        "complete",
+        "done",
+        "resolved",
+    }:
+        create_comment_closed_notification(
+            tour_doc=updated_tour or existing_tour or {},
+            comment=updated_comment,
+            sender_email=current_user.email,
+            sender_name=_current_user_display_name(current_user),
+            current_user=current_user,
+        )
+
+    site_name = str(
+        (updated_tour or existing_tour or {}).get("site_name")
+        or (updated_tour or existing_tour or {}).get("site")
+        or (updated_tour or existing_tour or {}).get("project_id")
+        or ""
+    ).strip()
+    if site_name:
+        sync_comment_delay_notifications(
+            project_id=site_name,
+            current_user=current_user,
+        )
+
+    return {"message": "Comment updated", "comment": updated_comment}
