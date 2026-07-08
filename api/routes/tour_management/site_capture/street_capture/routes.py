@@ -9,6 +9,9 @@ from core.auth_context import AuthenticatedUser
 from core.database import floorplans_collection, tours_collection
 from services.progress.overall.coverage_service import build_coverage_payload
 from services.progress.overall.progress_engine import calculate_progress
+from services.tour_management.tour_completion_notification_service import (
+    notify_tour_completion,
+)
 from services.tour_management.site_capture.street_capture import (
     build_street_capture_graph,
     delete_street_capture_tour,
@@ -134,22 +137,56 @@ async def save_street_capture_tour(
     site_objects_for_calc = floorplan_site_objects or tour_site_objects
     tour_for_calc = {**tour, "site_objects": site_objects_for_calc}
     result = calculate_progress(tour_for_calc)
+    resolved_tour_name = tour_name or tour.get("name") or "Street Capture Tour"
+    resolved_site_name = str(
+        tour.get("site_name")
+        or (floorplan or {}).get("site_name")
+        or (floorplan or {}).get("dxf_project_id")
+        or ""
+    ).strip()
 
     tours_collection.update_one(
         {"tour_id": tour_id},
         {"$set": {
-            "name": tour_name or tour.get("name") or "Street Capture Tour",
+            "name": resolved_tour_name,
             "progress": result["progress"],
             "coverage": tour["coverage"],
             "site_objects": result["site_objects"],
             "status": "completed",
+            "site_name": resolved_site_name or tour.get("site_name"),
             "updated_at": time.time(),
         }}
     )
 
+    notification_result = {
+        "created_count": 0,
+        "duplicate_count": 0,
+        "skipped_count": 0,
+    }
+    try:
+        notification_result = notify_tour_completion(
+            tour={
+                **tour,
+                "tour_id": tour_id,
+                "name": resolved_tour_name,
+                "site_name": resolved_site_name or tour.get("site_name"),
+                "floorplan_id": floorplan_id,
+                "status": "completed",
+            },
+            floorplan=floorplan,
+            current_user=current_user,
+        )
+    except Exception:
+        notification_result = {
+            "created_count": 0,
+            "duplicate_count": 0,
+            "skipped_count": 0,
+        }
+
     return {
         "message": "Tour finalized",
         "progress": result["progress"],
+        "notifications": notification_result,
     }
 
 

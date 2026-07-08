@@ -16,8 +16,14 @@ from core.database import (
 from services.features.comments.comment_notification_service import (
     sync_comment_delay_notifications,
 )
+from services.project_setup.team_member_notification_service import (
+    notify_team_member_added,
+)
 from services.project_setup.inspection_notification_service import (
     sync_inspection_delay_notifications,
+)
+from services.progress.weekly_progress_notification_service import (
+    sync_weekly_progress_notifications,
 )
 
 
@@ -27,6 +33,10 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 class ProjectInviteRequest(BaseModel):
     site_name: str
     recipient_email: str
+
+
+class WeeklyProgressSyncRequest(BaseModel):
+    project_id: str = ""
 
 
 def _normalize_email(value: str) -> str:
@@ -301,6 +311,17 @@ def create_project_invite_notification(
     }
 
 
+@router.post("/weekly-progress/sync")
+def manual_weekly_progress_sync(
+    payload: WeeklyProgressSyncRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return sync_weekly_progress_notifications(
+        project_id=payload.project_id.strip() or None,
+    )
+
+
 @router.post("/{notification_id}/accept")
 def accept_project_invite(
     notification_id: str,
@@ -323,6 +344,18 @@ def accept_project_invite(
     if update.matched_count == 0:
         raise HTTPException(status_code=404, detail="No floorplan found for this project")
 
+    team_member_notification = {
+        "created_count": 0,
+        "duplicate_count": 0,
+        "skipped_count": 0,
+    }
+    if int(update.modified_count or 0) > 0:
+        team_member_notification = notify_team_member_added(
+            site_name=site_name,
+            added_member_email=current_user.email,
+            current_user=current_user,
+        )
+
     notifications_collection.update_one(
         {"_id": notification["_id"]},
         {
@@ -339,6 +372,7 @@ def accept_project_invite(
         "message": "Project access accepted",
         "site_name": site_name,
         "notification": _serialize_notification(updated),
+        "team_member_notification": team_member_notification,
     }
 
 

@@ -19,6 +19,9 @@ from core.config import (
     APP_VERSION,
     DATA_DIR,
 )
+from services.progress.weekly_progress_notification_service import (
+    ensure_weekly_progress_scheduler_started,
+)
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -41,6 +44,11 @@ ensure_default_user_and_migrate_legacy_data()
 
 for directory in (DATA_DIR,):
     os.makedirs(directory, exist_ok=True)
+
+
+@app.on_event("startup")
+def startup_background_jobs():
+    ensure_weekly_progress_scheduler_started()
 
 
 @app.get("/")
