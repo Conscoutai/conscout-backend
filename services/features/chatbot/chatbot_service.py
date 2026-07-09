@@ -1323,7 +1323,7 @@ def _ollama_enabled() -> bool:
 
 
 def _answer_formatter_mode() -> str:
-    return os.getenv("CHAT_ANSWER_FORMATTER", "template").strip().lower()
+    return os.getenv("CHAT_ANSWER_FORMATTER", "adaptive").strip().lower()
 
 
 def _should_format_answer(response: dict) -> bool:
@@ -1336,6 +1336,70 @@ def _should_format_answer(response: dict) -> bool:
     if answer.startswith(("No ", "Please ", "Which ")):
         return False
     return True
+
+
+def _answer_style_from_message(message: str, intent: str) -> str:
+    normalized = _normalize_chat_typos(_norm(message))
+    if _contains_any(normalized, ["report", "client summary", "management summary"]):
+        return "report"
+    if _contains_any(normalized, ["explain", "detail", "details", "why", "more about", "brief me"]):
+        return "explained"
+    if _contains_any(normalized, ["what should", "what to do", "next step", "priority", "action", "check today"]):
+        return "action"
+    if _contains_any(normalized, ["list", "show all", "show me", "all comments", "all tours", "all sites"]):
+        return "list"
+    if _contains_any(normalized, ["how many", "count", "number of"]):
+        return "brief"
+    if _contains_any(normalized, ["short", "quick", "now", "status"]):
+        return "brief"
+    if intent in {"comments", "tours", "inspections", "notifications"} and _contains_any(normalized, ["show", "list"]):
+        return "list"
+    if intent in {"report_summary", "site_summary"}:
+        return "report"
+    if intent in {"daily_briefing", "pending_items", "delay_risk", "assigned_to_me"}:
+        return "action"
+    return "key_points"
+
+
+def _classify_answer_style_with_ollama(*, message: str, intent: str) -> Optional[str]:
+    if os.getenv("CHAT_ANSWER_STYLE_PROVIDER", "").strip().lower() != "ollama":
+        return None
+    if not _ollama_enabled():
+        return None
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip() or "llama3.2:3b"
+    prompt = (
+        "Choose the best answer style for this construction app chatbot question.\n"
+        "Return only JSON with one field named style.\n"
+        "Allowed styles: brief, list, key_points, explained, action, report.\n"
+        "- brief: user asks status, count, now, quick answer.\n"
+        "- list: user asks list/show/all.\n"
+        "- key_points: normal summary with important facts.\n"
+        "- explained: user asks explain/details/why.\n"
+        "- action: user asks what to do, pending, delayed, priority.\n"
+        "- report: user asks report/client/management summary.\n"
+        f"Intent: {intent}\n"
+        f"Message: {message}\n"
+    )
+    try:
+        response = requests.post(
+            f"{base_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "format": "json",
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 40},
+            },
+            timeout=6,
+        )
+        response.raise_for_status()
+        parsed = json.loads(_clean(response.json().get("response")))
+        style = _clean(parsed.get("style")).lower()
+        return style if style in {"brief", "list", "key_points", "explained", "action", "report"} else None
+    except Exception:
+        return None
 
 
 def _recommended_next_step(intent: str, answer: str) -> str:
@@ -1373,44 +1437,75 @@ def _recommended_next_step(intent: str, answer: str) -> str:
     return "Review the listed items and update the project record after action is taken."
 
 
-def _template_professional_answer(response: dict, site_name: str) -> str:
+def _answer_parts(answer: str) -> tuple[str, list[str]]:
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    if not lines:
+        return "", []
+    title = lines[0].rstrip(".:")
+    bullets: list[str] = []
+    for line in lines[1:]:
+        cleaned = line.lstrip("- ").strip()
+        if cleaned:
+            bullets.append(cleaned)
+    return title, bullets
+
+
+def _short_paragraph(title: str, intent: str, site_name: str) -> str:
+    location = f" for {site_name}" if _clean(site_name) and site_name.lower() not in title.lower() else ""
+    sentence = f"{title}{location}."
+    if intent in {"progress", "progress_summary"}:
+        return sentence
+    if intent in {"comments", "open_issues"}:
+        return sentence
+    if intent in {"delay_risk", "pending_items"}:
+        return f"{sentence} These are the items needing attention."
+    if intent in {"work_activity_summary", "material_summary", "inspections"}:
+        return f"{sentence} This is the current operational status."
+    return sentence
+
+
+def _template_adaptive_answer(response: dict, site_name: str, style: str) -> str:
     answer = _clean(response.get("answer"))
     if not answer:
         return answer
 
-    lines = [line.strip() for line in answer.splitlines() if line.strip()]
-    if not lines:
+    title, bullet_lines = _answer_parts(answer)
+    if not title:
         return answer
 
-    first_line = lines[0].rstrip(".")
-    bullet_lines = []
-    for line in lines[1:]:
-        cleaned = line.lstrip("- ").strip()
-        if cleaned:
-            bullet_lines.append(cleaned)
-
     intent = _clean(response.get("intent"))
-    location = f" for {site_name}" if _clean(site_name) and site_name.lower() not in first_line.lower() else ""
-    paragraph = f"{first_line}{location}."
-    if intent in {"progress", "progress_summary", "site_summary", "report_summary"}:
-        paragraph = f"{paragraph} This gives a quick view of the current site position and the areas that need attention."
-    elif intent in {"comments", "open_issues", "pending_items", "delay_risk"}:
-        paragraph = f"{paragraph} These items should be reviewed so the team can keep the site moving without unresolved blockers."
-    elif intent in {"work_activity_summary", "material_summary", "inspections"}:
-        paragraph = f"{paragraph} Use this to decide what needs coordination before the next site update."
+    paragraph = _short_paragraph(title, intent, site_name)
+
+    if style == "brief":
+        if not bullet_lines:
+            return paragraph
+        return "\n".join([paragraph, *[f"- {line}" for line in bullet_lines[:3]]])
+
+    if style == "list":
+        if not bullet_lines:
+            return paragraph
+        return "\n".join([paragraph, *[f"- {line}" for line in bullet_lines[:10]]])
 
     output = [paragraph]
+    if style == "explained":
+        output.append("")
+        output.append("What this means:")
+        output.append(f"- The current answer is based on live project data for {site_name or 'the selected site'}.")
+        output.append("- The figures and item names above are kept exactly from the project records.")
+
     if bullet_lines:
         output.append("")
-        output.append("Key points:")
+        output.append("Key points:" if style != "action" else "Priority items:")
         output.extend(f"- {line}" for line in bullet_lines[:8])
-    output.append("")
-    output.append("Recommended next step:")
-    output.append(f"- {_recommended_next_step(intent, answer)}")
+
+    if style in {"action", "report", "explained"}:
+        output.append("")
+        output.append("Recommended next step:")
+        output.append(f"- {_recommended_next_step(intent, answer)}")
     return "\n".join(output)
 
 
-def _format_answer_with_ollama(*, message: str, response: dict, site_name: str) -> Optional[str]:
+def _format_answer_with_ollama(*, message: str, response: dict, site_name: str, style: str) -> Optional[str]:
     if _answer_formatter_mode() != "ollama":
         return None
     if not _ollama_enabled():
@@ -1424,17 +1519,17 @@ def _format_answer_with_ollama(*, message: str, response: dict, site_name: str) 
         "Rewrite this Conscout construction chatbot answer in a professional, engaging style.\n"
         "Do not add facts, numbers, names, dates, statuses, or recommendations that are not present.\n"
         "Keep every number and project/site name exactly the same.\n"
-        "Use this format:\n"
-        "1 short summary paragraph.\n"
-        "Blank line.\n"
-        "Key points:\n"
-        "- 2 to 5 bullets.\n"
-        "Blank line.\n"
-        "Recommended next step:\n"
-        "- 1 practical action.\n"
+        "Choose the final layout based on the requested style:\n"
+        "- brief: 1 short paragraph, plus up to 3 factual bullets only if useful.\n"
+        "- list: short intro plus factual list only. No recommendation.\n"
+        "- key_points: short paragraph plus Key points bullets. No recommendation.\n"
+        "- explained: short paragraph, What this means, Key points, and Recommended next step.\n"
+        "- action: short paragraph, Priority items, and Recommended next step.\n"
+        "- report: short paragraph, Key points, and Recommended next step.\n"
         "Return plain text only.\n"
         f"User question: {message}\n"
         f"Intent: {intent}\n"
+        f"Style: {style}\n"
         f"Site: {site_name or 'unknown'}\n"
         f"Factual answer:\n{factual_answer}\n"
     )
@@ -1465,20 +1560,27 @@ def _professionalize_response(*, message: str, response: dict, site_name: str) -
         return response
 
     original_answer = _clean(response.get("answer"))
+    intent = _clean(response.get("intent"))
+    style = (
+        _classify_answer_style_with_ollama(message=message, intent=intent)
+        or _answer_style_from_message(message, intent)
+    )
     formatted = _format_answer_with_ollama(
         message=message,
         response=response,
         site_name=site_name,
+        style=style,
     )
-    answer_style = "ollama" if formatted else "template"
+    answer_style = f"ollama_{style}" if formatted else style
     if not formatted:
-        formatted = _template_professional_answer(response, site_name)
+        formatted = _template_adaptive_answer(response, site_name, style)
 
     if formatted and formatted != original_answer:
         updated = dict(response)
         updated["answer"] = formatted
         updated["raw_answer"] = original_answer
         updated["answer_style"] = answer_style
+        updated["answer_format"] = style
         return updated
     return response
 
@@ -1708,7 +1810,7 @@ def process_chat_message(
             site_name=resolved_site,
         )
 
-    if _contains_any(normalized, ["what should i check", "check today", "today priority", "today priorities", "daily briefing"]):
+    if _contains_any(normalized, ["what should i check", "what should i do", "what to do", "check today", "today priority", "today priorities", "daily briefing"]):
         clarification = site_clarification("daily_briefing")
         if clarification:
             return clarification
