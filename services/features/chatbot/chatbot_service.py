@@ -107,32 +107,9 @@ def _response(answer: str, *, intent: str, sources: Optional[list[str]] = None) 
 
 
 def _answer_site_clarification(project_names: list[str], intent: str) -> dict:
-    shown = ", ".join(project_names[:8])
-    more = f" and {len(project_names) - 8} more" if len(project_names) > 8 else ""
-    examples = {
-        "progress_summary": "progress in fozan",
-        "latest_updates": "latest updates in fozan",
-        "comments": "comments in fozan",
-        "open_issues": "open issues in fozan",
-        "inspection_summary": "inspections in fozan",
-        "tour_summary": "tours in fozan",
-        "daily_briefing": "what should I check today in fozan",
-        "pending_items": "pending items in fozan",
-        "delay_risk": "anything delayed in fozan",
-        "work_activity_summary": "work activity update in fozan",
-        "material_summary": "material summary in fozan",
-        "site_summary": "site summary for fozan",
-        "report_summary": "project report for fozan",
-    }
-    example = examples.get(intent, "progress in fozan")
-    return _response(
-        (
-            "Which site are you looking for?\n"
-            f"Available sites: {shown}{more}.\n"
-            f"Ask like: '{example}'."
-        ),
-        intent="clarify_site",
-    )
+    response = _response("Which site are you looking for?", intent="clarify_site")
+    response["pending_intent"] = intent
+    return response
 
 
 def _site_clarification_for(intent: str, site_name: str, project_names: list[str], tour_id: str = "") -> Optional[dict]:
@@ -1617,6 +1594,12 @@ def process_chat_message(
 
     if _contains_any(normalized, ["project", "site"]) and _contains_any(normalized, ["list", "show", "my", "all", "how many"]):
         return _answer_projects(floorplans_collection, project_names)
+
+    if _contains_any(normalized, ["comment", "comments", "coment", "coments", "commnet", "commnets"]) and _contains_any(normalized, ["latest", "recent", "last", "new"]):
+        clarification = site_clarification("comments")
+        if clarification:
+            return clarification
+        return _answer_comments(comments, resolved_site)
 
     if _contains_any(normalized, ["latest", "update", "recent", "today", "this week", "happened"]):
         clarification = site_clarification("latest_updates")
