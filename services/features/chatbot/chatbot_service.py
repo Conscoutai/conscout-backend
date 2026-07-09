@@ -42,6 +42,21 @@ SUPPORTED_LLM_INTENTS = {
     "report_summary",
     "unknown",
 }
+SITE_REQUIRED_INTENTS = {
+    "latest_updates",
+    "comments",
+    "open_issues",
+    "progress_summary",
+    "inspection_summary",
+    "tour_summary",
+    "daily_briefing",
+    "pending_items",
+    "delay_risk",
+    "work_activity_summary",
+    "material_summary",
+    "site_summary",
+    "report_summary",
+}
 
 
 def _now_ms() -> int:
@@ -89,6 +104,56 @@ def _response(answer: str, *, intent: str, sources: Optional[list[str]] = None) 
         "sources": sources or [],
         "timestamp": _now_ms(),
     }
+
+
+def _answer_site_clarification(project_names: list[str], intent: str) -> dict:
+    shown = ", ".join(project_names[:8])
+    more = f" and {len(project_names) - 8} more" if len(project_names) > 8 else ""
+    examples = {
+        "progress_summary": "progress in fozan",
+        "latest_updates": "latest updates in fozan",
+        "comments": "comments in fozan",
+        "open_issues": "open issues in fozan",
+        "inspection_summary": "inspections in fozan",
+        "tour_summary": "tours in fozan",
+        "daily_briefing": "what should I check today in fozan",
+        "pending_items": "pending items in fozan",
+        "delay_risk": "anything delayed in fozan",
+        "work_activity_summary": "work activity update in fozan",
+        "material_summary": "material summary in fozan",
+        "site_summary": "site summary for fozan",
+        "report_summary": "project report for fozan",
+    }
+    example = examples.get(intent, "progress in fozan")
+    return _response(
+        (
+            "Which site are you looking for?\n"
+            f"Available sites: {shown}{more}.\n"
+            f"Ask like: '{example}'."
+        ),
+        intent="clarify_site",
+    )
+
+
+def _site_clarification_for(intent: str, site_name: str, project_names: list[str], tour_id: str = "") -> Optional[dict]:
+    if intent not in SITE_REQUIRED_INTENTS:
+        return None
+    if _clean(site_name) or _clean(tour_id):
+        return None
+    if len(project_names) <= 1:
+        return None
+    return _answer_site_clarification(project_names, intent)
+
+
+def _needs_comment_material_confirmation(normalized_message: str) -> bool:
+    if not re.search(r"\bcement\b", normalized_message):
+        return False
+    if _contains_any(
+        normalized_message,
+        ["material", "materials", "quantity", "delivery", "shortage", "readiness", "used", "stock"],
+    ):
+        return False
+    return True
 
 
 def _project_filter(site_name: str) -> dict:
@@ -1446,6 +1511,17 @@ def process_chat_message(
         floorplans_collection=floorplans_collection,
         tours_collection=tours_collection,
     )
+    all_project_names = _list_project_names(floorplans_collection, project_names)
+
+    if _needs_comment_material_confirmation(normalized):
+        return _response(
+            "Did you mean comments/issues or material/cement? Ask like: 'list comments' or 'material summary'.",
+            intent="clarify_intent",
+        )
+
+    def site_clarification(intent: str) -> Optional[dict]:
+        return _site_clarification_for(intent, resolved_site, all_project_names, tour_id)
+
     tours = _fetch_tours(
         tours_collection=tours_collection,
         floorplans_collection=floorplans_collection,
@@ -1455,6 +1531,9 @@ def process_chat_message(
     comments = _collect_comments_from_tours(tours)
 
     if _contains_any(normalized, ["what should i check", "check today", "today priority", "today priorities", "daily briefing"]):
+        clarification = site_clarification("daily_briefing")
+        if clarification:
+            return clarification
         return _answer_daily_briefing(
             tours=tours,
             comments=comments,
@@ -1465,6 +1544,9 @@ def process_chat_message(
         )
 
     if _contains_any(normalized, ["pending", "open item", "open items", "remaining", "need attention", "action item", "action items"]):
+        clarification = site_clarification("pending_items")
+        if clarification:
+            return clarification
         return _answer_pending_items(
             comments=comments,
             inspections_collection=inspections_collection,
@@ -1474,6 +1556,9 @@ def process_chat_message(
         )
 
     if _contains_any(normalized, ["delay", "delayed", "overdue", "behind", "risk", "critical", "warning"]):
+        clarification = site_clarification("delay_risk")
+        if clarification:
+            return clarification
         return _answer_delay_risk(
             inspections_collection=inspections_collection,
             notifications_collection=notifications_collection,
@@ -1491,12 +1576,21 @@ def process_chat_message(
         )
 
     if _contains_any(normalized, ["work activity", "work activities", "activity status", "activity update", "schedule activity", "schedule activities"]):
+        clarification = site_clarification("work_activity_summary")
+        if clarification:
+            return clarification
         return _answer_work_activity(resolved_site)
 
     if _contains_any(normalized, ["material", "materials", "quantity", "delivery", "shortage", "readiness"]):
+        clarification = site_clarification("material_summary")
+        if clarification:
+            return clarification
         return _answer_material_summary(floorplans_collection, resolved_site)
 
     if _contains_any(normalized, ["site summary", "site overview", "project summary", "project overview", "site health", "project health"]):
+        clarification = site_clarification("site_summary")
+        if clarification:
+            return clarification
         return _answer_site_summary(
             tours=tours,
             comments=comments,
@@ -1508,6 +1602,9 @@ def process_chat_message(
         )
 
     if _contains_any(normalized, ["report", "client summary", "management summary", "status summary"]):
+        clarification = site_clarification("report_summary")
+        if clarification:
+            return clarification
         return _answer_report_summary(
             tours=tours,
             comments=comments,
@@ -1522,6 +1619,9 @@ def process_chat_message(
         return _answer_projects(floorplans_collection, project_names)
 
     if _contains_any(normalized, ["latest", "update", "recent", "today", "this week", "happened"]):
+        clarification = site_clarification("latest_updates")
+        if clarification:
+            return clarification
         return _answer_latest_updates(
             tours=tours,
             comments=comments,
@@ -1531,16 +1631,28 @@ def process_chat_message(
             site_name=resolved_site,
         )
 
-    if _contains_any(normalized, ["comment", "issue", "snag", "remark"]):
+    if _contains_any(normalized, ["comment", "comments", "coment", "coments", "commnet", "commnets", "issue", "snag", "remark"]):
+        clarification = site_clarification("comments")
+        if clarification:
+            return clarification
         return _answer_comments(comments, resolved_site)
 
     if _contains_any(normalized, ["inspection", "inspect", "checklist"]):
+        clarification = site_clarification("inspection_summary")
+        if clarification:
+            return clarification
         return _answer_inspections(inspections_collection, resolved_site)
 
     if _contains_any(normalized, ["progress", "coverage", "complete", "completion", "percent", "%"]):
+        clarification = site_clarification("progress_summary")
+        if clarification:
+            return clarification
         return _answer_progress(tours, resolved_site, floorplans_collection)
 
     if _contains_any(normalized, ["tour", "capture", "panorama", "pano"]):
+        clarification = site_clarification("tour_summary")
+        if clarification:
+            return clarification
         return _answer_tours(tours, resolved_site)
 
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
@@ -1549,8 +1661,13 @@ def process_chat_message(
     llm_intent = _classify_intent_with_ollama(
         message=raw_message,
         site_name=resolved_site,
-        project_names=project_names,
+        project_names=all_project_names,
     )
+    clarification = site_clarification(llm_intent)
+    if clarification:
+        clarification["intent_source"] = "ollama"
+        return clarification
+
     llm_response = _route_intent(
         intent=llm_intent,
         tours=tours,
@@ -1560,7 +1677,7 @@ def process_chat_message(
         notifications_collection=notifications_collection,
         current_user=current_user,
         site_name=resolved_site,
-        project_names=project_names,
+        project_names=all_project_names,
     )
     if llm_response is not None:
         llm_response["intent_source"] = "ollama"
