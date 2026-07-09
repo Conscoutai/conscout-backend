@@ -39,6 +39,7 @@ SUPPORTED_LLM_INTENTS = {
     "material_summary",
     "site_summary",
     "assigned_to_me",
+    "team_member_activity",
     "report_summary",
     "unknown",
 }
@@ -55,6 +56,7 @@ SITE_REQUIRED_INTENTS = {
     "work_activity_summary",
     "material_summary",
     "site_summary",
+    "team_member_activity",
     "report_summary",
 }
 
@@ -162,7 +164,7 @@ def _needs_comment_material_confirmation(normalized_message: str) -> bool:
 def _is_broad_site_question(normalized_message: str) -> bool:
     if _contains_any(
         normalized_message,
-        ["progress", "comment", "comments", "issue", "inspection", "tour", "alert", "notification", "material", "activity", "delay", "pending", "report"],
+        ["progress", "comment", "comments", "issue", "inspection", "tour", "alert", "notification", "material", "activity", "delay", "pending", "report", "team", "member"],
     ):
         return False
     return _contains_any(
@@ -720,6 +722,197 @@ def _answer_projects(floorplans_collection, project_names: list[str]) -> dict:
     return _response(f"You have {len(names)} project(s): {shown}{more}.", intent="projects")
 
 
+def _person_key(value: Any) -> str:
+    text = _norm(value)
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9@._+-]+", " ", text).strip()
+
+
+def _team_members_from_project(project: Optional[dict]) -> list[dict]:
+    if not project:
+        return []
+
+    members: list[dict] = []
+
+    def add_member(name: Any = "", email: Any = "", role: str = "") -> None:
+        clean_name = _clean(name)
+        clean_email = _clean(email).lower()
+        if not clean_name and not clean_email:
+            return
+        key = clean_email or _person_key(clean_name)
+        if not key:
+            return
+        for existing in members:
+            existing_key = existing.get("email") or _person_key(existing.get("name"))
+            if existing_key == key:
+                if role and not existing.get("role"):
+                    existing["role"] = role
+                return
+        members.append({"name": clean_name, "email": clean_email, "role": role})
+
+    stakeholder_members = project.get("stakeholder_members")
+    if isinstance(stakeholder_members, list):
+        for member in stakeholder_members:
+            if isinstance(member, dict):
+                add_member(
+                    member.get("name") or member.get("display_name"),
+                    member.get("email"),
+                    _clean(member.get("role") or member.get("project_role")),
+                )
+            else:
+                add_member(member)
+
+    stakeholder_emails = project.get("stakeholder_emails")
+    if isinstance(stakeholder_emails, list):
+        for email in stakeholder_emails:
+            add_member(email=email, role="team member")
+
+    owner = _clean(project.get("owner_email") or project.get("created_by_email"))
+    if owner:
+        add_member(email=owner, role="owner")
+
+    for member in members:
+        if not member.get("name") and member.get("email"):
+            member["name"] = member["email"].split("@", 1)[0]
+    return members
+
+
+def _team_member_label(member: dict) -> str:
+    name = _clean(member.get("name"))
+    email = _clean(member.get("email"))
+    role = _clean(member.get("role"))
+    label = name or email
+    if email and name and email.lower() != name.lower():
+        label = f"{name} ({email})"
+    if role:
+        label = f"{label} - {role}"
+    return label
+
+
+def _person_aliases(member: Optional[dict] = None, fallback_name: str = "") -> set[str]:
+    aliases: set[str] = set()
+    values = []
+    if member:
+        values.extend([member.get("name"), member.get("email")])
+    values.append(fallback_name)
+    for value in values:
+        key = _person_key(value)
+        if key:
+            aliases.add(key)
+            if "@" in key:
+                aliases.add(key.split("@", 1)[0])
+    return {alias for alias in aliases if alias}
+
+
+def _match_person_value(value: Any, aliases: set[str]) -> bool:
+    if value is None or not aliases:
+        return False
+    if isinstance(value, dict):
+        return any(_match_person_value(item, aliases) for item in value.values())
+    if isinstance(value, list):
+        return any(_match_person_value(item, aliases) for item in value)
+
+    text = _person_key(value)
+    if not text:
+        return False
+    tokens = set(text.split())
+    for alias in aliases:
+        if text == alias:
+            return True
+        if "@" in alias and alias in text:
+            return True
+        if len(alias) >= 3 and alias in tokens:
+            return True
+        if len(alias) >= 4 and alias in text:
+            return True
+    return False
+
+
+def _matches_person_fields(item: dict, aliases: set[str], fields: Iterable[str]) -> bool:
+    return any(_match_person_value(item.get(field), aliases) for field in fields)
+
+
+def _comment_title(comment: dict) -> str:
+    return _clean(
+        comment.get("title")
+        or comment.get("issue_type")
+        or comment.get("problem_description")
+        or comment.get("description")
+        or comment.get("message")
+        or "Untitled comment"
+    )
+
+
+def _inspection_title(inspection: dict) -> str:
+    return _clean(inspection.get("title") or inspection.get("inspection_id") or "Inspection")
+
+
+def _extract_person_name_from_message(normalized_message: str, members: list[dict]) -> tuple[str, Optional[dict]]:
+    message_key = _person_key(normalized_message)
+    for member in members:
+        aliases = _person_aliases(member)
+        if any(_match_person_value(message_key, {alias}) for alias in aliases if len(alias) >= 3):
+            return _clean(member.get("name") or member.get("email")), member
+
+    patterns = [
+        r"\bwho is\s+([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\b",
+        r"\bis\s+([a-z0-9@._+-]+(?:\s+(?!a\b|team\b|member\b)[a-z0-9@._+-]+)?)\s+(?:a\s+)?(?:team\s+)?member\b",
+        r"\bwhat did\s+([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\s+(?:do|open|opened|close|closed|create|created|complete|completed|finish|finished)\b",
+        r"\bwhat\s+(?:issues?|comments?|inspections?)\s+did\s+([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\s+(?:open|opened|close|closed|create|created|complete|completed|finish|finished)\b",
+        r"\bshow\s+([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\s+(?:activity|updates?|work)\b",
+        r"\bactivity\s+(?:of|for|by)\s+([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\b",
+        r"\b([a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?)\s+(?:activity|opened|closed|assigned|completed|created|issues?|comments?)\b",
+    ]
+    stop_words = {
+        "the",
+        "this",
+        "that",
+        "site",
+        "project",
+        "team",
+        "member",
+        "members",
+        "comment",
+        "comments",
+        "issue",
+        "issues",
+        "inspection",
+        "inspections",
+        "activity",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, message_key)
+        if not match:
+            continue
+        name = " ".join(part for part in match.group(1).split() if part not in stop_words)
+        if name:
+            return name, None
+    return "", None
+
+
+def _has_team_member_activity_language(normalized_message: str) -> bool:
+    if re.search(r"\bwho is\s+[a-z0-9@._+-]+", normalized_message):
+        return True
+    if re.search(r"\bis\s+[a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?\s+(?:a\s+)?(?:team\s+)?member\b", normalized_message):
+        return True
+    if re.search(r"\bwhat\s+(?:issues?|comments?|inspections?)\s+did\s+[a-z0-9@._+-]+", normalized_message):
+        return True
+    if re.search(r"\bactivity\s+(?:of|for|by)\s+[a-z0-9@._+-]+", normalized_message):
+        return True
+    if re.search(r"\b(?!work\b|schedule\b|site\b|project\b)[a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?\s+activity\b", normalized_message):
+        return True
+    if re.search(r"\b(?!comment\b|comments\b|issue\b|issues\b|inspection\b|inspections\b|work\b|site\b|project\b)[a-z0-9@._+-]+(?:\s+[a-z0-9@._+-]+)?\s+(?:opened|closed|assigned|completed|created)\b", normalized_message):
+        return True
+    return _contains_any(
+        normalized_message,
+        [
+            "what did",
+            "team member activity",
+        ],
+    )
+
+
 def _answer_team_members(floorplans_collection, site_name: str) -> dict:
     if not _clean(site_name):
         return _response("Which site are you looking for?", intent="clarify_site")
@@ -728,36 +921,7 @@ def _answer_team_members(floorplans_collection, site_name: str) -> dict:
     if not project:
         return _response(f"No project found for {site_name}.", intent="team_members", sources=["projects"])
 
-    members: list[str] = []
-    stakeholder_members = project.get("stakeholder_members")
-    if isinstance(stakeholder_members, list):
-        for member in stakeholder_members:
-            if not isinstance(member, dict):
-                continue
-            name = _clean(member.get("name"))
-            email = _clean(member.get("email"))
-            label = name or email
-            if label:
-                members.append(label)
-
-    stakeholder_emails = project.get("stakeholder_emails")
-    if isinstance(stakeholder_emails, list):
-        for email in stakeholder_emails:
-            cleaned = _clean(email)
-            if cleaned:
-                members.append(cleaned)
-
-    owner = _clean(project.get("owner_email") or project.get("created_by_email"))
-    if owner:
-        members.append(owner)
-
-    unique_members: list[str] = []
-    seen: set[str] = set()
-    for member in members:
-        key = member.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_members.append(member)
+    unique_members = _team_members_from_project(project)
 
     if not unique_members:
         return _response(
@@ -766,12 +930,153 @@ def _answer_team_members(floorplans_collection, site_name: str) -> dict:
             sources=["projects"],
         )
 
-    lines = [f"{index}. {member}" for index, member in enumerate(unique_members[:8], start=1)]
+    lines = [f"{index}. {_team_member_label(member)}" for index, member in enumerate(unique_members[:8], start=1)]
     more = f"\nShowing 8 of {len(unique_members)} team member(s)." if len(unique_members) > 8 else ""
     return _response(
         f"Team members for {site_name}:\n" + "\n".join(lines) + more,
         intent="team_members",
         sources=["projects"],
+    )
+
+
+def _answer_team_member_activity(
+    *,
+    message: str,
+    comments: list[dict],
+    floorplans_collection,
+    inspections_collection,
+    notifications_collection,
+    site_name: str,
+) -> dict:
+    if not _clean(site_name):
+        return _response("Which site are you looking for?", intent="clarify_site")
+
+    project = _project_doc(floorplans_collection, site_name)
+    if not project:
+        return _response(f"No project found for {site_name}.", intent="team_member_activity", sources=["projects"])
+
+    members = _team_members_from_project(project)
+    person_name, matched_member = _extract_person_name_from_message(_normalize_chat_typos(_norm(message)), members)
+    if not person_name:
+        return _response(
+            f"Which team member are you looking for in {site_name}?",
+            intent="clarify_intent",
+            sources=["projects"],
+        )
+
+    aliases = _person_aliases(matched_member, person_name)
+    raw_display_name = _clean((matched_member or {}).get("name") or person_name)
+    display_name = raw_display_name if "@" in raw_display_name else raw_display_name.title()
+    member_found = matched_member is not None
+
+    created_fields = ["created_by", "createdBy", "created_by_email", "owner_email"]
+    assigned_fields = ["assigned_to", "assignedTo", "assigned_to_detail", "responsible_party", "response_by"]
+    closed_fields = ["closed_by", "closedBy", "action_taken_by", "actionTakenBy"]
+
+    created_comments = [item for item in comments if _matches_person_fields(item, aliases, created_fields)]
+    assigned_comments = [
+        item
+        for item in comments
+        if not _is_closed_status(item.get("status")) and _matches_person_fields(item, aliases, assigned_fields)
+    ]
+    closed_comments = [
+        item
+        for item in comments
+        if _is_closed_status(item.get("status")) and _matches_person_fields(item, aliases, closed_fields)
+    ]
+
+    query = {"site_name": site_name} if _clean(site_name) else {}
+    inspections = list(inspections_collection.find(query).sort([("updated_at", -1), ("created_at", -1)]).limit(100))
+    created_inspections = [item for item in inspections if _matches_person_fields(item, aliases, created_fields)]
+    assigned_inspections = [
+        item
+        for item in inspections
+        if not _is_closed_status(item.get("status")) and _matches_person_fields(item, aliases, ["assigned_to"])
+    ]
+    completed_inspections = [
+        item
+        for item in inspections
+        if _is_closed_status(item.get("status"))
+        and _matches_person_fields(item, aliases, ["completion_by", "completed_by", "completionBy", "updated_by"])
+    ]
+
+    notification_query = {"site_name": site_name} if _clean(site_name) else {}
+    notifications = list(notifications_collection.find(notification_query).sort("created_at", -1).limit(50))
+    related_notifications = [
+        item
+        for item in notifications
+        if _match_person_value(
+            [
+                item.get("title"),
+                item.get("message"),
+                item.get("sender_name"),
+                item.get("sender_email"),
+                item.get("recipient_email"),
+                item.get("entity_id"),
+                item.get("metadata"),
+            ],
+            aliases,
+        )
+    ]
+
+    activity_count = (
+        len(created_comments)
+        + len(assigned_comments)
+        + len(closed_comments)
+        + len(created_inspections)
+        + len(assigned_inspections)
+        + len(completed_inspections)
+        + len(related_notifications)
+    )
+    if not member_found and activity_count == 0:
+        return _response(
+            (
+                f"I could not find {display_name} as a team member in {site_name}, "
+                "and I did not find project activity linked to that name. "
+                "What exactly are you looking for: progress, comments, inspections, tours, alerts, work activities, materials, or report?"
+            ),
+            intent="team_member_activity",
+            sources=["projects", "comments", "inspections", "notifications"],
+        )
+
+    intro = (
+        f"{display_name} is a team member in {site_name}."
+        if member_found
+        else f"I found activity linked to {display_name}, but this person is not listed as a team member in {site_name}."
+    )
+    lines = [
+        f"- Created/opened comments: {len(created_comments)}",
+        f"- Open comments assigned: {len(assigned_comments)}",
+        f"- Closed comments linked: {len(closed_comments)}",
+        f"- Inspections assigned: {len(assigned_inspections)}",
+        f"- Inspections completed: {len(completed_inspections)}",
+    ]
+    if related_notifications:
+        lines.append(f"- Related alerts/notifications: {len(related_notifications)}")
+
+    details: list[str] = []
+    for item in created_comments[:2]:
+        details.append(f"- Opened issue/comment: {_comment_title(item)} ({_clean(item.get('status') or 'Open')})")
+    for item in assigned_comments[:2]:
+        details.append(f"- Assigned open issue/comment: {_comment_title(item)} ({_clean(item.get('status') or 'Open')})")
+    for item in closed_comments[:2]:
+        details.append(f"- Closed issue/comment: {_comment_title(item)} ({_clean(item.get('status') or 'Closed')})")
+    for item in assigned_inspections[:2]:
+        details.append(f"- Assigned inspection: {_inspection_title(item)} ({_clean(item.get('status') or 'Pending')})")
+    for item in completed_inspections[:2]:
+        details.append(f"- Completed inspection: {_inspection_title(item)} ({_clean(item.get('status') or 'Completed')})")
+    for item in related_notifications[:2]:
+        title = _clean(item.get("title") or item.get("type") or "Notification")
+        message_text = _clean(item.get("message"))
+        details.append(f"- Related alert: {title}{': ' + message_text if message_text else ''}")
+
+    if activity_count == 0:
+        details.append(f"- No comments, inspections, or alerts are currently linked to {display_name}.")
+
+    return _response(
+        intro + "\n" + "\n".join(lines + details[:8]),
+        intent="team_member_activity",
+        sources=["projects", "comments", "inspections", "notifications"],
     )
 
 
@@ -1400,13 +1705,17 @@ def _should_format_answer(response: dict) -> bool:
     answer = _clean(response.get("answer"))
     if not answer:
         return False
-    if answer.startswith(("No ", "Please ", "Which ")):
+    if answer.startswith(("No ", "Please ", "Which ", "I could not find ")):
         return False
     return True
 
 
 def _answer_style_from_message(message: str, intent: str) -> str:
     normalized = _normalize_chat_typos(_norm(message))
+    if intent == "team_member_activity":
+        if _contains_any(normalized, ["what did", "activity", "opened", "closed", "created", "assigned", "completed"]):
+            return "action"
+        return "key_points"
     if _contains_any(normalized, ["report", "client summary", "management summary"]):
         return "report"
     if _contains_any(normalized, ["explain", "detail", "details", "why", "more about", "brief me"]):
@@ -1423,7 +1732,7 @@ def _answer_style_from_message(message: str, intent: str) -> str:
         return "list"
     if intent in {"report_summary", "site_summary"}:
         return "report"
-    if intent in {"daily_briefing", "pending_items", "delay_risk", "assigned_to_me"}:
+    if intent in {"daily_briefing", "pending_items", "delay_risk", "assigned_to_me", "team_member_activity"}:
         return "action"
     return "key_points"
 
@@ -1499,6 +1808,8 @@ def _recommended_next_step(intent: str, answer: str) -> str:
         return "Use this site snapshot to decide the next inspection, capture, or closure priority."
     if intent == "assigned_to_me":
         return "Work through your assigned open items and update their status once completed."
+    if intent == "team_member_activity":
+        return "Review this member's linked comments and inspections, then follow up on any open assigned items."
     if intent == "report_summary":
         return "Share this summary with the team and use the next action line for follow-up planning."
     return "Review the listed items and update the project record after action is taken."
@@ -1669,7 +1980,7 @@ def _classify_intent_with_ollama(
         "Allowed intents: project_list, latest_updates, comments, open_issues, "
         "progress_summary, inspection_summary, alerts, tour_summary, daily_briefing, "
         "pending_items, delay_risk, work_activity_summary, material_summary, "
-        "site_summary, assigned_to_me, report_summary, unknown.\n"
+        "site_summary, assigned_to_me, team_member_activity, report_summary, unknown.\n"
         "Rules:\n"
         "- pending_items: pending/open/remaining/action items.\n"
         "- daily_briefing: what should I check today, daily summary, today's priorities.\n"
@@ -1678,6 +1989,7 @@ def _classify_intent_with_ollama(
         "- material_summary: materials, material readiness, quantity used, delivery, shortage.\n"
         "- site_summary: full site/project health or site overview.\n"
         "- assigned_to_me: my tasks, assigned to me, my action items.\n"
+        "- team_member_activity: who is a team member, what a member did, member activity, opened/closed/assigned by a person.\n"
         "- report_summary: client report, project report, management summary.\n"
         "- alerts: alerts, notifications, reminders.\n"
         "- inspection_summary: checklist or inspection questions.\n"
@@ -1718,6 +2030,7 @@ def _classify_intent_with_ollama(
 def _route_intent(
     *,
     intent: str,
+    message: str,
     tours: list[dict],
     comments: list[dict],
     floorplans_collection,
@@ -1792,6 +2105,15 @@ def _route_intent(
             inspections_collection=inspections_collection,
             notifications_collection=notifications_collection,
             current_user=current_user,
+            site_name=site_name,
+        )
+    if intent == "team_member_activity":
+        return _answer_team_member_activity(
+            message=message,
+            comments=comments,
+            floorplans_collection=floorplans_collection,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
             site_name=site_name,
         )
     if intent == "report_summary":
@@ -1930,6 +2252,21 @@ def process_chat_message(
             )
         )
 
+    if _has_team_member_activity_language(normalized):
+        clarification = site_clarification("team_member_activity")
+        if clarification:
+            return clarification
+        return finish(
+            _answer_team_member_activity(
+                message=raw_message,
+                comments=comments,
+                floorplans_collection=floorplans_collection,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                site_name=resolved_site,
+            )
+        )
+
     if _contains_any(normalized, ["work activity", "work activities", "activity status", "activity update", "schedule activity", "schedule activities"]):
         clarification = site_clarification("work_activity_summary")
         if clarification:
@@ -2020,9 +2357,20 @@ def process_chat_message(
         return finish(_answer_tours(tours, resolved_site))
 
     if _contains_any(normalized, ["team", "member", "members", "teammember", "team member", "stakeholder", "stakeholders"]):
-        clarification = site_clarification("site_summary")
+        clarification = site_clarification("team_member_activity" if _has_team_member_activity_language(normalized) else "site_summary")
         if clarification:
             return clarification
+        if _has_team_member_activity_language(normalized):
+            return finish(
+                _answer_team_member_activity(
+                    message=raw_message,
+                    comments=comments,
+                    floorplans_collection=floorplans_collection,
+                    inspections_collection=inspections_collection,
+                    notifications_collection=notifications_collection,
+                    site_name=resolved_site,
+                )
+            )
         return finish(_answer_team_members(floorplans_collection, resolved_site))
 
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
@@ -2056,6 +2404,7 @@ def process_chat_message(
 
     llm_response = _route_intent(
         intent=llm_intent,
+        message=raw_message,
         tours=tours,
         comments=comments,
         floorplans_collection=floorplans_collection,
