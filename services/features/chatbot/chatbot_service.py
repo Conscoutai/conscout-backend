@@ -720,6 +720,61 @@ def _answer_projects(floorplans_collection, project_names: list[str]) -> dict:
     return _response(f"You have {len(names)} project(s): {shown}{more}.", intent="projects")
 
 
+def _answer_team_members(floorplans_collection, site_name: str) -> dict:
+    if not _clean(site_name):
+        return _response("Which site are you looking for?", intent="clarify_site")
+
+    project = _project_doc(floorplans_collection, site_name)
+    if not project:
+        return _response(f"No project found for {site_name}.", intent="team_members", sources=["projects"])
+
+    members: list[str] = []
+    stakeholder_members = project.get("stakeholder_members")
+    if isinstance(stakeholder_members, list):
+        for member in stakeholder_members:
+            if not isinstance(member, dict):
+                continue
+            name = _clean(member.get("name"))
+            email = _clean(member.get("email"))
+            label = name or email
+            if label:
+                members.append(label)
+
+    stakeholder_emails = project.get("stakeholder_emails")
+    if isinstance(stakeholder_emails, list):
+        for email in stakeholder_emails:
+            cleaned = _clean(email)
+            if cleaned:
+                members.append(cleaned)
+
+    owner = _clean(project.get("owner_email") or project.get("created_by_email"))
+    if owner:
+        members.append(owner)
+
+    unique_members: list[str] = []
+    seen: set[str] = set()
+    for member in members:
+        key = member.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_members.append(member)
+
+    if not unique_members:
+        return _response(
+            f"No team members found for {site_name}. What would you like to check instead: progress, comments, inspections, tours, alerts, work activities, materials, or report?",
+            intent="team_members",
+            sources=["projects"],
+        )
+
+    lines = [f"{index}. {member}" for index, member in enumerate(unique_members[:8], start=1)]
+    more = f"\nShowing 8 of {len(unique_members)} team member(s)." if len(unique_members) > 8 else ""
+    return _response(
+        f"Team members for {site_name}:\n" + "\n".join(lines) + more,
+        intent="team_members",
+        sources=["projects"],
+    )
+
+
 def _answer_tours(tours: list[dict], site_name: str) -> dict:
     if not tours:
         target = f" in {site_name}" if site_name else ""
@@ -1964,6 +2019,12 @@ def process_chat_message(
             return clarification
         return finish(_answer_tours(tours, resolved_site))
 
+    if _contains_any(normalized, ["team", "member", "members", "teammember", "team member", "stakeholder", "stakeholders"]):
+        clarification = site_clarification("site_summary")
+        if clarification:
+            return clarification
+        return finish(_answer_team_members(floorplans_collection, resolved_site))
+
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
         return finish(_answer_notifications(notifications_collection, current_user))
 
@@ -2008,7 +2069,11 @@ def process_chat_message(
         llm_response["intent_source"] = "ollama"
         return finish(llm_response)
 
+    target = f" for {resolved_site}" if _clean(resolved_site) else ""
     return _response(
-        "I can help with projects, latest updates, progress, tours, comments, inspections, notifications, work activities, materials, site summaries, assigned tasks, and reports.",
+        (
+            f"I can only answer Conscout project questions{target}. "
+            "What are you looking for: progress, comments, inspections, tours, alerts, work activities, materials, team members, or a report?"
+        ),
         intent="fallback",
     )
