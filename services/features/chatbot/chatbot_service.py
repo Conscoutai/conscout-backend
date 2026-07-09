@@ -74,6 +74,32 @@ def _norm(value: Any) -> str:
     return re.sub(r"\s+", " ", _clean(value).lower())
 
 
+def _normalize_chat_typos(message: str) -> str:
+    replacements = {
+        "siye": "site",
+        "sire": "site",
+        "stie": "site",
+        "progres": "progress",
+        "progess": "progress",
+        "prgress": "progress",
+        "commnet": "comment",
+        "commnets": "comments",
+        "coment": "comment",
+        "coments": "comments",
+        "updte": "update",
+        "updat": "update",
+        "latst": "latest",
+        "delayd": "delayed",
+        "materail": "material",
+        "activty": "activity",
+        "activites": "activities",
+    }
+    normalized = f" {message} "
+    for wrong, correct in replacements.items():
+        normalized = re.sub(rf"(?<=\s){re.escape(wrong)}(?=\s)", correct, normalized)
+    return normalized.strip()
+
+
 def _contains_any(message: str, words: Iterable[str]) -> bool:
     return any(word in message for word in words)
 
@@ -1328,6 +1354,7 @@ def _classify_intent_with_ollama(
         "- comments/open_issues: comments, issues, snags.\n"
         "- progress_summary: progress, coverage, completion percent.\n"
         "- latest_updates: recent/latest/today updates.\n"
+        "- Tolerate minor spelling mistakes and infer the closest construction app intent.\n"
         f"Current site: {site_name or 'unknown'}.\n"
         f"Projects: {', '.join(project_names[:20]) or 'unknown'}.\n"
         f"Message: {message}\n"
@@ -1465,7 +1492,7 @@ def process_chat_message(
     project_names: Optional[list[str]] = None,
 ) -> dict:
     raw_message = _clean(message)
-    normalized = _norm(raw_message)
+    normalized = _normalize_chat_typos(_norm(raw_message))
     project_names = project_names or []
 
     if normalized in {"hi", "hello", "hey", "hai"}:
@@ -1495,6 +1522,12 @@ def process_chat_message(
             "Did you mean comments/issues or material/cement? Ask like: 'list comments' or 'material summary'.",
             intent="clarify_intent",
         )
+
+    if _contains_any(normalized, ["project", "site"]) and _contains_any(
+        normalized,
+        ["list", "show", "my", "all", "how many", "another", "other", "available", "switch", "change"],
+    ):
+        return _answer_projects(floorplans_collection, all_project_names)
 
     def site_clarification(intent: str) -> Optional[dict]:
         return _site_clarification_for(intent, resolved_site, all_project_names, tour_id)
@@ -1591,9 +1624,6 @@ def process_chat_message(
             current_user=current_user,
             site_name=resolved_site,
         )
-
-    if _contains_any(normalized, ["project", "site"]) and _contains_any(normalized, ["list", "show", "my", "all", "how many"]):
-        return _answer_projects(floorplans_collection, project_names)
 
     if _contains_any(normalized, ["comment", "comments", "coment", "coments", "commnet", "commnets"]) and _contains_any(normalized, ["latest", "recent", "last", "new"]):
         clarification = site_clarification("comments")
