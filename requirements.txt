@@ -10,9 +10,7 @@ fpdf
 ezdxf
 exif
 pdf2image
-joblib
 pyproj
-scikit-learn
 python-multipart
 requests
 opencv-python
