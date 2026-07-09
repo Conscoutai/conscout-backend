@@ -159,6 +159,18 @@ def _needs_comment_material_confirmation(normalized_message: str) -> bool:
     return True
 
 
+def _is_broad_site_question(normalized_message: str) -> bool:
+    if _contains_any(
+        normalized_message,
+        ["progress", "comment", "comments", "issue", "inspection", "tour", "alert", "notification", "material", "activity", "delay", "pending", "report"],
+    ):
+        return False
+    return _contains_any(
+        normalized_message,
+        ["explain about", "tell me about", "about", "overview", "summary", "describe"],
+    )
+
+
 def _project_filter(site_name: str) -> dict:
     return {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]}
 
@@ -1954,6 +1966,22 @@ def process_chat_message(
 
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
         return finish(_answer_notifications(notifications_collection, current_user))
+
+    if _is_broad_site_question(normalized):
+        clarification = site_clarification("site_summary")
+        if clarification:
+            return clarification
+        return finish(
+            _answer_site_summary(
+                tours=tours,
+                comments=comments,
+                floorplans_collection=floorplans_collection,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
+        )
 
     llm_intent = _classify_intent_with_ollama(
         message=raw_message,
