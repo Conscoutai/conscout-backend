@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from datetime import datetime
 from typing import Any, Iterable, Optional
+
+import requests
 
 from core.auth_context import AuthenticatedUser
 from services.progress.work_schedule.work_schedule_service import (
@@ -18,6 +22,21 @@ from services.progress.work_schedule.work_schedule_service import (
 TOUR_WEIGHT = 0.45
 ACTIVITY_WEIGHT = 0.40
 MATERIAL_WEIGHT = 0.15
+OLLAMA_TIMEOUT_SECONDS = 12
+SUPPORTED_LLM_INTENTS = {
+    "project_list",
+    "latest_updates",
+    "comments",
+    "open_issues",
+    "progress_summary",
+    "inspection_summary",
+    "alerts",
+    "tour_summary",
+    "daily_briefing",
+    "pending_items",
+    "delay_risk",
+    "unknown",
+}
 
 
 def _now_ms() -> int:
@@ -695,6 +714,280 @@ def _answer_latest_updates(
     )
 
 
+def _is_closed_status(value: Any) -> bool:
+    status = _norm(value)
+    return status in {"closed", "complete", "completed", "done", "resolved"}
+
+
+def _open_comments(comments: list[dict]) -> list[dict]:
+    return [
+        comment
+        for comment in comments
+        if not _is_closed_status(comment.get("status"))
+    ]
+
+
+def _open_inspections(inspections_collection, site_name: str) -> list[dict]:
+    query = {"site_name": site_name} if _clean(site_name) else {}
+    inspections = list(
+        inspections_collection.find(query)
+        .sort([("updated_at", -1), ("created_at", -1)])
+        .limit(50)
+    )
+    return [
+        item
+        for item in inspections
+        if not _is_closed_status(item.get("status"))
+    ]
+
+
+def _recent_notifications(notifications_collection, current_user: Optional[AuthenticatedUser]) -> list[dict]:
+    return list(
+        notifications_collection.find(_recipient_filter(current_user))
+        .sort("created_at", -1)
+        .limit(20)
+    )
+
+
+def _answer_pending_items(
+    *,
+    comments: list[dict],
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    open_comments = _open_comments(comments)
+    open_inspections = _open_inspections(inspections_collection, site_name)
+    notifications = _recent_notifications(notifications_collection, current_user)
+    unread_alerts = [
+        item
+        for item in notifications
+        if item.get("is_read") is not True and _clean(item.get("status") or "pending") == "pending"
+    ]
+
+    lines = [
+        f"- Open comments: {len(open_comments)}",
+        f"- Open inspections: {len(open_inspections)}",
+        f"- Unread alerts: {len(unread_alerts)}",
+    ]
+    for comment in open_comments[:2]:
+        lines.append(f"- Comment: {_line_comment(comment, 1)[3:]}")
+    for inspection in open_inspections[:2]:
+        title = _clean(inspection.get("title") or inspection.get("inspection_id") or "Inspection")
+        status = _clean(inspection.get("status") or "Pending")
+        due = _format_date(inspection.get("due_date"))
+        lines.append(f"- Inspection: {title} ({status}{', due ' + due if due else ''})")
+
+    target = f" in {site_name}" if site_name else ""
+    return _response(
+        f"Pending items{target}:\n" + "\n".join(lines),
+        intent="pending_items",
+        sources=["comments", "inspections", "notifications"],
+    )
+
+
+def _answer_delay_risk(
+    *,
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    open_inspections = _open_inspections(inspections_collection, site_name)
+    risky_inspections = [
+        item
+        for item in open_inspections
+        if _contains_any(_norm(item.get("status")), ["overdue", "delay", "late"])
+    ]
+    notifications = _recent_notifications(notifications_collection, current_user)
+    risk_notifications = [
+        item
+        for item in notifications
+        if _contains_any(
+            _norm(f"{item.get('title')} {item.get('message')} {item.get('type')}"),
+            ["delay", "overdue", "behind", "critical", "warning", "risk"],
+        )
+    ]
+
+    lines = [
+        f"- Risk alerts: {len(risk_notifications)}",
+        f"- Overdue/delayed inspections: {len(risky_inspections)}",
+    ]
+    for item in risk_notifications[:4]:
+        title = _clean(item.get("title") or item.get("type") or "Alert")
+        message = _clean(item.get("message"))
+        lines.append(f"- {title}: {message}" if message else f"- {title}")
+
+    target = f" in {site_name}" if site_name else ""
+    return _response(
+        f"Delay/risk summary{target}:\n" + "\n".join(lines),
+        intent="delay_risk",
+        sources=["inspections", "notifications"],
+    )
+
+
+def _answer_daily_briefing(
+    *,
+    tours: list[dict],
+    comments: list[dict],
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    open_comments = _open_comments(comments)
+    open_inspections = _open_inspections(inspections_collection, site_name)
+    notifications = _recent_notifications(notifications_collection, current_user)
+    unread_alerts = [
+        item
+        for item in notifications
+        if item.get("is_read") is not True and _clean(item.get("status") or "pending") == "pending"
+    ]
+    latest_tour = tours[0] if tours else None
+
+    lines = [
+        f"- Open comments: {len(open_comments)}",
+        f"- Open inspections: {len(open_inspections)}",
+        f"- Unread alerts: {len(unread_alerts)}",
+    ]
+    if latest_tour:
+        tour_name = _clean(latest_tour.get("name") or latest_tour.get("tour_id") or "latest tour")
+        tour_date = _format_date(latest_tour.get("created_at"))
+        lines.append(f"- Latest tour: {tour_name}{' on ' + tour_date if tour_date else ''}")
+    if unread_alerts:
+        title = _clean(unread_alerts[0].get("title") or unread_alerts[0].get("type") or "Alert")
+        message = _clean(unread_alerts[0].get("message"))
+        lines.append(f"- First alert: {title}{': ' + message if message else ''}")
+
+    target = f" for {site_name}" if site_name else ""
+    return _response(
+        f"Today check{target}:\n" + "\n".join(lines),
+        intent="daily_briefing",
+        sources=["tours", "comments", "inspections", "notifications"],
+    )
+
+
+def _ollama_enabled() -> bool:
+    return os.getenv("CHAT_INTENT_PROVIDER", "").strip().lower() == "ollama"
+
+
+def _classify_intent_with_ollama(
+    *,
+    message: str,
+    site_name: str,
+    project_names: list[str],
+) -> str:
+    if not _ollama_enabled():
+        return "unknown"
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip() or "llama3.2:3b"
+    prompt = (
+        "You classify Conscout construction app chatbot messages.\n"
+        "Return only JSON with one field: intent.\n"
+        "Allowed intents: project_list, latest_updates, comments, open_issues, "
+        "progress_summary, inspection_summary, alerts, tour_summary, daily_briefing, "
+        "pending_items, delay_risk, unknown.\n"
+        "Rules:\n"
+        "- pending_items: pending/open/remaining/action items.\n"
+        "- daily_briefing: what should I check today, daily summary, today's priorities.\n"
+        "- delay_risk: delayed, overdue, behind, risk, critical, warning.\n"
+        "- alerts: alerts, notifications, reminders.\n"
+        "- inspection_summary: checklist or inspection questions.\n"
+        "- comments/open_issues: comments, issues, snags.\n"
+        "- progress_summary: progress, coverage, completion percent.\n"
+        "- latest_updates: recent/latest/today updates.\n"
+        f"Current site: {site_name or 'unknown'}.\n"
+        f"Projects: {', '.join(project_names[:20]) or 'unknown'}.\n"
+        f"Message: {message}\n"
+    )
+
+    try:
+        response = requests.post(
+            f"{base_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "format": "json",
+                "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": 80,
+                },
+            },
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        raw = _clean(payload.get("response"))
+        parsed = json.loads(raw)
+        intent = _clean(parsed.get("intent")).lower()
+        return intent if intent in SUPPORTED_LLM_INTENTS else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _route_intent(
+    *,
+    intent: str,
+    tours: list[dict],
+    comments: list[dict],
+    floorplans_collection,
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+    project_names: list[str],
+) -> Optional[dict]:
+    if intent == "project_list":
+        return _answer_projects(floorplans_collection, project_names)
+    if intent == "latest_updates":
+        return _answer_latest_updates(
+            tours=tours,
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    if intent in {"comments", "open_issues"}:
+        return _answer_comments(comments, site_name)
+    if intent == "progress_summary":
+        return _answer_progress(tours, site_name, floorplans_collection)
+    if intent == "inspection_summary":
+        return _answer_inspections(inspections_collection, site_name)
+    if intent == "alerts":
+        return _answer_notifications(notifications_collection, current_user)
+    if intent == "tour_summary":
+        return _answer_tours(tours, site_name)
+    if intent == "pending_items":
+        return _answer_pending_items(
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    if intent == "delay_risk":
+        return _answer_delay_risk(
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    if intent == "daily_briefing":
+        return _answer_daily_briefing(
+            tours=tours,
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    return None
+
+
 def process_chat_message(
     *,
     message: str,
@@ -741,6 +1034,33 @@ def process_chat_message(
     )
     comments = _collect_comments_from_tours(tours)
 
+    if _contains_any(normalized, ["what should i check", "check today", "today priority", "today priorities", "daily briefing"]):
+        return _answer_daily_briefing(
+            tours=tours,
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
+    if _contains_any(normalized, ["pending", "open item", "open items", "remaining", "need attention", "action item", "action items"]):
+        return _answer_pending_items(
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
+    if _contains_any(normalized, ["delay", "delayed", "overdue", "behind", "risk", "critical", "warning"]):
+        return _answer_delay_risk(
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
     if _contains_any(normalized, ["project", "site"]) and _contains_any(normalized, ["list", "show", "my", "all", "how many"]):
         return _answer_projects(floorplans_collection, project_names)
 
@@ -768,6 +1088,26 @@ def process_chat_message(
 
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
         return _answer_notifications(notifications_collection, current_user)
+
+    llm_intent = _classify_intent_with_ollama(
+        message=raw_message,
+        site_name=resolved_site,
+        project_names=project_names,
+    )
+    llm_response = _route_intent(
+        intent=llm_intent,
+        tours=tours,
+        comments=comments,
+        floorplans_collection=floorplans_collection,
+        inspections_collection=inspections_collection,
+        notifications_collection=notifications_collection,
+        current_user=current_user,
+        site_name=resolved_site,
+        project_names=project_names,
+    )
+    if llm_response is not None:
+        llm_response["intent_source"] = "ollama"
+        return llm_response
 
     return _response(
         "I can help with projects, latest updates, progress, tours, comments, inspections, and notifications. Try: 'latest updates', 'list comments', or 'progress summary'.",
