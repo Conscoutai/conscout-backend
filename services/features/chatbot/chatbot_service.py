@@ -1322,6 +1322,167 @@ def _ollama_enabled() -> bool:
     return os.getenv("CHAT_INTENT_PROVIDER", "").strip().lower() == "ollama"
 
 
+def _answer_formatter_mode() -> str:
+    return os.getenv("CHAT_ANSWER_FORMATTER", "template").strip().lower()
+
+
+def _should_format_answer(response: dict) -> bool:
+    intent = _clean(response.get("intent"))
+    if intent in {"greeting", "help", "fallback", "clarify_site", "clarify_intent", "projects"}:
+        return False
+    answer = _clean(response.get("answer"))
+    if not answer:
+        return False
+    if answer.startswith(("No ", "Please ", "Which ")):
+        return False
+    return True
+
+
+def _recommended_next_step(intent: str, answer: str) -> str:
+    normalized = _norm(answer)
+    if intent in {"progress", "progress_summary"}:
+        if "coverage" in normalized:
+            return "Focus the next site visit on improving capture coverage and verifying the remaining tour points."
+        return "Review the progress components and prioritize the weakest area first."
+    if intent in {"comments", "open_issues"}:
+        return "Review the open comments first, assign ownership, and close resolved items after verification."
+    if intent == "inspections":
+        return "Check the open or upcoming inspections and complete any overdue action before the next update."
+    if intent == "notifications":
+        return "Start with the unread alerts and clear the items that need immediate action."
+    if intent == "latest_updates":
+        return "Use these updates to decide what needs follow-up today."
+    if intent == "tours":
+        return "Open the latest tour and verify whether the captured areas match the current site condition."
+    if intent == "pending_items":
+        return "Close the highest-impact pending item first, then update the remaining owners."
+    if intent == "delay_risk":
+        return "Prioritize the delayed or critical items and update the responsible team before the next review."
+    if intent == "daily_briefing":
+        return "Start with the alerts and open site items before checking new progress."
+    if intent == "work_activity_summary":
+        return "Focus on delayed or critical activities and update actual progress after the next inspection."
+    if intent == "material_summary":
+        return "Follow up on delayed or due-soon materials so work activities are not blocked."
+    if intent == "site_summary":
+        return "Use this site snapshot to decide the next inspection, capture, or closure priority."
+    if intent == "assigned_to_me":
+        return "Work through your assigned open items and update their status once completed."
+    if intent == "report_summary":
+        return "Share this summary with the team and use the next action line for follow-up planning."
+    return "Review the listed items and update the project record after action is taken."
+
+
+def _template_professional_answer(response: dict, site_name: str) -> str:
+    answer = _clean(response.get("answer"))
+    if not answer:
+        return answer
+
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    if not lines:
+        return answer
+
+    first_line = lines[0].rstrip(".")
+    bullet_lines = []
+    for line in lines[1:]:
+        cleaned = line.lstrip("- ").strip()
+        if cleaned:
+            bullet_lines.append(cleaned)
+
+    intent = _clean(response.get("intent"))
+    location = f" for {site_name}" if _clean(site_name) and site_name.lower() not in first_line.lower() else ""
+    paragraph = f"{first_line}{location}."
+    if intent in {"progress", "progress_summary", "site_summary", "report_summary"}:
+        paragraph = f"{paragraph} This gives a quick view of the current site position and the areas that need attention."
+    elif intent in {"comments", "open_issues", "pending_items", "delay_risk"}:
+        paragraph = f"{paragraph} These items should be reviewed so the team can keep the site moving without unresolved blockers."
+    elif intent in {"work_activity_summary", "material_summary", "inspections"}:
+        paragraph = f"{paragraph} Use this to decide what needs coordination before the next site update."
+
+    output = [paragraph]
+    if bullet_lines:
+        output.append("")
+        output.append("Key points:")
+        output.extend(f"- {line}" for line in bullet_lines[:8])
+    output.append("")
+    output.append("Recommended next step:")
+    output.append(f"- {_recommended_next_step(intent, answer)}")
+    return "\n".join(output)
+
+
+def _format_answer_with_ollama(*, message: str, response: dict, site_name: str) -> Optional[str]:
+    if _answer_formatter_mode() != "ollama":
+        return None
+    if not _ollama_enabled():
+        return None
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip() or "llama3.2:3b"
+    factual_answer = _clean(response.get("answer"))
+    intent = _clean(response.get("intent"))
+    prompt = (
+        "Rewrite this Conscout construction chatbot answer in a professional, engaging style.\n"
+        "Do not add facts, numbers, names, dates, statuses, or recommendations that are not present.\n"
+        "Keep every number and project/site name exactly the same.\n"
+        "Use this format:\n"
+        "1 short summary paragraph.\n"
+        "Blank line.\n"
+        "Key points:\n"
+        "- 2 to 5 bullets.\n"
+        "Blank line.\n"
+        "Recommended next step:\n"
+        "- 1 practical action.\n"
+        "Return plain text only.\n"
+        f"User question: {message}\n"
+        f"Intent: {intent}\n"
+        f"Site: {site_name or 'unknown'}\n"
+        f"Factual answer:\n{factual_answer}\n"
+    )
+    try:
+        response_payload = requests.post(
+            f"{base_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 260,
+                },
+            },
+            timeout=max(8, OLLAMA_TIMEOUT_SECONDS),
+        )
+        response_payload.raise_for_status()
+        payload = response_payload.json()
+        formatted = _clean(payload.get("response"))
+        return formatted if formatted else None
+    except Exception:
+        return None
+
+
+def _professionalize_response(*, message: str, response: dict, site_name: str) -> dict:
+    if not _should_format_answer(response):
+        return response
+
+    original_answer = _clean(response.get("answer"))
+    formatted = _format_answer_with_ollama(
+        message=message,
+        response=response,
+        site_name=site_name,
+    )
+    answer_style = "ollama" if formatted else "template"
+    if not formatted:
+        formatted = _template_professional_answer(response, site_name)
+
+    if formatted and formatted != original_answer:
+        updated = dict(response)
+        updated["answer"] = formatted
+        updated["raw_answer"] = original_answer
+        updated["answer_style"] = answer_style
+        return updated
+    return response
+
+
 def _classify_intent_with_ollama(
     *,
     message: str,
@@ -1540,136 +1701,157 @@ def process_chat_message(
     )
     comments = _collect_comments_from_tours(tours)
 
+    def finish(response: dict) -> dict:
+        return _professionalize_response(
+            message=raw_message,
+            response=response,
+            site_name=resolved_site,
+        )
+
     if _contains_any(normalized, ["what should i check", "check today", "today priority", "today priorities", "daily briefing"]):
         clarification = site_clarification("daily_briefing")
         if clarification:
             return clarification
-        return _answer_daily_briefing(
-            tours=tours,
-            comments=comments,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_daily_briefing(
+                tours=tours,
+                comments=comments,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["pending", "open item", "open items", "remaining", "need attention", "action item", "action items"]):
         clarification = site_clarification("pending_items")
         if clarification:
             return clarification
-        return _answer_pending_items(
-            comments=comments,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_pending_items(
+                comments=comments,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["delay", "delayed", "overdue", "behind", "risk", "critical", "warning"]):
         clarification = site_clarification("delay_risk")
         if clarification:
             return clarification
-        return _answer_delay_risk(
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_delay_risk(
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["assigned to me", "my task", "my tasks", "my action", "for me"]):
-        return _answer_assigned_to_me(
-            comments=comments,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_assigned_to_me(
+                comments=comments,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["work activity", "work activities", "activity status", "activity update", "schedule activity", "schedule activities"]):
         clarification = site_clarification("work_activity_summary")
         if clarification:
             return clarification
-        return _answer_work_activity(resolved_site)
+        return finish(_answer_work_activity(resolved_site))
 
     if _contains_any(normalized, ["material", "materials", "quantity", "delivery", "shortage", "readiness"]):
         clarification = site_clarification("material_summary")
         if clarification:
             return clarification
-        return _answer_material_summary(floorplans_collection, resolved_site)
+        return finish(_answer_material_summary(floorplans_collection, resolved_site))
 
     if _contains_any(normalized, ["site summary", "site overview", "project summary", "project overview", "site health", "project health"]):
         clarification = site_clarification("site_summary")
         if clarification:
             return clarification
-        return _answer_site_summary(
-            tours=tours,
-            comments=comments,
-            floorplans_collection=floorplans_collection,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_site_summary(
+                tours=tours,
+                comments=comments,
+                floorplans_collection=floorplans_collection,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["report", "client summary", "management summary", "status summary"]):
         clarification = site_clarification("report_summary")
         if clarification:
             return clarification
-        return _answer_report_summary(
-            tours=tours,
-            comments=comments,
-            floorplans_collection=floorplans_collection,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_report_summary(
+                tours=tours,
+                comments=comments,
+                floorplans_collection=floorplans_collection,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["comment", "comments", "coment", "coments", "commnet", "commnets"]) and _contains_any(normalized, ["latest", "recent", "last", "new"]):
         clarification = site_clarification("comments")
         if clarification:
             return clarification
-        return _answer_comments(comments, resolved_site)
+        return finish(_answer_comments(comments, resolved_site))
 
     if _contains_any(normalized, ["latest", "update", "recent", "today", "this week", "happened"]):
         clarification = site_clarification("latest_updates")
         if clarification:
             return clarification
-        return _answer_latest_updates(
-            tours=tours,
-            comments=comments,
-            inspections_collection=inspections_collection,
-            notifications_collection=notifications_collection,
-            current_user=current_user,
-            site_name=resolved_site,
+        return finish(
+            _answer_latest_updates(
+                tours=tours,
+                comments=comments,
+                inspections_collection=inspections_collection,
+                notifications_collection=notifications_collection,
+                current_user=current_user,
+                site_name=resolved_site,
+            )
         )
 
     if _contains_any(normalized, ["comment", "comments", "coment", "coments", "commnet", "commnets", "issue", "snag", "remark"]):
         clarification = site_clarification("comments")
         if clarification:
             return clarification
-        return _answer_comments(comments, resolved_site)
+        return finish(_answer_comments(comments, resolved_site))
 
     if _contains_any(normalized, ["inspection", "inspect", "checklist"]):
         clarification = site_clarification("inspection_summary")
         if clarification:
             return clarification
-        return _answer_inspections(inspections_collection, resolved_site)
+        return finish(_answer_inspections(inspections_collection, resolved_site))
 
     if _contains_any(normalized, ["progress", "coverage", "complete", "completion", "percent", "%"]):
         clarification = site_clarification("progress_summary")
         if clarification:
             return clarification
-        return _answer_progress(tours, resolved_site, floorplans_collection)
+        return finish(_answer_progress(tours, resolved_site, floorplans_collection))
 
     if _contains_any(normalized, ["tour", "capture", "panorama", "pano"]):
         clarification = site_clarification("tour_summary")
         if clarification:
             return clarification
-        return _answer_tours(tours, resolved_site)
+        return finish(_answer_tours(tours, resolved_site))
 
     if _contains_any(normalized, ["notification", "alert", "unread", "reminder"]):
-        return _answer_notifications(notifications_collection, current_user)
+        return finish(_answer_notifications(notifications_collection, current_user))
 
     llm_intent = _classify_intent_with_ollama(
         message=raw_message,
@@ -1694,7 +1876,7 @@ def process_chat_message(
     )
     if llm_response is not None:
         llm_response["intent_source"] = "ollama"
-        return llm_response
+        return finish(llm_response)
 
     return _response(
         "I can help with projects, latest updates, progress, tours, comments, inspections, notifications, work activities, materials, site summaries, assigned tasks, and reports.",
