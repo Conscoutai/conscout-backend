@@ -35,6 +35,11 @@ SUPPORTED_LLM_INTENTS = {
     "daily_briefing",
     "pending_items",
     "delay_risk",
+    "work_activity_summary",
+    "material_summary",
+    "site_summary",
+    "assigned_to_me",
+    "report_summary",
     "unknown",
 }
 
@@ -427,6 +432,97 @@ def _material_progress(project: Optional[dict]) -> Optional[float]:
     return round(max(0.0, min(total_score / counted, 100.0)), 2)
 
 
+def _activity_name(activity: dict) -> str:
+    return _clean(
+        activity.get("activity_name")
+        or activity.get("name")
+        or activity.get("title")
+        or activity.get("work_type")
+        or "Activity"
+    )
+
+
+def _activity_end_date(activity: dict) -> Optional[datetime]:
+    return _parse_project_date(activity.get("end_date") or activity.get("endDate") or activity.get("finish_date"))
+
+
+def _work_activity_summary(site_name: str) -> Optional[dict]:
+    if not _clean(site_name):
+        return None
+    try:
+        comparison = work_schedule_comparison(site_name)
+    except Exception:
+        return None
+
+    activities = [item for item in comparison.get("activities") or [] if isinstance(item, dict)]
+    if not activities:
+        return None
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    completed: list[dict] = []
+    in_progress: list[dict] = []
+    not_started: list[dict] = []
+    delayed: list[dict] = []
+    critical: list[dict] = []
+
+    for activity in activities:
+        status = _norm(activity.get("primary_status") or activity.get("status"))
+        actual_percent = _to_percent(activity.get("actual_percent")) or 0.0
+        end_date = _activity_end_date(activity)
+        is_done = status in {"done", "complete", "completed"} or actual_percent >= 100
+        is_delayed = bool(activity.get("is_critical")) or _contains_any(
+            status,
+            ["critical", "delay", "delayed", "overdue", "late"],
+        )
+        if end_date is not None and today > end_date.replace(hour=0, minute=0, second=0, microsecond=0) and not is_done:
+            is_delayed = True
+
+        if is_done:
+            completed.append(activity)
+        elif "progress" in status or actual_percent > 0:
+            in_progress.append(activity)
+        else:
+            not_started.append(activity)
+
+        if is_delayed:
+            delayed.append(activity)
+        if bool(activity.get("is_critical")) or "critical" in status:
+            critical.append(activity)
+
+    progress = _activity_progress(site_name)
+    return {
+        "activities": activities,
+        "total": len(activities),
+        "completed": completed,
+        "in_progress": in_progress,
+        "not_started": not_started,
+        "delayed": delayed,
+        "critical": critical,
+        "progress": progress,
+    }
+
+
+def _material_entries(project: Optional[dict]) -> list[dict]:
+    if not project:
+        return []
+    material_setup = project.get("progress_materials") or project.get("materials_progress")
+    if not isinstance(material_setup, dict):
+        return []
+    entries = material_setup.get("entries")
+    return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+
+def _material_name(entry: dict) -> str:
+    return _clean(
+        entry.get("materialName")
+        or entry.get("material_name")
+        or entry.get("name")
+        or entry.get("item")
+        or entry.get("description")
+        or "Material"
+    )
+
+
 def _overall_progress(
     *,
     tour_progress: Optional[float],
@@ -809,11 +905,19 @@ def _answer_delay_risk(
             ["delay", "overdue", "behind", "critical", "warning", "risk"],
         )
     ]
+    activity = _work_activity_summary(site_name)
+    delayed_activities = activity["delayed"] if activity else []
 
     lines = [
         f"- Risk alerts: {len(risk_notifications)}",
         f"- Overdue/delayed inspections: {len(risky_inspections)}",
+        f"- Delayed/critical work activities: {len(delayed_activities)}",
     ]
+    for activity_item in delayed_activities[:3]:
+        name = _activity_name(activity_item)
+        actual = _to_percent(activity_item.get("actual_percent"))
+        progress = f", {actual:.0f}%" if actual is not None else ""
+        lines.append(f"- Work activity: {name}{progress}")
     for item in risk_notifications[:4]:
         title = _clean(item.get("title") or item.get("type") or "Alert")
         message = _clean(item.get("message"))
@@ -823,7 +927,7 @@ def _answer_delay_risk(
     return _response(
         f"Delay/risk summary{target}:\n" + "\n".join(lines),
         intent="delay_risk",
-        sources=["inspections", "notifications"],
+        sources=["inspections", "notifications", "work_schedules"],
     )
 
 
@@ -868,6 +972,284 @@ def _answer_daily_briefing(
     )
 
 
+def _answer_work_activity(site_name: str) -> dict:
+    summary = _work_activity_summary(site_name)
+    target = f" for {site_name}" if site_name else ""
+    if not summary:
+        return _response(f"No work activity schedule found{target}.", intent="work_activity_summary", sources=["work_schedules"])
+
+    lines = [
+        f"- Total activities: {summary['total']}",
+        f"- Completed: {len(summary['completed'])}",
+        f"- In progress: {len(summary['in_progress'])}",
+        f"- Not started: {len(summary['not_started'])}",
+        f"- Delayed/critical: {len(summary['delayed'])}",
+    ]
+    if summary.get("progress") is not None:
+        lines.insert(1, f"- Activity progress: {float(summary['progress']):.1f}%")
+
+    top_risks = summary["delayed"][:3] or summary["in_progress"][:3] or summary["not_started"][:3]
+    for activity in top_risks:
+        name = _activity_name(activity)
+        status = _clean(activity.get("primary_status") or activity.get("status") or "Pending")
+        actual = _to_percent(activity.get("actual_percent"))
+        progress = f", {actual:.0f}%" if actual is not None else ""
+        lines.append(f"- {name}: {status}{progress}")
+
+    return _response(
+        f"Work activity summary{target}:\n" + "\n".join(lines),
+        intent="work_activity_summary",
+        sources=["work_schedules", "tours"],
+    )
+
+
+def _answer_material_summary(floorplans_collection, site_name: str) -> dict:
+    project = _project_doc(floorplans_collection, site_name)
+    entries = _material_entries(project)
+    target = f" for {site_name}" if site_name else ""
+    if not entries:
+        return _response(f"No material plan found{target}.", intent="material_summary", sources=["materials"])
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    completed = 0
+    delayed: list[dict] = []
+    due_soon: list[dict] = []
+    remaining: list[dict] = []
+
+    for entry in entries:
+        total_quantity = _to_float(entry.get("totalQuantity")) or 0.0
+        quantity_used = _to_float(entry.get("quantityUsed")) or 0.0
+        delivery_date = _parse_project_date(entry.get("deliveryDate"))
+        is_complete = total_quantity > 0 and quantity_used >= total_quantity
+        if is_complete:
+            completed += 1
+            continue
+        remaining.append(entry)
+        if delivery_date is None:
+            continue
+        delivery_day = delivery_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        delta_days = (delivery_day - today).days
+        if delta_days < 0:
+            delayed.append(entry)
+        elif delta_days <= 7:
+            due_soon.append(entry)
+
+    readiness = _material_progress(project)
+    lines = [
+        f"- Total materials: {len(entries)}",
+        f"- Completed/used: {completed}",
+        f"- Remaining: {len(remaining)}",
+        f"- Delayed: {len(delayed)}",
+        f"- Due soon: {len(due_soon)}",
+    ]
+    if readiness is not None:
+        lines.insert(1, f"- Readiness: {readiness:.1f}%")
+
+    for entry in (delayed[:3] or due_soon[:3] or remaining[:3]):
+        name = _material_name(entry)
+        total_quantity = _to_float(entry.get("totalQuantity")) or 0.0
+        quantity_used = _to_float(entry.get("quantityUsed")) or 0.0
+        date = _format_date(entry.get("deliveryDate"))
+        quantity = f"{quantity_used:g}/{total_quantity:g}" if total_quantity else f"{quantity_used:g} used"
+        lines.append(f"- {name}: {quantity}{', delivery ' + date if date else ''}")
+
+    return _response(
+        f"Material summary{target}:\n" + "\n".join(lines),
+        intent="material_summary",
+        sources=["materials"],
+    )
+
+
+def _inspection_counts(inspections_collection, site_name: str) -> tuple[int, int]:
+    query = {"site_name": site_name} if _clean(site_name) else {}
+    inspections = list(inspections_collection.find(query).limit(200))
+    open_count = sum(1 for item in inspections if not _is_closed_status(item.get("status")))
+    return len(inspections), open_count
+
+
+def _unread_notifications_count(notifications_collection, current_user: Optional[AuthenticatedUser]) -> int:
+    return sum(
+        1
+        for item in _recent_notifications(notifications_collection, current_user)
+        if item.get("is_read") is not True and _clean(item.get("status") or "pending") == "pending"
+    )
+
+
+def _progress_snapshot(tours: list[dict], floorplans_collection, site_name: str) -> tuple[float, float]:
+    if not tours:
+        return 0.0, 0.0
+    details = [_tour_progress_details(tour) for tour in tours]
+    best_coverage = max((item["coverage_percent"] for item in details), default=0.0)
+    overview = next((item for item in details if item["has_progress"]), details[0])
+    project = _project_doc(floorplans_collection, site_name)
+    activity = _activity_progress(site_name)
+    material = _material_progress(project)
+    tour_progress = overview["tour_progress"] if overview["has_progress"] else None
+    overall, _ = _overall_progress(
+        tour_progress=tour_progress,
+        activity_progress=activity,
+        material_progress=material,
+    )
+    return overall, best_coverage
+
+
+def _answer_site_summary(
+    *,
+    tours: list[dict],
+    comments: list[dict],
+    floorplans_collection,
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    target = f" for {site_name}" if site_name else ""
+    if not site_name and not tours and not comments:
+        return _response("Please open or mention a project so I can summarize the site.", intent="site_summary")
+
+    overall, best_coverage = _progress_snapshot(tours, floorplans_collection, site_name)
+    total_inspections, open_inspections = _inspection_counts(inspections_collection, site_name)
+    open_comments = _open_comments(comments)
+    unread_alerts = _unread_notifications_count(notifications_collection, current_user)
+    activity = _work_activity_summary(site_name)
+    project = _project_doc(floorplans_collection, site_name)
+    material = _material_progress(project)
+
+    lines = [
+        f"- Overall progress: {overall:.1f}%",
+        f"- Best tour coverage: {best_coverage:.1f}%",
+        f"- Tours: {len(tours)}",
+        f"- Open comments: {len(open_comments)}",
+        f"- Open inspections: {open_inspections}/{total_inspections}",
+        f"- Unread alerts: {unread_alerts}",
+    ]
+    if activity:
+        lines.append(f"- Work activities delayed/critical: {len(activity['delayed'])}")
+    if material is not None:
+        lines.append(f"- Material readiness: {material:.1f}%")
+
+    return _response(
+        f"Site summary{target}:\n" + "\n".join(lines),
+        intent="site_summary",
+        sources=["tours", "comments", "inspections", "notifications", "work_schedules", "materials"],
+    )
+
+
+def _matches_current_user(value: Any, current_user: Optional[AuthenticatedUser]) -> bool:
+    if current_user is None:
+        return False
+    target = _norm(value)
+    if not target:
+        return False
+    email = _norm(current_user.email)
+    name = _norm(current_user.name)
+    email_prefix = email.split("@", 1)[0] if email else ""
+    user_id = _norm(current_user.user_id)
+    candidates = {item for item in [email, name, email_prefix, user_id] if item}
+    return target in candidates
+
+
+def _answer_assigned_to_me(
+    *,
+    comments: list[dict],
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    if current_user is None:
+        return _response("Please sign in to see items assigned to you.", intent="assigned_to_me")
+
+    my_comments = [
+        comment
+        for comment in _open_comments(comments)
+        if _matches_current_user(
+            comment.get("assigned_to")
+            or comment.get("assignedTo")
+            or comment.get("assigned_to_detail"),
+            current_user,
+        )
+    ]
+    query = {"site_name": site_name} if _clean(site_name) else {}
+    inspections = list(inspections_collection.find(query).sort([("updated_at", -1), ("created_at", -1)]).limit(100))
+    my_inspections = [
+        item
+        for item in inspections
+        if not _is_closed_status(item.get("status")) and _matches_current_user(item.get("assigned_to"), current_user)
+    ]
+    my_alerts = [
+        item
+        for item in _recent_notifications(notifications_collection, current_user)
+        if item.get("is_read") is not True and _clean(item.get("status") or "pending") == "pending"
+    ]
+
+    lines = [
+        f"- Comments assigned to you: {len(my_comments)}",
+        f"- Inspections assigned to you: {len(my_inspections)}",
+        f"- Unread alerts for you: {len(my_alerts)}",
+    ]
+    for comment in my_comments[:2]:
+        lines.append(f"- Comment: {_line_comment(comment, 1)[3:]}")
+    for inspection in my_inspections[:2]:
+        title = _clean(inspection.get("title") or inspection.get("inspection_id") or "Inspection")
+        due = _format_date(inspection.get("due_date"))
+        lines.append(f"- Inspection: {title}{', due ' + due if due else ''}")
+
+    target = f" in {site_name}" if site_name else ""
+    return _response(
+        f"Assigned to you{target}:\n" + "\n".join(lines),
+        intent="assigned_to_me",
+        sources=["comments", "inspections", "notifications"],
+    )
+
+
+def _answer_report_summary(
+    *,
+    tours: list[dict],
+    comments: list[dict],
+    floorplans_collection,
+    inspections_collection,
+    notifications_collection,
+    current_user: Optional[AuthenticatedUser],
+    site_name: str,
+) -> dict:
+    overall, best_coverage = _progress_snapshot(tours, floorplans_collection, site_name)
+    total_inspections, open_inspections = _inspection_counts(inspections_collection, site_name)
+    open_comments = _open_comments(comments)
+    unread_alerts = _unread_notifications_count(notifications_collection, current_user)
+    activity = _work_activity_summary(site_name)
+    project = _project_doc(floorplans_collection, site_name)
+    material = _material_progress(project)
+    target = f" for {site_name}" if site_name else ""
+
+    lines = [
+        f"- Overall progress: {overall:.1f}%",
+        f"- Best coverage: {best_coverage:.1f}%",
+        f"- Tours completed: {len(tours)}",
+        f"- Open comments/issues: {len(open_comments)}",
+        f"- Open inspections: {open_inspections}/{total_inspections}",
+        f"- Unread alerts: {unread_alerts}",
+    ]
+    if activity:
+        lines.append(
+            f"- Work activities: {len(activity['completed'])} done, "
+            f"{len(activity['in_progress'])} in progress, {len(activity['delayed'])} delayed"
+        )
+    if material is not None:
+        lines.append(f"- Material readiness: {material:.1f}%")
+
+    if open_comments or open_inspections or (activity and activity["delayed"]):
+        lines.append("- Next action: close open issues and delayed activities first.")
+    else:
+        lines.append("- Next action: continue scheduled capture and verification.")
+
+    return _response(
+        f"Project report summary{target}:\n" + "\n".join(lines),
+        intent="report_summary",
+        sources=["tours", "comments", "inspections", "notifications", "work_schedules", "materials"],
+    )
+
+
 def _ollama_enabled() -> bool:
     return os.getenv("CHAT_INTENT_PROVIDER", "").strip().lower() == "ollama"
 
@@ -888,11 +1270,17 @@ def _classify_intent_with_ollama(
         "Return only JSON with one field: intent.\n"
         "Allowed intents: project_list, latest_updates, comments, open_issues, "
         "progress_summary, inspection_summary, alerts, tour_summary, daily_briefing, "
-        "pending_items, delay_risk, unknown.\n"
+        "pending_items, delay_risk, work_activity_summary, material_summary, "
+        "site_summary, assigned_to_me, report_summary, unknown.\n"
         "Rules:\n"
         "- pending_items: pending/open/remaining/action items.\n"
         "- daily_briefing: what should I check today, daily summary, today's priorities.\n"
         "- delay_risk: delayed, overdue, behind, risk, critical, warning.\n"
+        "- work_activity_summary: work activities, schedule activities, activity progress/status.\n"
+        "- material_summary: materials, material readiness, quantity used, delivery, shortage.\n"
+        "- site_summary: full site/project health or site overview.\n"
+        "- assigned_to_me: my tasks, assigned to me, my action items.\n"
+        "- report_summary: client report, project report, management summary.\n"
         "- alerts: alerts, notifications, reminders.\n"
         "- inspection_summary: checklist or inspection questions.\n"
         "- comments/open_issues: comments, issues, snags.\n"
@@ -985,6 +1373,38 @@ def _route_intent(
             current_user=current_user,
             site_name=site_name,
         )
+    if intent == "work_activity_summary":
+        return _answer_work_activity(site_name)
+    if intent == "material_summary":
+        return _answer_material_summary(floorplans_collection, site_name)
+    if intent == "site_summary":
+        return _answer_site_summary(
+            tours=tours,
+            comments=comments,
+            floorplans_collection=floorplans_collection,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    if intent == "assigned_to_me":
+        return _answer_assigned_to_me(
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
+    if intent == "report_summary":
+        return _answer_report_summary(
+            tours=tours,
+            comments=comments,
+            floorplans_collection=floorplans_collection,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=site_name,
+        )
     return None
 
 
@@ -1008,13 +1428,13 @@ def process_chat_message(
 
     if normalized in {"hi", "hello", "hey", "hai"}:
         return _response(
-            "Hi. Ask me about projects, latest updates, progress, tours, comments, inspections, or notifications.",
+            "Hi. Ask me about projects, progress, tours, comments, inspections, alerts, work activities, materials, or site reports.",
             intent="greeting",
         )
 
     if _contains_any(normalized, ["help", "what can you do", "how to use"]):
         return _response(
-            "I can answer Phase 1 Conscout questions using your live data: projects, tours, progress, comments, inspections, notifications, and latest updates.",
+            "I can answer Conscout questions using live data: projects, tours, progress, comments, inspections, alerts, work activities, materials, assigned tasks, and reports.",
             intent="help",
         )
 
@@ -1055,6 +1475,43 @@ def process_chat_message(
 
     if _contains_any(normalized, ["delay", "delayed", "overdue", "behind", "risk", "critical", "warning"]):
         return _answer_delay_risk(
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
+    if _contains_any(normalized, ["assigned to me", "my task", "my tasks", "my action", "for me"]):
+        return _answer_assigned_to_me(
+            comments=comments,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
+    if _contains_any(normalized, ["work activity", "work activities", "activity status", "activity update", "schedule activity", "schedule activities"]):
+        return _answer_work_activity(resolved_site)
+
+    if _contains_any(normalized, ["material", "materials", "quantity", "delivery", "shortage", "readiness"]):
+        return _answer_material_summary(floorplans_collection, resolved_site)
+
+    if _contains_any(normalized, ["site summary", "site overview", "project summary", "project overview", "site health", "project health"]):
+        return _answer_site_summary(
+            tours=tours,
+            comments=comments,
+            floorplans_collection=floorplans_collection,
+            inspections_collection=inspections_collection,
+            notifications_collection=notifications_collection,
+            current_user=current_user,
+            site_name=resolved_site,
+        )
+
+    if _contains_any(normalized, ["report", "client summary", "management summary", "status summary"]):
+        return _answer_report_summary(
+            tours=tours,
+            comments=comments,
+            floorplans_collection=floorplans_collection,
             inspections_collection=inspections_collection,
             notifications_collection=notifications_collection,
             current_user=current_user,
@@ -1110,6 +1567,6 @@ def process_chat_message(
         return llm_response
 
     return _response(
-        "I can help with projects, latest updates, progress, tours, comments, inspections, and notifications. Try: 'latest updates', 'list comments', or 'progress summary'.",
+        "I can help with projects, latest updates, progress, tours, comments, inspections, notifications, work activities, materials, site summaries, assigned tasks, and reports.",
         intent="fallback",
     )
