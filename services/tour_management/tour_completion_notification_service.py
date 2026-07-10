@@ -9,6 +9,7 @@ from core.database import (
     raw_floorplans_collection,
     raw_users_collection,
 )
+from services.notifications.push_notification_service import dispatch_notification_push_async
 
 
 def _normalize_email(value: str) -> str:
@@ -193,32 +194,33 @@ def notify_tour_completion(
             continue
 
         now_ms = _now_ms()
-        notifications_collection.insert_one(
-            {
-                "type": "tour_completion",
-                "title": "Tour completed",
-                "message": f"{sender_name} completed {tour_name} in {resolved_site_name}.",
-                "site_name": resolved_site_name,
-                "recipient_email": recipient_email,
-                "recipient_user_id": str(recipient.get("user_id") or "").strip(),
-                "sender_email": sender_email,
-                "sender_name": sender_name,
-                "status": "pending",
-                "severity": "success",
-                "is_read": False,
-                "primary_action_label": "Open tour",
-                "primary_action_type": "open_tour",
-                "secondary_action_label": "",
-                "secondary_action_type": "",
-                "entity_id": normalized_tour_id,
-                "entity_type": "tour",
-                "route": route,
-                "metadata": metadata,
-                "created_at": now_ms,
-                "updated_at": now_ms,
-                "acted_at": 0,
-            }
-        )
+        notification = {
+            "type": "tour_completion",
+            "title": "Tour completed",
+            "message": f"{sender_name} completed {tour_name} in {resolved_site_name}.",
+            "site_name": resolved_site_name,
+            "recipient_email": recipient_email,
+            "recipient_user_id": str(recipient.get("user_id") or "").strip(),
+            "sender_email": sender_email,
+            "sender_name": sender_name,
+            "status": "pending",
+            "severity": "success",
+            "is_read": False,
+            "primary_action_label": "Open tour",
+            "primary_action_type": "open_tour",
+            "secondary_action_label": "",
+            "secondary_action_type": "",
+            "entity_id": normalized_tour_id,
+            "entity_type": "tour",
+            "route": route,
+            "metadata": metadata,
+            "created_at": now_ms,
+            "updated_at": now_ms,
+            "acted_at": 0,
+        }
+        inserted = notifications_collection.insert_one(notification)
+        notification["_id"] = inserted.inserted_id
+        dispatch_notification_push_async(notification)
         created_count += 1
 
     return {

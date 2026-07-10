@@ -80,6 +80,7 @@ raw_work_schedules_collection = db["work_schedules"]
 raw_users_collection = db["users"]
 raw_inspections_collection = db["inspections"]
 raw_notifications_collection = db["notifications"]
+raw_notification_devices_collection = db["notification_devices"]
 raw_subscription_requests_collection = db["subscription_requests"]
 raw_subscription_checkout_sessions_collection = db["subscription_checkout_sessions"]
 
@@ -91,3 +92,4 @@ work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
 users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
 notifications_collection = raw_notifications_collection
+notification_devices_collection = raw_notification_devices_collection

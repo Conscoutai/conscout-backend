@@ -13,6 +13,7 @@ from core.database import (
     raw_tours_collection,
     raw_users_collection,
 )
+from services.notifications.push_notification_service import dispatch_notification_push_async
 
 
 SYSTEM_SENDER_EMAIL = "system@conscout.local"
@@ -327,25 +328,26 @@ def _upsert_notification(
         notifications_collection.update_one({"_id": existing["_id"]}, {"$set": fields})
         return "updated"
 
-    notifications_collection.insert_one(
-        {
-            "type": SAFETY_NOTIFICATION_TYPE,
-            **fields,
-            "site_name": site_name,
-            "recipient_email": recipient_email,
-            "recipient_user_id": str(recipient.get("user_id") or "").strip(),
-            "sender_email": SYSTEM_SENDER_EMAIL,
-            "sender_name": SYSTEM_SENDER_NAME,
-            "status": "pending",
-            "primary_action_label": "Open issue",
-            "primary_action_type": "open_safety_issue",
-            "secondary_action_label": "",
-            "secondary_action_type": "",
-            "entity_id": payload["entity_id"],
-            "created_at": now_ms,
-            "acted_at": 0,
-        }
-    )
+    notification = {
+        "type": SAFETY_NOTIFICATION_TYPE,
+        **fields,
+        "site_name": site_name,
+        "recipient_email": recipient_email,
+        "recipient_user_id": str(recipient.get("user_id") or "").strip(),
+        "sender_email": SYSTEM_SENDER_EMAIL,
+        "sender_name": SYSTEM_SENDER_NAME,
+        "status": "pending",
+        "primary_action_label": "Open issue",
+        "primary_action_type": "open_safety_issue",
+        "secondary_action_label": "",
+        "secondary_action_type": "",
+        "entity_id": payload["entity_id"],
+        "created_at": now_ms,
+        "acted_at": 0,
+    }
+    inserted = notifications_collection.insert_one(notification)
+    notification["_id"] = inserted.inserted_id
+    dispatch_notification_push_async(notification)
     return "created"
 
 

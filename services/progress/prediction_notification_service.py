@@ -13,6 +13,7 @@ from core.database import (
     raw_floorplans_collection,
     raw_users_collection,
 )
+from services.notifications.push_notification_service import dispatch_notification_push_async
 from services.progress.work_schedule.work_schedule_service import (
     parse_work_schedule_date,
     work_schedule_comparison,
@@ -272,32 +273,33 @@ def _upsert_notification(
         )
         return "updated"
 
-    notifications_collection.insert_one(
-        {
-            "type": payload["type"],
-            "title": payload["title"],
-            "message": payload["message"],
-            "site_name": site_name,
-            "recipient_email": recipient_email,
-            "recipient_user_id": str(recipient.get("user_id") or "").strip(),
-            "sender_email": SYSTEM_SENDER_EMAIL,
-            "sender_name": SYSTEM_SENDER_NAME,
-            "status": "pending",
-            "severity": payload["severity"],
-            "is_read": False,
-            "primary_action_label": "Review progress",
-            "primary_action_type": "open_progress",
-            "secondary_action_label": "",
-            "secondary_action_type": "",
-            "entity_id": payload["entity_id"],
-            "entity_type": payload["entity_type"],
-            "route": payload["route"],
-            "metadata": payload["metadata"],
-            "created_at": now_ms,
-            "updated_at": now_ms,
-            "acted_at": 0,
-        }
-    )
+    notification = {
+        "type": payload["type"],
+        "title": payload["title"],
+        "message": payload["message"],
+        "site_name": site_name,
+        "recipient_email": recipient_email,
+        "recipient_user_id": str(recipient.get("user_id") or "").strip(),
+        "sender_email": SYSTEM_SENDER_EMAIL,
+        "sender_name": SYSTEM_SENDER_NAME,
+        "status": "pending",
+        "severity": payload["severity"],
+        "is_read": False,
+        "primary_action_label": "Review progress",
+        "primary_action_type": "open_progress",
+        "secondary_action_label": "",
+        "secondary_action_type": "",
+        "entity_id": payload["entity_id"],
+        "entity_type": payload["entity_type"],
+        "route": payload["route"],
+        "metadata": payload["metadata"],
+        "created_at": now_ms,
+        "updated_at": now_ms,
+        "acted_at": 0,
+    }
+    inserted = notifications_collection.insert_one(notification)
+    notification["_id"] = inserted.inserted_id
+    dispatch_notification_push_async(notification)
     return "created"
 
 

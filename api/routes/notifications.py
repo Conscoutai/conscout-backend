@@ -31,6 +31,10 @@ from services.progress.weekly_progress_notification_service import (
 from services.progress.prediction_notification_service import (
     sync_prediction_notifications,
 )
+from services.notifications.push_notification_service import (
+    dispatch_notification_push_async,
+    register_device_token,
+)
 
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
@@ -39,6 +43,12 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 class ProjectInviteRequest(BaseModel):
     site_name: str
     recipient_email: str
+
+
+class RegisterDeviceRequest(BaseModel):
+    fcm_token: str
+    platform: str = "unknown"
+    app: str = "main"
 
 
 class WeeklyProgressSyncRequest(BaseModel):
@@ -279,6 +289,24 @@ def unread_notification_count(
     return {"count": count}
 
 
+@router.post("/register-device")
+def register_notification_device(
+    payload: RegisterDeviceRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    fcm_token = payload.fcm_token.strip()
+    if not fcm_token:
+        raise HTTPException(status_code=400, detail="fcm_token is required")
+    result = register_device_token(
+        user_id=current_user.user_id,
+        email=current_user.email,
+        fcm_token=fcm_token,
+        platform=payload.platform,
+        app=payload.app,
+    )
+    return {"message": "Notification device registered", **result}
+
+
 @router.post("/{notification_id}/read")
 def mark_notification_as_read(
     notification_id: str,
@@ -381,6 +409,7 @@ def create_project_invite_notification(
     }
     inserted = notifications_collection.insert_one(notification)
     created = notifications_collection.find_one({"_id": inserted.inserted_id}) or notification
+    dispatch_notification_push_async(created)
     return {
         "message": "Invite notification sent",
         "notification": _serialize_notification(created),

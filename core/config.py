@@ -357,6 +357,13 @@ GOOGLE_OAUTH_CLIENT_IDS = _env_list("GOOGLE_OAUTH_CLIENT_IDS")
 GOOGLE_OAUTH_HOSTED_DOMAIN = _env("GOOGLE_OAUTH_HOSTED_DOMAIN", "").strip().lower()
 
 # ---------------------------------------------------------
+# Push notifications
+# ---------------------------------------------------------
+FIREBASE_CREDENTIALS_FILE = _env("FIREBASE_CREDENTIALS_FILE", "").strip()
+FIREBASE_SERVICE_ACCOUNT_JSON = _env("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+FCM_ANDROID_CHANNEL_ID = _env("FCM_ANDROID_CHANNEL_ID", "conscout_alerts").strip()
+
+# ---------------------------------------------------------
 # Payments
 # ---------------------------------------------------------
 PUBLIC_API_BASE_URL = _env("PUBLIC_API_BASE_URL", "").rstrip("/")

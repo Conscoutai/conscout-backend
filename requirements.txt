@@ -14,3 +14,4 @@ pyproj
 python-multipart
 requests
 opencv-python
+firebase-admin

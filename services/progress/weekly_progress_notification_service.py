@@ -13,6 +13,7 @@ from core.database import (
     raw_tours_collection,
     raw_users_collection,
 )
+from services.notifications.push_notification_service import dispatch_notification_push_async
 from services.progress.work_schedule.work_schedule_service import (
     parse_work_schedule_date,
     work_schedule_comparison,
@@ -497,32 +498,34 @@ def _create_weekly_notification(
         "calculated_at": now.isoformat(),
         "project_start_date": _project_start_date(project, now).date().isoformat(),
     }
-    notifications_collection.insert_one(
-        {
-            "type": WEEKLY_PROGRESS_TYPE,
-            "title": _notification_title(delta),
-            "message": _notification_message(site_name, current_progress, delta),
-            "site_name": site_name,
-            "recipient_email": recipient["email"],
-            "recipient_user_id": recipient["user_id"],
-            "sender_email": SYSTEM_SENDER_EMAIL,
-            "sender_name": SYSTEM_SENDER_NAME,
-            "status": "pending",
-            "severity": _notification_severity(delta),
-            "is_read": False,
-            "primary_action_label": "Open progress",
-            "primary_action_type": "open_progress",
-            "secondary_action_label": "",
-            "secondary_action_type": "",
-            "entity_id": week_window["week_key"],
-            "entity_type": "weekly_progress",
-            "route": f"/projects/{site_name}/progress/overview",
-            "metadata": metadata,
-            "created_at": _now_ms(now),
-            "updated_at": _now_ms(now),
-            "acted_at": 0,
-        }
-    )
+    now_ms = _now_ms(now)
+    notification = {
+        "type": WEEKLY_PROGRESS_TYPE,
+        "title": _notification_title(delta),
+        "message": _notification_message(site_name, current_progress, delta),
+        "site_name": site_name,
+        "recipient_email": recipient["email"],
+        "recipient_user_id": recipient["user_id"],
+        "sender_email": SYSTEM_SENDER_EMAIL,
+        "sender_name": SYSTEM_SENDER_NAME,
+        "status": "pending",
+        "severity": _notification_severity(delta),
+        "is_read": False,
+        "primary_action_label": "Open progress",
+        "primary_action_type": "open_progress",
+        "secondary_action_label": "",
+        "secondary_action_type": "",
+        "entity_id": week_window["week_key"],
+        "entity_type": "weekly_progress",
+        "route": f"/projects/{site_name}/progress/overview",
+        "metadata": metadata,
+        "created_at": now_ms,
+        "updated_at": now_ms,
+        "acted_at": 0,
+    }
+    inserted = notifications_collection.insert_one(notification)
+    notification["_id"] = inserted.inserted_id
+    dispatch_notification_push_async(notification)
     return "created"
 
 
