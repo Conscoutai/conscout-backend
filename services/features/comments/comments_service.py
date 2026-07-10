@@ -15,6 +15,9 @@ from services.features.comments.comment_notification_service import (
     create_comment_open_notification,
     sync_comment_delay_notifications,
 )
+from services.project_setup.safety_notification_service import (
+    sync_safety_issue_notifications,
+)
 from services.features.comments.report_generation import generate_issue_report_pdf
 
 
@@ -386,6 +389,10 @@ def create_comment(payload: dict, *, current_user: AuthenticatedUser) -> dict:
                 project_id=site_name,
                 current_user=current_user,
             )
+            sync_safety_issue_notifications(
+                project_id=site_name,
+                current_user=current_user,
+            )
 
     return {"message": "Comment saved", "comment": comment_data}
 
@@ -520,6 +527,10 @@ def update_comment(comment_id: str, payload: dict, *, current_user: Authenticate
     ).strip()
     if site_name:
         sync_comment_delay_notifications(
+            project_id=site_name,
+            current_user=current_user,
+        )
+        sync_safety_issue_notifications(
             project_id=site_name,
             current_user=current_user,
         )

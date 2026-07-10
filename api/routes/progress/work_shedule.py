@@ -14,6 +14,9 @@ from services.progress.work_schedule.work_schedule_service import (
 from services.progress.work_schedule.work_schedule_notification_service import (
     sync_schedule_delay_notifications as sync_schedule_delay_notifications_service,
 )
+from services.progress.prediction_notification_service import (
+    sync_prediction_notifications as sync_prediction_notifications_service,
+)
 
 router = APIRouter(tags=["WorkSchedule"])
 
@@ -24,6 +27,28 @@ def _best_effort_schedule_notification_sync(
 ) -> dict:
     try:
         result = sync_schedule_delay_notifications_service(
+            project_id=project_id,
+            current_user=current_user,
+        )
+        return {
+            "status": "synced",
+            "created_count": int(result.get("created_count") or 0),
+            "updated_count": int(result.get("updated_count") or 0),
+            "resolved_count": int(result.get("resolved_count") or 0),
+        }
+    except Exception as error:
+        return {
+            "status": "skipped",
+            "detail": str(error),
+        }
+
+
+def _best_effort_prediction_notification_sync(
+    project_id: str,
+    current_user: Optional[AuthenticatedUser] = None,
+) -> dict:
+    try:
+        result = sync_prediction_notifications_service(
             project_id=project_id,
             current_user=current_user,
         )
@@ -101,6 +126,10 @@ def save_work_schedule(
             payload.project_id,
             current_user=current_user,
         ),
+        "prediction_notification_sync": _best_effort_prediction_notification_sync(
+            payload.project_id,
+            current_user=current_user,
+        ),
     }
 
 
@@ -121,6 +150,9 @@ def latest_work_schedule(project_id: str):
 def work_schedule_comparison(project_id: str):
     comparison = work_schedule_comparison_service(project_id)
     comparison["notification_sync"] = _best_effort_schedule_notification_sync(
+        project_id,
+    )
+    comparison["prediction_notification_sync"] = _best_effort_prediction_notification_sync(
         project_id,
     )
     return comparison

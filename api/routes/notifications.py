@@ -22,8 +22,14 @@ from services.project_setup.team_member_notification_service import (
 from services.project_setup.inspection_notification_service import (
     sync_inspection_delay_notifications,
 )
+from services.project_setup.safety_notification_service import (
+    sync_safety_issue_notifications,
+)
 from services.progress.weekly_progress_notification_service import (
     sync_weekly_progress_notifications,
+)
+from services.progress.prediction_notification_service import (
+    sync_prediction_notifications,
 )
 
 
@@ -37,6 +43,14 @@ class ProjectInviteRequest(BaseModel):
 
 class WeeklyProgressSyncRequest(BaseModel):
     project_id: str = ""
+
+
+class PredictionSyncRequest(BaseModel):
+    project_id: str
+
+
+class SafetySyncRequest(BaseModel):
+    project_id: str
 
 
 def _normalize_email(value: str) -> str:
@@ -144,6 +158,66 @@ def _best_effort_comment_notification_sync(
     }
 
 
+def _best_effort_prediction_notification_sync(
+    current_user: AuthenticatedUser,
+) -> dict:
+    synced_projects = 0
+    created_count = 0
+    updated_count = 0
+    resolved_count = 0
+    for project_name in current_user.accessible_project_names:
+        normalized_project_name = str(project_name or "").strip()
+        if not normalized_project_name:
+            continue
+        try:
+            result = sync_prediction_notifications(
+                project_id=normalized_project_name,
+                current_user=current_user,
+            )
+            synced_projects += 1
+            created_count += int(result.get("created_count") or 0)
+            updated_count += int(result.get("updated_count") or 0)
+            resolved_count += int(result.get("resolved_count") or 0)
+        except Exception:
+            continue
+    return {
+        "synced_projects": synced_projects,
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "resolved_count": resolved_count,
+    }
+
+
+def _best_effort_safety_notification_sync(
+    current_user: AuthenticatedUser,
+) -> dict:
+    synced_projects = 0
+    created_count = 0
+    updated_count = 0
+    resolved_count = 0
+    for project_name in current_user.accessible_project_names:
+        normalized_project_name = str(project_name or "").strip()
+        if not normalized_project_name:
+            continue
+        try:
+            result = sync_safety_issue_notifications(
+                project_id=normalized_project_name,
+                current_user=current_user,
+            )
+            synced_projects += 1
+            created_count += int(result.get("created_count") or 0)
+            updated_count += int(result.get("updated_count") or 0)
+            resolved_count += int(result.get("resolved_count") or 0)
+        except Exception:
+            continue
+    return {
+        "synced_projects": synced_projects,
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "resolved_count": resolved_count,
+    }
+
+
 def _recipient_filter(current_user: AuthenticatedUser) -> dict:
     normalized_email = _normalize_email(current_user.email)
     return {
@@ -180,6 +254,8 @@ def list_notifications(
 ):
     _best_effort_inspection_notification_sync(current_user)
     _best_effort_comment_notification_sync(current_user)
+    _best_effort_prediction_notification_sync(current_user)
+    _best_effort_safety_notification_sync(current_user)
     records = list(
         notifications_collection.find(_recipient_filter(current_user)).sort(
             "created_at",
@@ -319,6 +395,30 @@ def manual_weekly_progress_sync(
     ensure_admin_user(current_user)
     return sync_weekly_progress_notifications(
         project_id=payload.project_id.strip() or None,
+    )
+
+
+@router.post("/predictions/sync")
+def manual_prediction_sync(
+    payload: PredictionSyncRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return sync_prediction_notifications(
+        project_id=payload.project_id.strip(),
+        current_user=current_user,
+    )
+
+
+@router.post("/safety/sync")
+def manual_safety_sync(
+    payload: SafetySyncRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return sync_safety_issue_notifications(
+        project_id=payload.project_id.strip(),
+        current_user=current_user,
     )
 
 

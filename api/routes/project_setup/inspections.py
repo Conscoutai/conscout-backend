@@ -13,6 +13,9 @@ from services.project_setup.inspection_notification_service import (
     create_inspection_completion_notification,
     sync_inspection_delay_notifications,
 )
+from services.project_setup.safety_notification_service import (
+    sync_safety_issue_notifications,
+)
 
 
 router = APIRouter(tags=["Inspections"])
@@ -213,6 +216,28 @@ def _best_effort_inspection_delay_sync(
         }
 
 
+def _best_effort_safety_sync(
+    site_name: str,
+    current_user: Optional[AuthenticatedUser] = None,
+) -> dict:
+    try:
+        result = sync_safety_issue_notifications(
+            project_id=site_name,
+            current_user=current_user,
+        )
+        return {
+            "status": "synced",
+            "created_count": int(result.get("created_count") or 0),
+            "updated_count": int(result.get("updated_count") or 0),
+            "resolved_count": int(result.get("resolved_count") or 0),
+        }
+    except Exception as error:
+        return {
+            "status": "skipped",
+            "detail": str(error),
+        }
+
+
 @router.get("/projects/{site_name}/inspections")
 def list_project_inspections(
     site_name: str,
@@ -221,6 +246,7 @@ def list_project_inspections(
     if not _can_user_access_site(current_user, site_name):
         raise HTTPException(status_code=403, detail="Not allowed to access this project")
     _best_effort_inspection_delay_sync(site_name, current_user=current_user)
+    _best_effort_safety_sync(site_name, current_user=current_user)
     docs = list(
         raw_inspections_collection.find({"site_name": site_name}).sort(
             [("updated_at", -1), ("created_at", -1)]
@@ -279,6 +305,7 @@ def create_project_inspection(
         current_user=current_user,
     )
     _best_effort_inspection_delay_sync(site_name, current_user=current_user)
+    _best_effort_safety_sync(site_name, current_user=current_user)
     return _serialize_inspection(inspection)
 
 
@@ -367,6 +394,7 @@ def update_project_inspection(
             current_user=current_user,
         )
     _best_effort_inspection_delay_sync(site_name, current_user=current_user)
+    _best_effort_safety_sync(site_name, current_user=current_user)
     return _serialize_inspection(updated)
 
 
