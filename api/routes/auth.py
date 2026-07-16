@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 import requests
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -15,6 +15,7 @@ from core.auth import (
     change_user_password,
     create_user,
     ensure_user_allowed_for_app,
+    ensure_subscription_admin_user,
     normalize_user_role,
     refresh_user_session,
     require_authenticated_user,
@@ -25,8 +26,14 @@ from core.auth import (
     update_user_profile,
 )
 from core.auth_context import AuthenticatedUser
-from core.config import APP_SURFACE, GOOGLE_OAUTH_CLIENT_IDS, GOOGLE_OAUTH_HOSTED_DOMAIN
-from core.database import raw_users_collection
+from core.config import (
+    APP_SURFACE,
+    DB_NAME,
+    GOOGLE_OAUTH_CLIENT_IDS,
+    GOOGLE_OAUTH_HOSTED_DOMAIN,
+    LITE_ADMIN_DB_NAME,
+)
+from core.database import client, raw_users_collection
 from services.account_deletion_service import delete_user_account
 
 
@@ -49,6 +56,51 @@ def _normalize_app(value: str) -> str:
             detail=f"This API serves the {APP_SURFACE} product only.",
         )
     return normalized
+
+
+def _admin_directory_collection(app_name: str):
+    normalized = app_name.strip().lower()
+    if normalized not in _SUPPORTED_APPS:
+        raise HTTPException(status_code=400, detail="Invalid app identifier.")
+    if APP_SURFACE != "main":
+        raise HTTPException(
+            status_code=403,
+            detail="The account directory is available through the main admin API only.",
+        )
+    database_name = DB_NAME if normalized == "main" else LITE_ADMIN_DB_NAME
+    return client[database_name]["users"], normalized
+
+
+def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
+    subscription = user.get("subscription")
+    subscription = subscription if isinstance(subscription, dict) else {}
+    pending_request = user.get("pending_subscription_request")
+    pending_request = pending_request if isinstance(pending_request, dict) else {}
+    plan_name = str(subscription.get("plan_name") or "").strip()
+    if not plan_name:
+        plan_name = str(pending_request.get("plan_name") or "Starter Access").strip()
+    subscription_status = str(subscription.get("status") or "").strip().lower()
+    if not subscription_status:
+        subscription_status = "pending_approval" if pending_request else "active"
+    plan_joined_at = (
+        subscription.get("activated_at")
+        or subscription.get("approved_at")
+        or user.get("created_at")
+    )
+    return {
+        "user_id": str(user.get("user_id") or ""),
+        "email": str(user.get("email") or "").strip().lower(),
+        "name": str(user.get("name") or "").strip(),
+        "workspace": str(user.get("workspace") or "").strip(),
+        "role": normalize_user_role(user.get("role")),
+        "app": app_name,
+        "plan_name": plan_name or "Starter Access",
+        "subscription_status": subscription_status,
+        "plan_joined_at": plan_joined_at,
+        "last_login_at": user.get("last_login_at"),
+        "last_login_app": str(user.get("last_login_app") or "").strip(),
+        "created_at": user.get("created_at"),
+    }
 
 
 def _delete_account_page(*, message: str = "", is_error: bool = False) -> str:
@@ -341,6 +393,45 @@ def user_exists(
     return {
         "exists": user is not None,
         "user": sanitize_user_payload(user) if user else None,
+    }
+
+
+@router.get("/users")
+def list_admin_users(
+    app: str = Query(default="main"),
+    limit: int = Query(default=500, ge=1, le=500),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """List actual account records for the designated subscription admin."""
+    ensure_subscription_admin_user(current_user)
+    collection, app_name = _admin_directory_collection(app)
+    users = list(
+        collection.find(
+            {},
+            {
+                "_id": 0,
+                "user_id": 1,
+                "email": 1,
+                "name": 1,
+                "workspace": 1,
+                "role": 1,
+                "subscription": 1,
+                "pending_subscription_request": 1,
+                "created_at": 1,
+                "last_login_at": 1,
+                "last_login_app": 1,
+            },
+        )
+        .sort([("created_at", -1), ("email", 1)])
+        .limit(limit)
+    )
+    return {
+        "app": app_name,
+        "users": [
+            _admin_directory_user_payload(user, app_name=app_name)
+            for user in users
+        ],
+        "count": len(users),
     }
 
 

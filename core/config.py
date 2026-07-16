@@ -321,6 +321,10 @@ def tour_comments_dir(
 # ---------------------------------------------------------
 MONGO_URI = _required_env("MONGO_URI")
 DB_NAME = _env("DB_NAME", "construction_ai")
+# The Main API uses this only for the protected subscription-admin directory.
+# Both product databases live on the same MongoDB cluster, while user-facing
+# product endpoints remain strictly isolated by APP_SURFACE.
+LITE_ADMIN_DB_NAME = _env("LITE_ADMIN_DB_NAME", "construction_ai_lite")
 if APP_SURFACE == "lite" and DB_NAME == "construction_ai":
     raise RuntimeError(
         "Lite must use its own MongoDB database. Set DB_NAME to a value such "
