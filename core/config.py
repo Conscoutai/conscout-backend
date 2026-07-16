@@ -60,12 +60,27 @@ def _port(default_key: str, default_value: int) -> int:
         return port
     return _env_int(default_key, default_value)
 
+
+# ---------------------------------------------------------
+# Product surface
+# ---------------------------------------------------------
+# A deployment serves exactly one product data boundary.  Web and the Main
+# mobile app use the ``main`` deployment; the Lite mobile app uses ``lite``.
+# The value is intentionally deployment configuration, never a client choice.
+APP_SURFACE = _env("APP_SURFACE", "main").strip().lower()
+if APP_SURFACE not in {"main", "lite"}:
+    raise RuntimeError("APP_SURFACE must be either 'main' or 'lite'.")
+
 # ---------------------------------------------------------
 # Storage paths
 # ---------------------------------------------------------
 MODEL_DIR = _env("MODEL_DIR", os.path.join(BASE_DIR, "models"))
 
-DATA_DIR = _env("DATA_DIR", os.path.join(BASE_DIR, "data"))
+_DEFAULT_DATA_DIR = os.path.join(
+    BASE_DIR,
+    "data" if APP_SURFACE == "main" else "data-lite",
+)
+DATA_DIR = _env("DATA_DIR", _DEFAULT_DATA_DIR)
 SITES_DIR = _env("SITES_DIR", os.path.join(DATA_DIR, "sites"))
 TOURS_DIR = _env("TOURS_DIR", os.path.join(DATA_DIR, "tours"))
 
@@ -306,6 +321,11 @@ def tour_comments_dir(
 # ---------------------------------------------------------
 MONGO_URI = _required_env("MONGO_URI")
 DB_NAME = _env("DB_NAME", "construction_ai")
+if APP_SURFACE == "lite" and DB_NAME == "construction_ai":
+    raise RuntimeError(
+        "Lite must use its own MongoDB database. Set DB_NAME to a value such "
+        "as 'construction_ai_lite'."
+    )
 
 # ---------------------------------------------------------
 # CORS

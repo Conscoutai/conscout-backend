@@ -25,7 +25,7 @@ from core.auth import (
     update_user_profile,
 )
 from core.auth_context import AuthenticatedUser
-from core.config import GOOGLE_OAUTH_CLIENT_IDS, GOOGLE_OAUTH_HOSTED_DOMAIN
+from core.config import APP_SURFACE, GOOGLE_OAUTH_CLIENT_IDS, GOOGLE_OAUTH_HOSTED_DOMAIN
 from core.database import raw_users_collection
 from services.account_deletion_service import delete_user_account
 
@@ -43,6 +43,11 @@ def _normalize_app(value: str) -> str:
     normalized = value.strip().lower()
     if normalized not in _SUPPORTED_APPS:
         raise HTTPException(status_code=400, detail="Invalid app identifier.")
+    if normalized != APP_SURFACE:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This API serves the {APP_SURFACE} product only.",
+        )
     return normalized
 
 
@@ -285,7 +290,7 @@ def google_auth(payload: GoogleAuthRequest):
 
 @router.post("/refresh")
 def refresh_session(payload: RefreshSessionRequest):
-    app_name = _normalize_app(payload.app or "lite")
+    app_name = _normalize_app(payload.app or APP_SURFACE)
     user = refresh_user_session(payload.refresh_token, app_name=app_name)
     return {
         "token": user.get("session_token", ""),

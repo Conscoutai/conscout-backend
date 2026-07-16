@@ -15,6 +15,7 @@ from core.auth import ensure_default_user_and_migrate_legacy_data
 from core.config import (
     ALLOWED_ORIGINS,
     API_PORT,
+    APP_SURFACE,
     APP_TITLE,
     APP_VERSION,
     DATA_DIR,
@@ -40,7 +41,17 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
-ensure_default_user_and_migrate_legacy_data()
+
+# This migration belonged to the original shared database. It must be run only
+# as an explicit, one-time administrative operation, never when a new Lite
+# deployment starts.
+if os.getenv("ENABLE_LEGACY_BOOTSTRAP_MIGRATION", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}:
+    ensure_default_user_and_migrate_legacy_data()
 
 for directory in (DATA_DIR,):
     os.makedirs(directory, exist_ok=True)
@@ -54,12 +65,15 @@ def startup_background_jobs():
 @app.get("/")
 def root():
     """Health check route confirms backend is running."""
-    return {"message": "FastAPI Stitching Service is live and running!"}
+    return {
+        "message": "FastAPI Stitching Service is live and running!",
+        "product": APP_SURFACE,
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "product": APP_SURFACE}
 
 
 if __name__ == "__main__":

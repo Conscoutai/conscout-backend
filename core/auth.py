@@ -16,7 +16,13 @@ from core.auth_context import (
     reset_current_user,
     set_current_user,
 )
-from core.config import site_dir, site_storage_roots, tour_storage_roots, user_data_dir
+from core.config import (
+    APP_SURFACE,
+    site_dir,
+    site_storage_roots,
+    tour_storage_roots,
+    user_data_dir,
+)
 from core.database import (
     raw_floorplans_collection,
     raw_tours_collection,
@@ -28,8 +34,11 @@ from core.database import (
 DEFAULT_BOOTSTRAP_EMAIL = "safwanc189@gmail.com"
 DEFAULT_BOOTSTRAP_PASSWORD = "1234567890"
 SUBSCRIPTION_ADMIN_EMAIL = "safwanc189@gmail.com"
+# ``APP_SURFACE`` is set by the server deployment and is the authoritative
+# product boundary.  A request body must never be able to select a database or
+# unlock a second product.
 SUPPORTED_APPS = {"main", "lite"}
-DEFAULT_ALLOWED_APPS = sorted(SUPPORTED_APPS)
+DEFAULT_ALLOWED_APPS = [APP_SURFACE]
 _bearer_scheme = HTTPBearer(auto_error=False)
 ACCESS_TOKEN_TTL_MS = 12 * 60 * 60 * 1000
 REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
@@ -109,21 +118,17 @@ def normalize_user_role(value: Optional[str]) -> str:
 def normalize_allowed_apps(
     values: Optional[Union[list[str], tuple[str, ...], set[str], str]],
 ) -> list[str]:
-    candidates = values if isinstance(values, (list, tuple, set)) else [values]
-    normalized = {
-        str(item).strip().lower()
-        for item in candidates
-        if str(item or "").strip().lower() in SUPPORTED_APPS
-    }
-    if normalized:
-        # Main and lite now share the same account pool, so any valid app
-        # assignment should unlock both surfaces for the same user.
-        return DEFAULT_ALLOWED_APPS.copy()
+    # Kept for backwards-compatible user documents. Every user in an isolated
+    # database belongs only to the product served by this deployment.
+    del values
     return DEFAULT_ALLOWED_APPS.copy()
 
 
 def user_can_access_app(user: dict, app_name: str) -> bool:
-    return app_name in normalize_allowed_apps(user.get("allowed_apps"))
+    return (
+        app_name == APP_SURFACE
+        and APP_SURFACE in normalize_allowed_apps(user.get("allowed_apps"))
+    )
 
 
 def ensure_user_allowed_for_app(user: dict, app_name: str) -> None:
@@ -656,6 +661,7 @@ def sanitize_user_payload(user: dict) -> dict:
         "workspace": user.get("workspace", ""),
         "role": normalize_user_role(user.get("role")),
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
+        "product": APP_SURFACE,
         "accessible_project_names": access_payload["accessible_project_names"],
         "plan_code": active_plan_code,
         "subscription": subscription if isinstance(subscription, dict) else {},
