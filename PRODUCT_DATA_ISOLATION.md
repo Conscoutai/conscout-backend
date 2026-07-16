@@ -19,12 +19,13 @@ a client is validated and cannot choose a database.
    its own database.
 2. Deploy the Main backend with `.env.main.example` values, using the current
    web/API hostname.
-3. Deploy a second Lite backend with `.env.lite.example` values, exposed at
-   `https://lite-api.conscout.com` or another HTTPS endpoint.
+3. Deploy a second Lite backend with `.env.lite.example` values. The current
+   deployment is exposed at `http://91.98.16.60:8002`; replace it with a Lite
+   HTTPS hostname when DNS and TLS are provisioned.
 4. Point the Lite Flutter build to that Lite endpoint:
 
    ```powershell
-   flutter build appbundle --dart-define=API_BASE_URL=https://lite-api.conscout.com --dart-define=LITE_WEB_BASE_URL=https://lite.conscout.com --dart-define=INVITE_BASE_URL=https://lite.conscout.com
+   flutter build appbundle --dart-define=API_BASE_URL=http://91.98.16.60:8002 --dart-define=LITE_WEB_BASE_URL=https://lite.conscout.com --dart-define=INVITE_BASE_URL=https://lite.conscout.com
    ```
 
 5. Keep the Web Cloudflare `/api/*` proxy pointed only at the Main backend.
@@ -52,5 +53,5 @@ stakeholder email from the project.
 - Do not run `ENABLE_LEGACY_BOOTSTRAP_MIGRATION` on either new deployment.
 - Lite refuses to start if `DB_NAME=construction_ai`, preventing an accidental
   connection to the old shared database.
-- Lite mobile defaults to `https://lite-api.conscout.com`; it no longer
+- Lite mobile defaults to the dedicated Lite API on port `8002`; it no longer
   defaults to the Main/Web API.
