@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -69,6 +70,29 @@ def _admin_directory_collection(app_name: str):
         )
     database_name = DB_NAME if normalized == "main" else LITE_ADMIN_DB_NAME
     return client[database_name]["users"], normalized
+
+
+def _admin_product_collections(app_name: str):
+    users, normalized = _admin_directory_collection(app_name)
+    database = users.database
+    return users, database["subscription_requests"], normalized
+
+
+def _admin_request_payload(request: dict) -> dict:
+    payload = dict(request)
+    payload.pop("_id", None)
+    return payload
+
+
+def _admin_request_status_filter(status: str) -> dict:
+    normalized = status.strip().lower()
+    if normalized in {"pending", "pending_approval"}:
+        return {"status": "pending_approval"}
+    if normalized in {"approved", "rejected"}:
+        return {"status": normalized}
+    if normalized in {"", "all"}:
+        return {}
+    raise HTTPException(status_code=400, detail="Invalid request status filter.")
 
 
 def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
@@ -443,6 +467,145 @@ def create_subscription_admin(
         "message": "Administrator created successfully.",
         "admin": sanitize_user_payload(admin),
     }
+
+
+@router.get("/admin/subscription-requests")
+def list_admin_subscription_requests(
+    app: str = Query(default="lite"),
+    status: str = Query(default="pending"),
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Read Main or Lite plan requests using the central Admin session."""
+    ensure_subscription_admin_user(current_user)
+    _, requests, app_name = _admin_product_collections(app)
+    docs = list(
+        requests.find(_admin_request_status_filter(status), {"_id": 0})
+        .sort([("requested_at", -1), ("updated_at", -1)])
+        .limit(limit)
+    )
+    return {
+        "app": app_name,
+        "requests": [_admin_request_payload(doc) for doc in docs],
+        "count": len(docs),
+    }
+
+
+def _review_admin_subscription_request(
+    *,
+    app: str,
+    request_id: str,
+    approve: bool,
+    current_user: AuthenticatedUser,
+) -> dict:
+    users, requests, app_name = _admin_product_collections(app)
+    request = requests.find_one({"request_id": request_id.strip()})
+    if not request:
+        raise HTTPException(status_code=404, detail="Subscription request not found.")
+    if str(request.get("status") or "").strip().lower() not in {
+        "pending",
+        "pending_approval",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Only pending subscription requests can be reviewed.",
+        )
+    user = users.find_one({"user_id": request.get("user_id")})
+    if not user:
+        raise HTTPException(status_code=404, detail="Request owner not found.")
+
+    now_ms = int(time.time() * 1000)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if approve:
+        subscription = {
+            "plan_code": str(request.get("plan_code") or "").strip().lower(),
+            "plan_name": str(request.get("plan_name") or "").strip(),
+            "monthly_price_usd": request.get("monthly_price_usd"),
+            "project_limit": request.get("project_limit"),
+            "company_name": str(request.get("company_name") or "").strip(),
+            "status": "active",
+            "payment_status": "approved",
+            "source": "admin_approval",
+            "activated_at": now_iso,
+            "approved_at": now_iso,
+            "approved_by_user_id": current_user.user_id,
+            "approved_by_email": current_user.email,
+            "request_id": str(request.get("request_id") or "").strip(),
+        }
+        users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "subscription": subscription,
+                    "workspace": str(request.get("company_name") or "").strip()
+                    or str(user.get("workspace") or "").strip(),
+                    "updated_at": now_ms,
+                },
+                "$unset": {"pending_subscription_request": ""},
+            },
+        )
+        status = "approved"
+        extra = {"approved_subscription": subscription}
+    else:
+        users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$unset": {"pending_subscription_request": ""},
+                "$set": {"updated_at": now_ms},
+            },
+        )
+        status = "rejected"
+        extra = {}
+
+    requests.update_one(
+        {"_id": request["_id"]},
+        {
+            "$set": {
+                "status": status,
+                "reviewed_at": now_iso,
+                "reviewed_by_user_id": current_user.user_id,
+                "reviewed_by_email": current_user.email,
+                "updated_at": now_iso,
+                **extra,
+            }
+        },
+    )
+    updated = requests.find_one({"_id": request["_id"]}) or request
+    return {
+        "message": f"Subscription request {status}.",
+        "app": app_name,
+        "request": _admin_request_payload(updated),
+    }
+
+
+@router.post("/admin/subscription-requests/{app}/{request_id}/approve")
+def approve_admin_subscription_request(
+    app: str,
+    request_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_subscription_admin_user(current_user)
+    return _review_admin_subscription_request(
+        app=app,
+        request_id=request_id,
+        approve=True,
+        current_user=current_user,
+    )
+
+
+@router.post("/admin/subscription-requests/{app}/{request_id}/reject")
+def reject_admin_subscription_request(
+    app: str,
+    request_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_subscription_admin_user(current_user)
+    return _review_admin_subscription_request(
+        app=app,
+        request_id=request_id,
+        approve=False,
+        current_user=current_user,
+    )
 
 
 @router.get("/users")
