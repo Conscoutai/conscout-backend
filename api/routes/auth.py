@@ -156,6 +156,12 @@ class SignupRequest(BaseModel):
     role: Optional[str] = None
 
 
+class CreateAdminRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -393,6 +399,49 @@ def user_exists(
     return {
         "exists": user is not None,
         "user": sanitize_user_payload(user) if user else None,
+    }
+
+
+@router.post("/admins")
+def create_subscription_admin(
+    payload: CreateAdminRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Create an additional administrator for the web subscription console."""
+    ensure_subscription_admin_user(current_user)
+    if APP_SURFACE != "main":
+        raise HTTPException(
+            status_code=403,
+            detail="Administrators can be created through the main API only.",
+        )
+    if not payload.name.strip():
+        raise HTTPException(status_code=400, detail="Admin name is required.")
+    if len(payload.password.strip()) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters.",
+        )
+
+    admin = create_user(
+        name=payload.name,
+        email=payload.email,
+        password=payload.password,
+        role="admin",
+        allowed_apps=["main"],
+    )
+    raw_users_collection.update_one(
+        {"_id": admin["_id"]},
+        {
+            "$set": {
+                "is_subscription_admin": True,
+                "updated_at": int(time.time() * 1000),
+            }
+        },
+    )
+    admin = raw_users_collection.find_one({"_id": admin["_id"]}) or admin
+    return {
+        "message": "Administrator created successfully.",
+        "admin": sanitize_user_payload(admin),
     }
 
 

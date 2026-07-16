@@ -151,11 +151,18 @@ def ensure_admin_user(user: AuthenticatedUser) -> None:
 def ensure_subscription_admin_user(user: AuthenticatedUser) -> None:
     ensure_admin_user(user)
     normalized_email = str(user.email or "").strip().lower()
-    if normalized_email != SUBSCRIPTION_ADMIN_EMAIL:
-        raise HTTPException(
-            status_code=403,
-            detail="This page is restricted to the designated subscription admin account.",
-        )
+    if normalized_email == SUBSCRIPTION_ADMIN_EMAIL:
+        return
+    stored_user = raw_users_collection.find_one(
+        {"user_id": user.user_id},
+        {"is_subscription_admin": 1},
+    )
+    if stored_user and stored_user.get("is_subscription_admin") is True:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="This page is restricted to authorized subscription administrators.",
+    )
 
 
 def _hash_password(password: str, *, salt: Optional[str] = None) -> str:
