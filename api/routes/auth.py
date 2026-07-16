@@ -117,6 +117,10 @@ def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
         "name": str(user.get("name") or "").strip(),
         "workspace": str(user.get("workspace") or "").strip(),
         "role": normalize_user_role(user.get("role")),
+        "is_subscription_admin": (
+            str(user.get("email") or "").strip().lower() == "safwanc189@gmail.com"
+            or user.get("is_subscription_admin") is True
+        ),
         "app": app_name,
         "plan_name": plan_name or "Starter Access",
         "subscription_status": subscription_status,
@@ -627,6 +631,7 @@ def list_admin_users(
                 "name": 1,
                 "workspace": 1,
                 "role": 1,
+                "is_subscription_admin": 1,
                 "subscription": 1,
                 "pending_subscription_request": 1,
                 "created_at": 1,
