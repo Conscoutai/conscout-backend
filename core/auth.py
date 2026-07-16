@@ -34,6 +34,19 @@ from core.database import (
 DEFAULT_BOOTSTRAP_EMAIL = "safwanc189@gmail.com"
 DEFAULT_BOOTSTRAP_PASSWORD = "1234567890"
 SUBSCRIPTION_ADMIN_EMAIL = "safwanc189@gmail.com"
+# ``role`` is kept for construction-project permissions (admin/stakeholder).
+# Console permissions are deliberately stored separately so customer accounts
+# never become Admin Console accounts merely because they can manage a project.
+ACCOUNT_ROLE_MAIN_USER = "main_user"
+ACCOUNT_ROLE_LITE_USER = "lite_user"
+ACCOUNT_ROLE_ADMIN = "admin"
+ACCOUNT_ROLE_SUPER_ADMIN = "super_admin"
+ACCOUNT_ROLES = {
+    ACCOUNT_ROLE_MAIN_USER,
+    ACCOUNT_ROLE_LITE_USER,
+    ACCOUNT_ROLE_ADMIN,
+    ACCOUNT_ROLE_SUPER_ADMIN,
+}
 # ``APP_SURFACE`` is set by the server deployment and is the authoritative
 # product boundary.  A request body must never be able to select a database or
 # unlock a second product.
@@ -115,6 +128,57 @@ def normalize_user_role(value: Optional[str]) -> str:
     return normalized if normalized in {"admin", "stakeholder"} else "admin"
 
 
+def default_account_role(*, email: str = "", is_subscription_admin: bool = False) -> str:
+    normalized_email = str(email or "").strip().lower()
+    if normalized_email == SUBSCRIPTION_ADMIN_EMAIL:
+        return ACCOUNT_ROLE_SUPER_ADMIN
+    if is_subscription_admin:
+        return ACCOUNT_ROLE_ADMIN
+    return ACCOUNT_ROLE_LITE_USER if APP_SURFACE == "lite" else ACCOUNT_ROLE_MAIN_USER
+
+
+def normalize_account_role(
+    value: Optional[str],
+    *,
+    email: str = "",
+    is_subscription_admin: bool = False,
+) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in ACCOUNT_ROLES:
+        return normalized
+    return default_account_role(
+        email=email,
+        is_subscription_admin=is_subscription_admin,
+    )
+
+
+def account_role_for_user(user: dict) -> str:
+    return normalize_account_role(
+        user.get("account_role"),
+        email=str(user.get("email") or ""),
+        is_subscription_admin=user.get("is_subscription_admin") is True,
+    )
+
+
+def ensure_account_admin_access(user: dict, *, required_role: str = "admin") -> str:
+    requested = str(required_role or "admin").strip().lower()
+    if requested not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
+        raise HTTPException(status_code=400, detail="Invalid Admin Console access type.")
+
+    account_role = account_role_for_user(user)
+    if account_role not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
+        raise HTTPException(
+            status_code=403,
+            detail="This account is not authorized for the Admin Console.",
+        )
+    if requested == ACCOUNT_ROLE_SUPER_ADMIN and account_role != ACCOUNT_ROLE_SUPER_ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail="This account is not authorized for Super Admin access.",
+        )
+    return account_role
+
+
 def normalize_allowed_apps(
     values: Optional[Union[list[str], tuple[str, ...], set[str], str]],
 ) -> list[str]:
@@ -148,21 +212,22 @@ def ensure_admin_user(user: AuthenticatedUser) -> None:
         )
 
 
-def ensure_subscription_admin_user(user: AuthenticatedUser) -> None:
-    ensure_admin_user(user)
-    normalized_email = str(user.email or "").strip().lower()
-    if normalized_email == SUBSCRIPTION_ADMIN_EMAIL:
-        return
+def ensure_subscription_admin_user(
+    user: AuthenticatedUser,
+    *,
+    required_role: str = "admin",
+) -> str:
     stored_user = raw_users_collection.find_one(
         {"user_id": user.user_id},
-        {"is_subscription_admin": 1},
+        {"email": 1, "account_role": 1, "is_subscription_admin": 1},
     )
-    if stored_user and stored_user.get("is_subscription_admin") is True:
-        return
-    raise HTTPException(
-        status_code=403,
-        detail="This page is restricted to authorized subscription administrators.",
-    )
+    if not stored_user:
+        raise HTTPException(status_code=401, detail="Administrator account was not found.")
+    return ensure_account_admin_access(stored_user, required_role=required_role)
+
+
+def ensure_super_admin_user(user: AuthenticatedUser) -> None:
+    ensure_subscription_admin_user(user, required_role=ACCOUNT_ROLE_SUPER_ADMIN)
 
 
 def _hash_password(password: str, *, salt: Optional[str] = None) -> str:
@@ -447,6 +512,7 @@ def create_user(
     password: str,
     workspace: str = "",
     role: str = "admin",
+    account_role: Optional[str] = None,
     allowed_apps: Optional[list[str]] = None,
 ) -> dict:
     normalized_email = email.strip().lower()
@@ -462,6 +528,10 @@ def create_user(
         "workspace": workspace.strip(),
         "password_hash": _hash_password(password),
         "role": normalize_user_role(role),
+        "account_role": normalize_account_role(
+            account_role,
+            email=normalized_email,
+        ),
         "allowed_apps": normalize_allowed_apps(allowed_apps),
         "session_token": "",
         "auth_sessions": [],
@@ -667,6 +737,7 @@ def sanitize_user_payload(user: dict) -> dict:
         "name": user.get("name", ""),
         "workspace": user.get("workspace", ""),
         "role": normalize_user_role(user.get("role")),
+        "account_role": account_role_for_user(user),
         "allowed_apps": normalize_allowed_apps(user.get("allowed_apps")),
         "product": APP_SURFACE,
         "accessible_project_names": access_payload["accessible_project_names"],

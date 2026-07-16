@@ -12,9 +12,13 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from core.auth import (
+    ACCOUNT_ROLE_ADMIN,
+    account_role_for_user,
     authenticate_user,
     change_user_password,
     create_user,
+    ensure_account_admin_access,
+    ensure_super_admin_user,
     ensure_user_allowed_for_app,
     ensure_subscription_admin_user,
     normalize_user_role,
@@ -111,16 +115,15 @@ def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
         or subscription.get("approved_at")
         or user.get("created_at")
     )
+    account_role = account_role_for_user(user)
     return {
         "user_id": str(user.get("user_id") or ""),
         "email": str(user.get("email") or "").strip().lower(),
         "name": str(user.get("name") or "").strip(),
         "workspace": str(user.get("workspace") or "").strip(),
         "role": normalize_user_role(user.get("role")),
-        "is_subscription_admin": (
-            str(user.get("email") or "").strip().lower() == "safwanc189@gmail.com"
-            or user.get("is_subscription_admin") is True
-        ),
+        "account_role": account_role,
+        "is_subscription_admin": account_role in {"admin", "super_admin"},
         "app": app_name,
         "plan_name": plan_name or "Starter Access",
         "subscription_status": subscription_status,
@@ -173,6 +176,7 @@ class LoginRequest(BaseModel):
     email: str
     password: str
     app: str
+    admin_access: Optional[str] = None
 
 
 class SignupRequest(BaseModel):
@@ -290,6 +294,10 @@ def login(payload: LoginRequest):
     user = authenticate_user(payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if payload.admin_access is not None:
+        if app_name != "main":
+            raise HTTPException(status_code=400, detail="Admin Console access uses the main API.")
+        ensure_account_admin_access(user, required_role=payload.admin_access)
     return _finalize_auth_response(user, app_name=app_name)
 
 
@@ -436,7 +444,7 @@ def create_subscription_admin(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     """Create an additional administrator for the web subscription console."""
-    ensure_subscription_admin_user(current_user)
+    ensure_super_admin_user(current_user)
     if APP_SURFACE != "main":
         raise HTTPException(
             status_code=403,
@@ -455,6 +463,7 @@ def create_subscription_admin(
         email=payload.email,
         password=payload.password,
         role="admin",
+        account_role=ACCOUNT_ROLE_ADMIN,
         allowed_apps=["main"],
     )
     raw_users_collection.update_one(
@@ -462,6 +471,7 @@ def create_subscription_admin(
         {
             "$set": {
                 "is_subscription_admin": True,
+                "account_role": ACCOUNT_ROLE_ADMIN,
                 "updated_at": int(time.time() * 1000),
             }
         },
@@ -470,6 +480,22 @@ def create_subscription_admin(
     return {
         "message": "Administrator created successfully.",
         "admin": sanitize_user_payload(admin),
+    }
+
+
+@router.get("/admin/access")
+def admin_access(
+    required_role: str = Query(default="admin"),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Verify the signed-in account's Admin Console access level."""
+    account_role = ensure_subscription_admin_user(
+        current_user,
+        required_role=required_role,
+    )
+    return {
+        "account_role": account_role,
+        "is_super_admin": account_role == "super_admin",
     }
 
 
@@ -631,6 +657,7 @@ def list_admin_users(
                 "name": 1,
                 "workspace": 1,
                 "role": 1,
+                "account_role": 1,
                 "is_subscription_admin": 1,
                 "subscription": 1,
                 "pending_subscription_request": 1,
