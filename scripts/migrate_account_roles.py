@@ -7,6 +7,12 @@ construction-project permissions (admin/stakeholder).
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Allow direct execution with ``python scripts/migrate_account_roles.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from core.auth import (
     ACCOUNT_ROLE_ADMIN,
     ACCOUNT_ROLE_LITE_USER,
