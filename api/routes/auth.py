@@ -103,6 +103,54 @@ def _admin_request_status_filter(status: str) -> dict:
     raise HTTPException(status_code=400, detail="Invalid request status filter.")
 
 
+def _admin_project_registry_payload(project: dict, owner: Optional[dict]) -> dict:
+    """Return the minimal, serializable project record needed by Admin."""
+    owner = owner or {}
+    owner_id = str(
+        project.get("owner_user_id")
+        or project.get("owner_id")
+        or project.get("created_by_id")
+        or project.get("user_id")
+        or ""
+    ).strip()
+    owner_email = _normalize_email(
+        str(
+            project.get("owner_email")
+            or project.get("created_by_email")
+            or project.get("user_email")
+            or ""
+        )
+    )
+    owner_name = str(
+        project.get("owner_name")
+        or project.get("created_by_name")
+        or project.get("created_by")
+        or owner.get("name")
+        or ""
+    ).strip()
+    return {
+        "id": str(project.get("_id") or project.get("id") or ""),
+        "site_name": str(
+            project.get("site_name")
+            or project.get("project_name")
+            or project.get("name")
+            or project.get("dxf_project_id")
+            or ""
+        ).strip(),
+        "location": str(
+            project.get("location")
+            or project.get("project_location")
+            or project.get("area_location")
+            or ""
+        ).strip(),
+        "owner_id": owner_id or str(owner.get("user_id") or "").strip(),
+        "owner_email": owner_email or _normalize_email(str(owner.get("email") or "")),
+        "owner_name": owner_name,
+        "created_at": project.get("created_at") or project.get("createdAt"),
+        "updated_at": project.get("updated_at") or project.get("updatedAt"),
+    }
+
+
 def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
     subscription = user.get("subscription")
     subscription = subscription if isinstance(subscription, dict) else {}
@@ -682,6 +730,129 @@ def list_admin_subscription_requests(
         "requests": [_admin_request_payload(doc) for doc in docs],
         "count": len(docs),
     }
+
+
+@router.get("/admin/projects")
+def list_admin_projects(
+    app: str = Query(default="main"),
+    limit: int = Query(default=500, ge=1, le=500),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """List Main or Lite projects for the central Admin Console.
+
+    This deliberately reads the raw product collection after verifying the
+    central admin session; the regular ``/projects`` route is owner-scoped.
+    """
+    ensure_subscription_admin_user(current_user)
+    users, _, app_name = _admin_product_collections(app)
+    projects_collection = users.database["sites"]
+    candidates = list(
+        projects_collection.find(
+            {},
+            {
+                "site_name": 1,
+                "project_name": 1,
+                "name": 1,
+                "dxf_project_id": 1,
+                "location": 1,
+                "project_location": 1,
+                "area_location": 1,
+                "owner_user_id": 1,
+                "owner_id": 1,
+                "owner_email": 1,
+                "owner_name": 1,
+                "created_by_id": 1,
+                "created_by_email": 1,
+                "created_by_name": 1,
+                "created_by": 1,
+                "user_id": 1,
+                "user_email": 1,
+                "created_at": 1,
+                "createdAt": 1,
+                "updated_at": 1,
+                "updatedAt": 1,
+            },
+        ).sort([("created_at", -1), ("updated_at", -1), ("_id", -1)])
+    )
+
+    projects = []
+    seen_site_names = set()
+    owner_ids = set()
+    owner_emails = set()
+    for project in candidates:
+        site_name = str(
+            project.get("site_name")
+            or project.get("project_name")
+            or project.get("name")
+            or project.get("dxf_project_id")
+            or ""
+        ).strip()
+        site_key = site_name.lower()
+        if not site_name or site_key in seen_site_names:
+            continue
+        seen_site_names.add(site_key)
+        projects.append(project)
+        owner_id = str(
+            project.get("owner_user_id")
+            or project.get("owner_id")
+            or project.get("created_by_id")
+            or project.get("user_id")
+            or ""
+        ).strip()
+        owner_email = _normalize_email(
+            str(
+                project.get("owner_email")
+                or project.get("created_by_email")
+                or project.get("user_email")
+                or ""
+            )
+        )
+        if owner_id:
+            owner_ids.add(owner_id)
+        if owner_email:
+            owner_emails.add(owner_email)
+        if len(projects) >= limit:
+            break
+
+    owner_filters = []
+    if owner_ids:
+        owner_filters.append({"user_id": {"$in": list(owner_ids)}})
+    if owner_emails:
+        owner_filters.append({"email": {"$in": list(owner_emails)}})
+    owners_by_id = {}
+    owners_by_email = {}
+    if owner_filters:
+        for owner in users.find(
+            {"$or": owner_filters},
+            {"user_id": 1, "email": 1, "name": 1},
+        ):
+            owner_id = str(owner.get("user_id") or "").strip()
+            owner_email = _normalize_email(str(owner.get("email") or ""))
+            if owner_id:
+                owners_by_id[owner_id] = owner
+            if owner_email:
+                owners_by_email[owner_email] = owner
+
+    payload = []
+    for project in projects:
+        owner_id = str(
+            project.get("owner_user_id")
+            or project.get("owner_id")
+            or project.get("created_by_id")
+            or project.get("user_id")
+            or ""
+        ).strip()
+        owner_email = _normalize_email(
+            str(
+                project.get("owner_email")
+                or project.get("created_by_email")
+                or project.get("user_email")
+                or ""
+            )
+        )
+        owner = owners_by_id.get(owner_id) or owners_by_email.get(owner_email)
+        payload.append(_admin_project_registry_payload(project, owner))
+    return {"app": app_name, "projects": payload, "count": len(payload)}
 
 
 def _review_admin_subscription_request(
