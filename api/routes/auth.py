@@ -436,8 +436,8 @@ def google_auth(payload: GoogleAuthRequest):
         raise HTTPException(
             status_code=404,
             detail=(
-                "No Conscout account is linked to this Google account. "
-                "Create an account first."
+                "We couldn't find a Conscout account for this Google account. "
+                "Create an account to get started."
             ),
         )
     if intent == "signup" and user:
@@ -445,7 +445,7 @@ def google_auth(payload: GoogleAuthRequest):
             status_code=409,
             detail=(
                 "A Conscout account already exists for this Google account. "
-                "Please sign in instead."
+                "Sign in to continue."
             ),
         )
 
