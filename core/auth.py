@@ -160,6 +160,20 @@ def account_role_for_user(user: dict) -> str:
     )
 
 
+def account_status_for_user(user: dict) -> str:
+    return (
+        str(user.get("account_status") or "active").strip().lower() or "active"
+    )
+
+
+def ensure_user_account_active(user: dict) -> None:
+    if account_status_for_user(user) == "deactivated":
+        raise HTTPException(
+            status_code=403,
+            detail="This account has been deactivated. Please contact support.",
+        )
+
+
 def ensure_account_admin_access(user: dict, *, required_role: str = "admin") -> str:
     requested = str(required_role or "admin").strip().lower()
     if requested not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
@@ -502,6 +516,7 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
         return None
     if not verify_password(password, user.get("password_hash", "")):
         return None
+    ensure_user_account_active(user)
     return user
 
 
@@ -532,6 +547,7 @@ def create_user(
             account_role,
             email=normalized_email,
         ),
+        "account_status": "active",
         "allowed_apps": normalize_allowed_apps(allowed_apps),
         "session_token": "",
         "auth_sessions": [],
@@ -657,6 +673,7 @@ def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) 
     user = raw_users_collection.find_one({"auth_sessions.refresh_token": normalized_refresh_token})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token.")
+    ensure_user_account_active(user)
 
     sessions = _normalize_auth_sessions(user)
     matching_session = _find_session_by_refresh_token(user, normalized_refresh_token)
@@ -766,6 +783,7 @@ async def require_authenticated_user(
 
     user = raw_users_collection.find_one({"auth_sessions.access_token": token})
     if user:
+        ensure_user_account_active(user)
         session = _find_session_by_access_token(user, token)
         if session:
             current_ms = _now_ms()
@@ -791,6 +809,7 @@ async def require_authenticated_user(
     user = raw_users_collection.find_one({"session_token": token})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+    ensure_user_account_active(user)
 
     access_payload = _build_user_access_payload(user)
     auth_user = AuthenticatedUser(

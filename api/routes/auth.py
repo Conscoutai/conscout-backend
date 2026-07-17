@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +14,9 @@ from pydantic import BaseModel
 
 from core.auth import (
     ACCOUNT_ROLE_ADMIN,
+    ACCOUNT_ROLE_LITE_USER,
+    ACCOUNT_ROLE_MAIN_USER,
+    _hash_password,
     account_role_for_user,
     authenticate_user,
     change_user_password,
@@ -123,6 +127,8 @@ def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
         "workspace": str(user.get("workspace") or "").strip(),
         "role": normalize_user_role(user.get("role")),
         "account_role": account_role,
+        "account_status": str(user.get("account_status") or "active").strip().lower()
+        or "active",
         "is_subscription_admin": account_role in {"admin", "super_admin"},
         "app": app_name,
         "plan_name": plan_name or "Starter Access",
@@ -192,6 +198,18 @@ class CreateAdminRequest(BaseModel):
     name: str
     email: str
     password: str
+
+
+class CreateManagedUserRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    app: str
+    workspace: str = ""
+
+
+class DeleteManagedUserRequest(BaseModel):
+    confirmation_email: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -499,6 +517,151 @@ def admin_access(
     }
 
 
+def _managed_customer_or_404(collection, user_id: str) -> dict:
+    user = collection.find_one({"user_id": user_id.strip()})
+    if not user:
+        raise HTTPException(status_code=404, detail="User account was not found.")
+    if account_role_for_user(user) in {"admin", "super_admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin Console accounts must be managed separately.",
+        )
+    return user
+
+
+@router.post("/admin/users")
+def create_managed_user(
+    payload: CreateManagedUserRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Create a regular Main or Lite account from the Admin Console."""
+    ensure_subscription_admin_user(current_user)
+    app_name = payload.app.strip().lower()
+    collection, app_name = _admin_directory_collection(app_name)
+    name = payload.name.strip()
+    email = _normalize_email(payload.email)
+    password = payload.password.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="User name is required.")
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required.")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if collection.find_one({"email": email}, {"_id": 1}):
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    now = int(time.time() * 1000)
+    user = {
+        "user_id": uuid.uuid4().hex,
+        "email": email,
+        "name": name,
+        "workspace": payload.workspace.strip(),
+        "password_hash": _hash_password(password),
+        "role": "admin",
+        "account_role": (
+            ACCOUNT_ROLE_LITE_USER if app_name == "lite" else ACCOUNT_ROLE_MAIN_USER
+        ),
+        "account_status": "active",
+        "allowed_apps": [app_name],
+        "session_token": "",
+        "auth_sessions": [],
+        "last_login_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collection.insert_one(user)
+    return {
+        "message": f"{app_name.title()} user created successfully.",
+        "user": _admin_directory_user_payload(user, app_name=app_name),
+    }
+
+
+@router.post("/admin/users/{app}/{user_id}/deactivate")
+def deactivate_managed_user(
+    app: str,
+    user_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_subscription_admin_user(current_user)
+    collection, _ = _admin_directory_collection(app)
+    user = _managed_customer_or_404(collection, user_id)
+    collection.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "account_status": "deactivated",
+                "deactivated_at": int(time.time() * 1000),
+                "updated_at": int(time.time() * 1000),
+                "session_token": "",
+                "auth_sessions": [],
+            }
+        },
+    )
+    return {"message": "User account deactivated."}
+
+
+@router.post("/admin/users/{app}/{user_id}/reactivate")
+def reactivate_managed_user(
+    app: str,
+    user_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_subscription_admin_user(current_user)
+    collection, _ = _admin_directory_collection(app)
+    user = _managed_customer_or_404(collection, user_id)
+    collection.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "account_status": "active",
+                "reactivated_at": int(time.time() * 1000),
+                "updated_at": int(time.time() * 1000),
+            },
+            "$unset": {"deactivated_at": ""},
+        },
+    )
+    return {"message": "User account reactivated."}
+
+
+@router.post("/admin/users/{app}/{user_id}/delete")
+def delete_managed_user(
+    app: str,
+    user_id: str,
+    payload: DeleteManagedUserRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Permanently delete a regular account after exact-email confirmation."""
+    ensure_subscription_admin_user(current_user)
+    collection, app_name = _admin_directory_collection(app)
+    user = _managed_customer_or_404(collection, user_id)
+    if _normalize_email(payload.confirmation_email) != _normalize_email(user.get("email", "")):
+        raise HTTPException(status_code=400, detail="Email confirmation does not match this account.")
+
+    if app_name == "main":
+        deleted = delete_user_account(user)
+    else:
+        database = collection.database
+        user_filter = {
+            "$or": [
+                {"user_id": user.get("user_id", "")},
+                {"email": user.get("email", "")},
+            ]
+        }
+        requests_deleted = database["subscription_requests"].delete_many(
+            user_filter
+        ).deleted_count
+        checkout_deleted = database["subscription_checkout_sessions"].delete_many(
+            user_filter
+        ).deleted_count
+        users_deleted = collection.delete_one({"_id": user["_id"]}).deleted_count
+        deleted = {
+            "users_deleted": users_deleted,
+            "subscription_requests_deleted": requests_deleted,
+            "checkout_sessions_deleted": checkout_deleted,
+        }
+    return {"message": "User account permanently deleted.", "deleted": deleted}
+
+
 @router.get("/admin/subscription-requests")
 def list_admin_subscription_requests(
     app: str = Query(default="lite"),
@@ -661,6 +824,7 @@ def list_admin_users(
                 "is_subscription_admin": 1,
                 "subscription": 1,
                 "pending_subscription_request": 1,
+                "account_status": 1,
                 "created_at": 1,
                 "last_login_at": 1,
                 "last_login_app": 1,
