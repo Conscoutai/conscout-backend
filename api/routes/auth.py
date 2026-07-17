@@ -392,6 +392,10 @@ def google_auth(payload: GoogleAuthRequest):
         raise HTTPException(status_code=400, detail="Unsupported auth provider.")
 
     app_name = _normalize_app(payload.app)
+    intent = payload.intent.strip().lower()
+    if intent not in {"login", "signup"}:
+        raise HTTPException(status_code=400, detail="Invalid Google sign-in intent.")
+
     token_payload = _verify_google_id_token(payload.id_token)
 
     email = _normalize_email(
@@ -409,14 +413,44 @@ def google_auth(payload: GoogleAuthRequest):
     google_user_id = str(
         token_payload.get("sub") or payload.google_user_id or ""
     ).strip()
+    if not google_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Google account identifier is missing.",
+        )
     photo_url = str(
         payload.photo_url
         or token_payload.get("picture")
         or ""
     ).strip()
 
-    user = raw_users_collection.find_one({"email": email})
-    if not user:
+    user = raw_users_collection.find_one(
+        {
+            "$or": [
+                {"google_user_id": google_user_id},
+                {"email": email},
+            ]
+        }
+    )
+    if intent == "login" and not user:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No Conscout account is linked to this Google account. "
+                "Create an account first."
+            ),
+        )
+    if intent == "signup" and user:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A Conscout account already exists for this Google account. "
+                "Please sign in instead."
+            ),
+        )
+
+    is_new_google_account = user is None
+    if is_new_google_account:
         user = create_user(
             name=display_name or "Google User",
             email=email,
@@ -428,18 +462,21 @@ def google_auth(payload: GoogleAuthRequest):
 
     update_fields = {
         "updated_at": int(time.time() * 1000),
-        "name": display_name or user.get("name", ""),
-        "workspace": workspace or user.get("workspace", ""),
-        "allowed_apps": [app_name],
-        "auth_provider": "google",
         "google_user_id": google_user_id,
         "google_photo_url": photo_url,
         "google_email_verified": True,
     }
+    if is_new_google_account:
+        update_fields.update(
+            {
+                "name": display_name or "Google User",
+                "workspace": workspace,
+                "auth_provider": "google",
+            }
+        )
     if payload.platform:
         update_fields["last_login_platform"] = payload.platform.strip().lower()
-    if payload.intent:
-        update_fields["last_google_intent"] = payload.intent.strip().lower()
+    update_fields["last_google_intent"] = intent
     raw_users_collection.update_one(
         {"_id": user["_id"]},
         {"$set": update_fields},
