@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import math
 import json
 import shutil
+from uuid import uuid4
 from typing import Literal, Optional
 
 from fastapi import UploadFile, HTTPException
@@ -35,6 +36,7 @@ def create_floorplan(
     pointB_lon: Optional[float],
     calibration_points: Optional[str] = None,
     site_name: Optional[str] = None,
+    project_id: Optional[str] = None,
     dxf_project_id: Optional[str] = None,
     baseline_xer_url: Optional[str] = None,
     baseline_xer_name: Optional[str] = None,
@@ -50,19 +52,14 @@ def create_floorplan(
         if ext not in ["jpg", "jpeg", "png"]:
             raise HTTPException(400, "Only JPG or PNG supported")
 
-        site_name = site_name or dxf_project_id or DEFAULT_SITE_NAME
-        existing_floorplan = floorplans_collection.find_one(
-            {"site_name": site_name},
-            sort=[("_id", -1)],
-        )
-        floorplan_id = (
-            existing_floorplan.get("id")
-            if existing_floorplan and existing_floorplan.get("id")
-            else f"floorplan_{int(time.time())}"
-        )
+        site_name = site_name or DEFAULT_SITE_NAME
+        floorplan_id = (project_id or "").strip() or f"floorplan_{uuid4().hex}"
+        # Creation is never an upsert by name. A project name is a label; the
+        # generated project ID is the record and asset identity.
+        existing_floorplan = floorplans_collection.find_one({"id": floorplan_id})
         save_as = f"{floorplan_id}.png"
 
-        floorplan_dir = site_floorplan_dir(site_name)
+        floorplan_dir = site_floorplan_dir(floorplan_id)
         os.makedirs(floorplan_dir, exist_ok=True)
         image_path = os.path.join(floorplan_dir, save_as)
 
@@ -201,9 +198,10 @@ def create_floorplan(
         floorplan_metadata = {
             "id": floorplan_id,
             "name": effective_name,
-            "imageUrl": f"/sites/{site_name}/floorplan/{save_as}",
+            "imageUrl": f"/sites/{floorplan_id}/floorplan/{save_as}",
             "bounds": {"width": width, "height": height},
             "site_name": site_name,
+            "project_id": floorplan_id,
             "location": project_location,
             "project_location": project_location,
             "area_location": project_location,
@@ -248,12 +246,6 @@ def create_floorplan(
             floorplans_collection.update_one(
                 {"_id": existing_floorplan["_id"]},
                 {"$set": floorplan_metadata},
-            )
-            floorplans_collection.delete_many(
-                {
-                    "$or": [{"site_name": site_name}, {"dxf_project_id": site_name}],
-                    "_id": {"$ne": existing_floorplan["_id"]},
-                }
             )
             floorplan_metadata["_id"] = str(existing_floorplan["_id"])
         else:

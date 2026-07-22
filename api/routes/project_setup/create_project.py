@@ -1,4 +1,5 @@
 from typing import Literal, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 
@@ -21,7 +22,8 @@ from services.project_setup.project_assets_service import (
 
 router = APIRouter(tags=["Floorplans"])
 
-# Creates/updates a project floorplan upload.
+# Creates a project floorplan upload. Project names are display labels and are
+# deliberately not used as identifiers: duplicate names are valid.
 # Accepts calibration points, optional DXF zip, optional site config JSON, optional baseline XER.
 # Triggers floorplan creation + optional DXF processing + optional config attach.
 
@@ -39,6 +41,7 @@ async def create_project_floorplan(
     pointB_lat: Optional[float] = Form(None),
     pointB_lon: Optional[float] = Form(None),
     calibration_points: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
     dxf_project_id: Optional[str] = Form(None),
     location: Optional[str] = Form(None),
     project_location: Optional[str] = Form(None),
@@ -57,20 +60,23 @@ async def create_project_floorplan(
     if normalized_form_site and normalized_form_site != site_name:
         raise HTTPException(400, "Path site_name and form site_name must match")
 
-    effective_site = site_name or dxf_project_id or DEFAULT_SITE_NAME
+    effective_site = site_name or DEFAULT_SITE_NAME
+    # The client may provide an ID for retries. Otherwise the server creates
+    # one before any files are written so every project's assets stay isolated.
+    effective_project_id = (project_id or "").strip() or f"floorplan_{uuid4().hex}"
     parsed_site_config = None
     if site_config:
         if not site_config.filename or not site_config.filename.lower().endswith(".json"):
             raise HTTPException(400, "Site config must be a .json file")
         raw_bytes = await site_config.read()
-        parsed_site_config = save_site_config_and_try_parse(effective_site, raw_bytes)
+        parsed_site_config = save_site_config_and_try_parse(effective_project_id, raw_bytes)
 
     if dxf_zip and ENABLE_DXF_PROCESSING:
-        replace_site_dxfs_from_zip(effective_site, await dxf_zip.read(), require_dxf=False)
+        replace_site_dxfs_from_zip(effective_project_id, await dxf_zip.read(), require_dxf=False)
         if not isinstance(parsed_site_config, dict):
-            generated = generate_site_config_from_saved_dxfs(effective_site)
+            generated = generate_site_config_from_saved_dxfs(effective_project_id)
             parsed_site_config = generated["site_config"]
-        dxf_project_id = effective_site
+        dxf_project_id = effective_project_id
     else:
         dxf_project_id = None
 
@@ -80,7 +86,7 @@ async def create_project_floorplan(
         if not baseline_xer.filename or not baseline_xer.filename.lower().endswith(".xer"):
             raise HTTPException(400, "Baseline file must be a .xer")
         baseline_xer_url, baseline_xer_name = save_baseline_xer(
-            effective_site,
+            effective_project_id,
             baseline_xer.filename,
             await baseline_xer.read(),
         )
@@ -98,6 +104,7 @@ async def create_project_floorplan(
         pointB_lon=pointB_lon,
         calibration_points=calibration_points,
         site_name=effective_site,
+        project_id=effective_project_id,
         dxf_project_id=dxf_project_id,
         baseline_xer_url=baseline_xer_url,
         baseline_xer_name=baseline_xer_name,
@@ -110,6 +117,6 @@ async def create_project_floorplan(
     )
     if isinstance(parsed_site_config, dict):
         floorplan_id = result.get("floorPlan", {}).get("id")
-        upsert_floorplan_site_config(effective_site, parsed_site_config, floorplan_id)
+        upsert_floorplan_site_config(effective_project_id, parsed_site_config, floorplan_id)
 
     return result

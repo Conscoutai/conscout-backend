@@ -46,7 +46,16 @@ def delete_project(site_name: str) -> None:
     if not normalized_site:
         raise HTTPException(400, "Project name is required")
 
-    site_filter = {"$or": [{"site_name": normalized_site}, {"dxf_project_id": normalized_site}]}
+    # IDs identify a single project. Keep the name filter only for legacy
+    # clients that still call this route with a display name.
+    site_filter = {
+        "$or": [
+            {"id": normalized_site},
+            {"project_id": normalized_site},
+            {"site_name": normalized_site},
+            {"dxf_project_id": normalized_site},
+        ]
+    }
     floorplans = list(floorplans_collection.find(site_filter))
     floorplan_ids = [
         str(doc.get("id") or "").strip()
@@ -129,6 +138,21 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         raise HTTPException(400, "Both old and new site names are required")
     if old_site == new_site:
         raise HTTPException(400, "New site name must be different")
+
+    project_by_id = floorplans_collection.find_one(
+        {"$or": [{"id": old_site}, {"project_id": old_site}]}
+    )
+    if project_by_id:
+        project_id = str(project_by_id.get("id") or old_site).strip()
+        floorplans_collection.update_one(
+            {"_id": project_by_id["_id"]},
+            {"$set": {"site_name": new_site, "name": new_site}},
+        )
+        tours_collection.update_many(
+            {"floorplan_id": project_id},
+            {"$set": {"site_name": new_site}},
+        )
+        return
 
     existing = floorplans_collection.find_one(
         {"$or": [{"site_name": new_site}, {"dxf_project_id": new_site}]}

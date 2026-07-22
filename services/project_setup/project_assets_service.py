@@ -18,6 +18,17 @@ from core.config import (
 )
 
 
+def _project_filter(project_ref: str) -> dict:
+    return {
+        "$or": [
+            {"id": project_ref},
+            {"project_id": project_ref},
+            {"site_name": project_ref},
+            {"dxf_project_id": project_ref},
+        ]
+    }
+
+
 def replace_site_dxfs_from_zip(
     site_name: str,
     zip_bytes: bytes,
@@ -82,11 +93,9 @@ def persist_project_assets_update(
     class_colors = parsed_site_config.get("class_colors", {})
     now = datetime.now(timezone.utc)
     floorplans_collection.update_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         {
             "$set": {
-                "dxf_project_id": site_name,
-                "site_name": site_name,
                 "site_objects": site_objects,
                 "site_config": {
                     "dxf_blocks": parsed_site_config.get("dxf_blocks", {}),
@@ -118,7 +127,7 @@ def resolve_site_config_for_reprocess(
             pass
 
     latest_floorplan = floorplans_collection.find_one(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         sort=[("_id", -1)],
     )
     if latest_floorplan and isinstance(latest_floorplan.get("site_config"), dict):

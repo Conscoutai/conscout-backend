@@ -232,7 +232,14 @@ def get_site_asset(
 
     site_name = parts[0]
     floorplan = raw_floorplans_collection.find_one(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]}
+        {
+            "$or": [
+                {"id": site_name},
+                {"project_id": site_name},
+                {"site_name": site_name},
+                {"dxf_project_id": site_name},
+            ]
+        }
     )
     if not floorplan:
         return _asset_error(404, "Site asset not found.")

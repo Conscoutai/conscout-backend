@@ -108,6 +108,19 @@ def _build_stakeholder_members(stakeholder_emails: list[str]) -> list[dict]:
         members.append({"email": email, "name": name, "role": role})
     return members
 
+
+def _project_filter(project_ref: str) -> dict:
+    """Resolve ID-based requests while retaining legacy name routes."""
+    value = project_ref.strip()
+    return {
+        "$or": [
+            {"id": value},
+            {"project_id": value},
+            {"site_name": value},
+            {"dxf_project_id": value},
+        ]
+    }
+
 #Lists projects
 @router.get("/projects")
 def list_projects(
@@ -129,14 +142,10 @@ def list_projects(
         query["$or"].append({"id": {"$in": list(floorplan_ids)}})
 
     floorplans = list(raw_floorplans_collection.find(query).sort("_id", -1))
-    seen_sites = set()
     projects = []
     for fp in floorplans:
-        site_name = str(fp.get("site_name") or fp.get("dxf_project_id") or "").strip()
-        site_key = site_name.lower()
-        if not site_name or site_key in seen_sites:
+        if not str(fp.get("id") or fp.get("project_id") or "").strip():
             continue
-        seen_sites.add(site_key)
         fp["_id"] = str(fp["_id"])
         normalized = normalize_floorplan(fp)
         normalized["stakeholder_members"] = _build_stakeholder_members(
@@ -152,7 +161,7 @@ def get_project_floorplan(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     fp = floorplans_collection.find_one(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         sort=[("_id", -1)],
     )
     if not fp:
@@ -204,7 +213,7 @@ def update_project_capture_mode(
         raise HTTPException(400, "Project name is required")
 
     update = floorplans_collection.update_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         {"$set": {"capture_mode": payload.capture_mode}},
     )
     if update.matched_count == 0:
@@ -232,7 +241,7 @@ def update_project_currency(
         raise HTTPException(400, "Currency type is required")
 
     update = floorplans_collection.update_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         {"$set": {"currency_code": currency_code, "currency": currency_code}},
     )
     if update.matched_count == 0:
@@ -296,7 +305,7 @@ async def update_project_assets(
     parsed_for_reprocess = resolve_site_config_for_reprocess(site_name, parsed)
 
     latest_floorplan = floorplans_collection.find_one(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         sort=[("_id", -1)],
     )
     if not latest_floorplan:
@@ -355,7 +364,7 @@ def list_project_stakeholders(
 ):
     ensure_admin_user(current_user)
     floorplan = floorplans_collection.find_one(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         sort=[("_id", -1)],
     )
     if not floorplan:
@@ -379,7 +388,7 @@ def add_project_stakeholder(
     if not _registered_user_exists(normalized_email):
         raise HTTPException(404, "No registered user found for this email")
     update = floorplans_collection.update_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         {"$addToSet": {"stakeholder_emails": normalized_email}},
     )
     if update.matched_count == 0:
@@ -400,7 +409,7 @@ def remove_project_stakeholder(
     ensure_admin_user(current_user)
     normalized_email = payload.email.strip().lower()
     update = floorplans_collection.update_many(
-        {"$or": [{"site_name": site_name}, {"dxf_project_id": site_name}]},
+        _project_filter(site_name),
         {"$pull": {"stakeholder_emails": normalized_email}},
     )
     if update.matched_count == 0:
