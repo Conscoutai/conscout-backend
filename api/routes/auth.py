@@ -86,6 +86,15 @@ def _admin_product_collections(app_name: str):
     return users, database["subscription_requests"], normalized
 
 
+def _admin_demo_requests_collection():
+    if APP_SURFACE != "main":
+        raise HTTPException(
+            status_code=403,
+            detail="Demo requests are available through the main admin API only.",
+        )
+    return client[DB_NAME]["demo_requests"]
+
+
 def _admin_request_payload(request: dict) -> dict:
     payload = dict(request)
     payload.pop("_id", None)
@@ -96,7 +105,7 @@ def _admin_request_status_filter(status: str) -> dict:
     normalized = status.strip().lower()
     if normalized in {"pending", "pending_approval"}:
         return {"status": "pending_approval"}
-    if normalized in {"approved", "rejected"}:
+    if normalized in {"approved", "rejected", "completed_by_payment"}:
         return {"status": normalized}
     if normalized in {"", "all"}:
         return {}
@@ -297,6 +306,21 @@ class GoogleAuthRequest(BaseModel):
     platform: Optional[str] = None
 
 
+class DemoRequestPayload(BaseModel):
+    name: str
+    email: str
+    phone: str
+    company: Optional[str] = None
+    job_title: Optional[str] = None
+    project_location: Optional[str] = None
+    team_size: Optional[str] = None
+    message: Optional[str] = None
+
+
+class DemoRequestStatusUpdate(BaseModel):
+    status: str
+
+
 def _verify_google_id_token(id_token: str) -> dict:
     token = id_token.strip()
     if not token:
@@ -384,6 +408,42 @@ def signup(payload: SignupRequest):
         allowed_apps=[app_name],
     )
     return _finalize_auth_response(user, app_name=app_name)
+
+
+@router.post("/demo-requests", status_code=201)
+def create_demo_request(payload: DemoRequestPayload):
+    """Store a website demo enquiry for the central Admin Console."""
+    name = payload.name.strip()
+    email = _normalize_email(payload.email)
+    phone = payload.phone.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid work email is required.")
+    if len(phone) < 7:
+        raise HTTPException(status_code=400, detail="A valid phone number is required.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    request = {
+        "request_id": f"demo_{uuid.uuid4().hex}",
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "company": str(payload.company or "").strip(),
+        "job_title": str(payload.job_title or "").strip(),
+        "project_location": str(payload.project_location or "").strip(),
+        "team_size": str(payload.team_size or "").strip(),
+        "message": str(payload.message or "").strip(),
+        "source": "website",
+        "status": "new",
+        "submitted_at": now,
+        "updated_at": now,
+    }
+    _admin_demo_requests_collection().insert_one(request)
+    return {
+        "message": "Thanks — your demo request has been sent to the ConScout team.",
+        "request_id": request["request_id"],
+    }
 
 
 @router.post("/google")
@@ -769,6 +829,57 @@ def list_admin_subscription_requests(
     }
 
 
+@router.get("/admin/demo-requests")
+def list_admin_demo_requests(
+    status: str = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """List website demo enquiries for the central Admin Console."""
+    ensure_subscription_admin_user(current_user)
+    normalized_status = status.strip().lower()
+    if normalized_status not in {"", "all", "new", "contacted", "closed"}:
+        raise HTTPException(status_code=400, detail="Invalid demo request status filter.")
+    query = {} if normalized_status in {"", "all"} else {"status": normalized_status}
+    requests = list(
+        _admin_demo_requests_collection()
+        .find(query, {"_id": 0})
+        .sort([("submitted_at", -1)])
+        .limit(limit)
+    )
+    return {"requests": requests, "count": len(requests)}
+
+
+@router.post("/admin/demo-requests/{request_id}/status")
+def update_admin_demo_request_status(
+    request_id: str,
+    payload: DemoRequestStatusUpdate,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """Update a demo enquiry as the sales team follows up."""
+    ensure_subscription_admin_user(current_user)
+    status = payload.status.strip().lower()
+    if status not in {"new", "contacted", "closed"}:
+        raise HTTPException(status_code=400, detail="Invalid demo request status.")
+    collection = _admin_demo_requests_collection()
+    now = datetime.now(timezone.utc).isoformat()
+    result = collection.update_one(
+        {"request_id": request_id.strip()},
+        {
+            "$set": {
+                "status": status,
+                "updated_at": now,
+                "status_updated_by_user_id": current_user.user_id,
+                "status_updated_by_email": current_user.email,
+            }
+        },
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=404, detail="Demo request not found.")
+    request = collection.find_one({"request_id": request_id.strip()}, {"_id": 0})
+    return {"message": "Demo request updated.", "request": request}
+
+
 @router.get("/admin/projects")
 def list_admin_projects(
     app: str = Query(default="main"),
@@ -900,6 +1011,14 @@ def _review_admin_subscription_request(
     current_user: AuthenticatedUser,
 ) -> dict:
     users, requests, app_name = _admin_product_collections(app)
+    if approve and app_name == "lite":
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "ConScout Lite plans require a verified Moyasar payment and "
+                "cannot be activated through admin approval."
+            ),
+        )
     request = requests.find_one({"request_id": request_id.strip()})
     if not request:
         raise HTTPException(status_code=404, detail="Subscription request not found.")

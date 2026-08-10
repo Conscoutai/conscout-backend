@@ -83,6 +83,7 @@ raw_notifications_collection = db["notifications"]
 raw_notification_devices_collection = db["notification_devices"]
 raw_subscription_requests_collection = db["subscription_requests"]
 raw_subscription_checkout_sessions_collection = db["subscription_checkout_sessions"]
+raw_subscription_payments_collection = db["subscription_payments"]
 
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.

@@ -128,7 +128,9 @@ def normalize_user_role(value: Optional[str]) -> str:
     return normalized if normalized in {"admin", "stakeholder"} else "admin"
 
 
-def default_account_role(*, email: str = "", is_subscription_admin: bool = False) -> str:
+def default_account_role(
+    *, email: str = "", is_subscription_admin: bool = False
+) -> str:
     normalized_email = str(email or "").strip().lower()
     if normalized_email == SUBSCRIPTION_ADMIN_EMAIL:
         return ACCOUNT_ROLE_SUPER_ADMIN
@@ -161,9 +163,7 @@ def account_role_for_user(user: dict) -> str:
 
 
 def account_status_for_user(user: dict) -> str:
-    return (
-        str(user.get("account_status") or "active").strip().lower() or "active"
-    )
+    return str(user.get("account_status") or "active").strip().lower() or "active"
 
 
 def ensure_user_account_active(user: dict) -> None:
@@ -177,7 +177,9 @@ def ensure_user_account_active(user: dict) -> None:
 def ensure_account_admin_access(user: dict, *, required_role: str = "admin") -> str:
     requested = str(required_role or "admin").strip().lower()
     if requested not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
-        raise HTTPException(status_code=400, detail="Invalid Admin Console access type.")
+        raise HTTPException(
+            status_code=400, detail="Invalid Admin Console access type."
+        )
 
     account_role = account_role_for_user(user)
     if account_role not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
@@ -185,7 +187,10 @@ def ensure_account_admin_access(user: dict, *, required_role: str = "admin") -> 
             status_code=403,
             detail="This account is not authorized for the Admin Console.",
         )
-    if requested == ACCOUNT_ROLE_SUPER_ADMIN and account_role != ACCOUNT_ROLE_SUPER_ADMIN:
+    if (
+        requested == ACCOUNT_ROLE_SUPER_ADMIN
+        and account_role != ACCOUNT_ROLE_SUPER_ADMIN
+    ):
         raise HTTPException(
             status_code=403,
             detail="This account is not authorized for Super Admin access.",
@@ -203,9 +208,8 @@ def normalize_allowed_apps(
 
 
 def user_can_access_app(user: dict, app_name: str) -> bool:
-    return (
-        app_name == APP_SURFACE
-        and APP_SURFACE in normalize_allowed_apps(user.get("allowed_apps"))
+    return app_name == APP_SURFACE and APP_SURFACE in normalize_allowed_apps(
+        user.get("allowed_apps")
     )
 
 
@@ -236,7 +240,9 @@ def ensure_subscription_admin_user(
         {"email": 1, "account_role": 1, "is_subscription_admin": 1},
     )
     if not stored_user:
-        raise HTTPException(status_code=401, detail="Administrator account was not found.")
+        raise HTTPException(
+            status_code=401, detail="Administrator account was not found."
+        )
     return ensure_account_admin_access(stored_user, required_role=required_role)
 
 
@@ -300,7 +306,9 @@ def _normalize_auth_sessions(user: dict) -> list[dict]:
     return normalized
 
 
-def _prune_auth_sessions(sessions: list[dict], *, now_ms: Optional[int] = None) -> list[dict]:
+def _prune_auth_sessions(
+    sessions: list[dict], *, now_ms: Optional[int] = None
+) -> list[dict]:
     current_ms = now_ms if now_ms is not None else _now_ms()
     active = [
         session
@@ -379,7 +387,10 @@ def bootstrap_default_user() -> dict:
                 }
             },
         )
-        return raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL}) or existing
+        return (
+            raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL})
+            or existing
+        )
 
     now = _now_ms()
     doc = {
@@ -533,7 +544,9 @@ def create_user(
     normalized_email = email.strip().lower()
     existing = raw_users_collection.find_one({"email": normalized_email})
     if existing:
-        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        raise HTTPException(
+            status_code=409, detail="An account with this email already exists."
+        )
 
     now = _now_ms()
     doc = {
@@ -559,7 +572,9 @@ def create_user(
     return raw_users_collection.find_one({"email": normalized_email}) or doc
 
 
-def change_user_password(*, user_id: str, current_password: str, new_password: str) -> dict:
+def change_user_password(
+    *, user_id: str, current_password: str, new_password: str
+) -> dict:
     user = raw_users_collection.find_one({"user_id": user_id.strip()})
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -670,7 +685,9 @@ def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) 
     if not normalized_refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token is required.")
 
-    user = raw_users_collection.find_one({"auth_sessions.refresh_token": normalized_refresh_token})
+    user = raw_users_collection.find_one(
+        {"auth_sessions.refresh_token": normalized_refresh_token}
+    )
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token.")
     ensure_user_account_active(user)
@@ -692,7 +709,9 @@ def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) 
 
     rotated_session = {
         **matching_session,
-        "app_name": (app_name or matching_session.get("app_name") or "").strip().lower(),
+        "app_name": (app_name or matching_session.get("app_name") or "")
+        .strip()
+        .lower(),
         "access_token": issue_session_token(),
         "refresh_token": issue_refresh_token(),
         "access_expires_at": current_ms + ACCESS_TOKEN_TTL_MS,
@@ -701,7 +720,11 @@ def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) 
         "last_used_at": current_ms,
     }
     updated_sessions = [
-        rotated_session if session.get("session_id") == rotated_session["session_id"] else session
+        (
+            rotated_session
+            if session.get("session_id") == rotated_session["session_id"]
+            else session
+        )
         for session in sessions
     ]
     refreshed = _save_auth_sessions(user, updated_sessions, app_name=app_name)
@@ -724,11 +747,15 @@ def revoke_user_session(
 
     user = None
     if normalized_access:
-        user = raw_users_collection.find_one({"auth_sessions.access_token": normalized_access})
+        user = raw_users_collection.find_one(
+            {"auth_sessions.access_token": normalized_access}
+        )
         if not user:
             user = raw_users_collection.find_one({"session_token": normalized_access})
     if user is None and normalized_refresh:
-        user = raw_users_collection.find_one({"auth_sessions.refresh_token": normalized_refresh})
+        user = raw_users_collection.find_one(
+            {"auth_sessions.refresh_token": normalized_refresh}
+        )
     if not user:
         return
 
@@ -746,8 +773,31 @@ def sanitize_user_payload(user: dict) -> dict:
     subscription = user.get("subscription")
     pending_subscription_request = user.get("pending_subscription_request")
     active_plan_code = ""
+    public_subscription = {}
     if isinstance(subscription, dict):
         active_plan_code = str(subscription.get("plan_code") or "").strip().lower()
+        public_subscription = {
+            key: subscription.get(key)
+            for key in (
+                "plan_code",
+                "plan_name",
+                "monthly_price_usd",
+                "project_limit",
+                "status",
+                "payment_status",
+                "source",
+                "activated_at",
+                "current_period_start",
+                "current_period_end",
+                "next_charge_at",
+                "auto_renew",
+                "gateway_payment_method",
+                "gateway_card_brand",
+                "gateway_card_last_four",
+                "cancellation_requested_at",
+            )
+            if key in subscription
+        }
     return {
         "user_id": user.get("user_id", ""),
         "email": user.get("email", ""),
@@ -759,10 +809,12 @@ def sanitize_user_payload(user: dict) -> dict:
         "product": APP_SURFACE,
         "accessible_project_names": access_payload["accessible_project_names"],
         "plan_code": active_plan_code,
-        "subscription": subscription if isinstance(subscription, dict) else {},
-        "pending_subscription_request": pending_subscription_request
-        if isinstance(pending_subscription_request, dict)
-        else {},
+        "subscription": public_subscription,
+        "pending_subscription_request": (
+            pending_subscription_request
+            if isinstance(pending_subscription_request, dict)
+            else {}
+        ),
         "last_login_at": user.get("last_login_at"),
         "last_login_app": user.get("last_login_app", ""),
         "last_login_platform": user.get("last_login_platform", ""),
@@ -796,8 +848,12 @@ async def require_authenticated_user(
                 email=user.get("email", ""),
                 name=user.get("name", ""),
                 role=access_payload["role"],
-                accessible_project_names=tuple(access_payload["accessible_project_names"]),
-                accessible_floorplan_ids=tuple(access_payload["accessible_floorplan_ids"]),
+                accessible_project_names=tuple(
+                    access_payload["accessible_project_names"]
+                ),
+                accessible_floorplan_ids=tuple(
+                    access_payload["accessible_floorplan_ids"]
+                ),
             )
             context_token = set_current_user(auth_user)
             try:

@@ -393,15 +393,28 @@ FCM_ANDROID_CHANNEL_ID = _env("FCM_ANDROID_CHANNEL_ID", "conscout_alerts").strip
 PUBLIC_API_BASE_URL = _env("PUBLIC_API_BASE_URL", "").rstrip("/")
 MOYASAR_PUBLISHABLE_KEY = _env("MOYASAR_PUBLISHABLE_KEY", "").strip()
 MOYASAR_SECRET_KEY = _env("MOYASAR_SECRET_KEY", "").strip()
+MOYASAR_WEBHOOK_SECRET = _env("MOYASAR_WEBHOOK_SECRET", "").strip()
 MOYASAR_FORM_SCRIPT_URL = _env(
     "MOYASAR_FORM_SCRIPT_URL",
-    "https://cdn.moyasar.com/mpf/1.15.0/moyasar.js",
+    "https://cdn.jsdelivr.net/npm/moyasar-payment-form@2.2.10/dist/moyasar.umd.min.js",
 ).strip()
 MOYASAR_FORM_CSS_URL = _env(
     "MOYASAR_FORM_CSS_URL",
-    "https://cdn.moyasar.com/mpf/1.15.0/moyasar.css",
+    "https://cdn.jsdelivr.net/npm/moyasar-payment-form@2.2.10/dist/moyasar.css",
 ).strip()
 SUBSCRIPTION_PAYMENT_CURRENCY = _env("SUBSCRIPTION_PAYMENT_CURRENCY", "USD").strip().upper()
+SUBSCRIPTION_RENEWAL_SCHEDULER_ENABLED = _env_bool(
+    "SUBSCRIPTION_RENEWAL_SCHEDULER_ENABLED",
+    False,
+)
+SUBSCRIPTION_RENEWAL_POLL_SECONDS = _env_int(
+    "SUBSCRIPTION_RENEWAL_POLL_SECONDS",
+    300,
+)
+SUBSCRIPTION_RENEWAL_MAX_RETRIES = _env_int(
+    "SUBSCRIPTION_RENEWAL_MAX_RETRIES",
+    3,
+)
 MOYASAR_APPLE_PAY_COUNTRY = _env("MOYASAR_APPLE_PAY_COUNTRY", "SA").strip().upper()
 MOYASAR_APPLE_PAY_LABEL = _env("MOYASAR_APPLE_PAY_LABEL", "ConScout").strip() or "ConScout"
 

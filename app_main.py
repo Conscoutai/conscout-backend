@@ -23,6 +23,9 @@ from core.config import (
 from services.progress.weekly_progress_notification_service import (
     ensure_weekly_progress_scheduler_started,
 )
+from services.subscription_billing_service import (
+    ensure_subscription_billing_scheduler_started,
+)
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -60,6 +63,7 @@ for directory in (DATA_DIR,):
 @app.on_event("startup")
 def startup_background_jobs():
     ensure_weekly_progress_scheduler_started()
+    ensure_subscription_billing_scheduler_started()
 
 
 @app.get("/")
