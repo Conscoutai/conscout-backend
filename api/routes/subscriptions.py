@@ -1350,7 +1350,7 @@ def _checkout_page(session_doc: dict[str, Any]) -> str:
         setStatus('Payment received. Verifying and activating your subscription...');
       }};
 
-      checkoutConfig.on_failure = function (error) {{
+      checkoutConfig.on_failure = async function (error) {{
         var message = (error && (error.message || error.toString())) || 'Payment failed. Please review the entered details and try again.';
         setStatus(message);
       }};
