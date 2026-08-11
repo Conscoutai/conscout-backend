@@ -1355,7 +1355,7 @@ def _checkout_page(session_doc: dict[str, Any]) -> str:
         setStatus(message);
       }};
 
-      checkoutConfig.on_redirect = function (url) {{
+      checkoutConfig.on_redirect = async function (url) {{
         setStatus('Redirecting to secure bank or wallet confirmation...');
         if (url) {{
           window.location.assign(url);
