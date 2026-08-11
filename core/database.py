@@ -6,7 +6,7 @@ from __future__ import annotations
 from pymongo import MongoClient
 
 from core.auth_context import merge_owner_filter, stamp_owned_document
-from core.config import MONGO_URI, DB_NAME
+from core.config import ADMIN_DB_NAME, DB_NAME, MONGO_URI
 
 
 class ScopedCollection:
@@ -73,17 +73,33 @@ class ScopedCollection:
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
+admin_db = client[ADMIN_DB_NAME]
 
 raw_floorplans_collection = db["sites"]
 raw_tours_collection = db["tours"]
 raw_work_schedules_collection = db["work_schedules"]
 raw_users_collection = db["users"]
+raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
 raw_notifications_collection = db["notifications"]
 raw_notification_devices_collection = db["notification_devices"]
 raw_subscription_requests_collection = db["subscription_requests"]
 raw_subscription_checkout_sessions_collection = db["subscription_checkout_sessions"]
 raw_subscription_payments_collection = db["subscription_payments"]
+
+
+def ensure_admin_directory_indexes() -> None:
+    """Create the indexes required by the isolated administrator directory."""
+    raw_admins_collection.create_index("email", unique=True, name="unique_admin_email")
+    raw_admins_collection.create_index(
+        "user_id", unique=True, name="unique_admin_user_id"
+    )
+    raw_admins_collection.create_index(
+        "auth_sessions.access_token", sparse=True, name="admin_access_token"
+    )
+    raw_admins_collection.create_index(
+        "auth_sessions.refresh_token", sparse=True, name="admin_refresh_token"
+    )
 
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.

@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 from api.router import api_router
-from core.auth import ensure_default_user_and_migrate_legacy_data
 from core.config import (
     ALLOWED_ORIGINS,
     API_PORT,
@@ -20,6 +19,7 @@ from core.config import (
     APP_VERSION,
     DATA_DIR,
 )
+from core.database import ensure_admin_directory_indexes
 from services.progress.weekly_progress_notification_service import (
     ensure_weekly_progress_scheduler_started,
 )
@@ -45,23 +45,14 @@ app.add_middleware(
 
 app.include_router(api_router)
 
-# This migration belonged to the original shared database. It must be run only
-# as an explicit, one-time administrative operation, never when a new Lite
-# deployment starts.
-if os.getenv("ENABLE_LEGACY_BOOTSTRAP_MIGRATION", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}:
-    ensure_default_user_and_migrate_legacy_data()
-
 for directory in (DATA_DIR,):
     os.makedirs(directory, exist_ok=True)
 
 
 @app.on_event("startup")
 def startup_background_jobs():
+    if APP_SURFACE == "main":
+        ensure_admin_directory_indexes()
     ensure_weekly_progress_scheduler_started()
     ensure_subscription_billing_scheduler_started()
 

@@ -18,26 +18,28 @@ from core.auth import (
     ACCOUNT_ROLE_LITE_USER,
     ACCOUNT_ROLE_MAIN_USER,
     ACCOUNT_ROLE_SUPER_ADMIN,
-    SUBSCRIPTION_ADMIN_EMAIL,
+    ACCOUNT_ROLE_TECHNICAL_ADMIN,
 )
 from core.config import DB_NAME, LITE_ADMIN_DB_NAME
 from core.database import client
 
 
 def _role_for(document: dict, *, default_role: str) -> str:
-    email = str(document.get("email") or "").strip().lower()
-    if email == SUBSCRIPTION_ADMIN_EMAIL:
-        return ACCOUNT_ROLE_SUPER_ADMIN
     current = str(document.get("account_role") or "").strip().lower()
     if current in {
         ACCOUNT_ROLE_MAIN_USER,
         ACCOUNT_ROLE_LITE_USER,
         ACCOUNT_ROLE_ADMIN,
+        ACCOUNT_ROLE_TECHNICAL_ADMIN,
         ACCOUNT_ROLE_SUPER_ADMIN,
     }:
-        return current
+        return (
+            ACCOUNT_ROLE_TECHNICAL_ADMIN
+            if current == ACCOUNT_ROLE_ADMIN
+            else current
+        )
     if document.get("is_subscription_admin") is True:
-        return ACCOUNT_ROLE_ADMIN
+        return ACCOUNT_ROLE_TECHNICAL_ADMIN
     return default_role
 
 

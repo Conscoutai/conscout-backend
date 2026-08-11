@@ -13,18 +13,20 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from core.auth import (
-    ACCOUNT_ROLE_ADMIN,
     ACCOUNT_ROLE_LITE_USER,
     ACCOUNT_ROLE_MAIN_USER,
     _hash_password,
     account_role_for_user,
+    authenticate_admin_user,
     authenticate_user,
     change_user_password,
+    create_technical_admin,
     create_user,
     ensure_account_admin_access,
     ensure_super_admin_user,
     ensure_user_allowed_for_app,
     ensure_subscription_admin_user,
+    find_account_by_user_id,
     normalize_user_role,
     refresh_user_session,
     require_authenticated_user,
@@ -42,7 +44,7 @@ from core.config import (
     GOOGLE_OAUTH_HOSTED_DOMAIN,
     LITE_ADMIN_DB_NAME,
 )
-from core.database import client, raw_users_collection
+from core.database import client, raw_admins_collection, raw_users_collection
 from services.account_deletion_service import delete_user_account
 
 
@@ -186,7 +188,8 @@ def _admin_directory_user_payload(user: dict, *, app_name: str) -> dict:
         "account_role": account_role,
         "account_status": str(user.get("account_status") or "active").strip().lower()
         or "active",
-        "is_subscription_admin": account_role in {"admin", "super_admin"},
+        "is_subscription_admin": account_role
+        in {"admin", "technical_admin", "super_admin"},
         "app": app_name,
         "plan_name": plan_name or "Starter Access",
         "subscription_status": subscription_status,
@@ -381,12 +384,18 @@ def _finalize_auth_response(user: dict, *, app_name: str) -> dict:
 @router.post("/login")
 def login(payload: LoginRequest):
     app_name = _normalize_app(payload.app)
-    user = authenticate_user(payload.email, payload.password)
+    if payload.admin_access is not None:
+        if app_name != "main":
+            raise HTTPException(
+                status_code=400,
+                detail="Admin Console access uses the main API.",
+            )
+        user = authenticate_admin_user(payload.email, payload.password)
+    else:
+        user = authenticate_user(payload.email, payload.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     if payload.admin_access is not None:
-        if app_name != "main":
-            raise HTTPException(status_code=400, detail="Admin Console access uses the main API.")
         ensure_account_admin_access(user, required_role=payload.admin_access)
     return _finalize_auth_response(user, app_name=app_name)
 
@@ -560,7 +569,7 @@ def refresh_session(payload: RefreshSessionRequest):
 
 @router.get("/me")
 def me(current_user: AuthenticatedUser = Depends(require_authenticated_user)):
-    user = raw_users_collection.find_one({"user_id": current_user.user_id})
+    user = find_account_by_user_id(current_user.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     return {"user": sanitize_user_payload(user)}
@@ -606,7 +615,7 @@ def create_subscription_admin(
     payload: CreateAdminRequest,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
-    """Create an additional administrator for the web subscription console."""
+    """Create a Technical Admin in the dedicated administrator directory."""
     ensure_super_admin_user(current_user)
     if APP_SURFACE != "main":
         raise HTTPException(
@@ -621,29 +630,110 @@ def create_subscription_admin(
             detail="Password must be at least 8 characters.",
         )
 
-    admin = create_user(
+    admin = create_technical_admin(
         name=payload.name,
         email=payload.email,
         password=payload.password,
-        role="admin",
-        account_role=ACCOUNT_ROLE_ADMIN,
-        allowed_apps=["main"],
     )
-    raw_users_collection.update_one(
+    return {
+        "message": "Technical Admin created successfully.",
+        "admin": sanitize_user_payload(admin),
+    }
+
+
+@router.get("/admins")
+def list_administrator_accounts(
+    limit: int = Query(default=500, ge=1, le=500),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    """List accounts in the isolated administrator directory."""
+    ensure_subscription_admin_user(current_user)
+    admins = list(
+        raw_admins_collection.find(
+            {},
+            {
+                "_id": 0,
+                "user_id": 1,
+                "email": 1,
+                "name": 1,
+                "workspace": 1,
+                "role": 1,
+                "account_role": 1,
+                "is_subscription_admin": 1,
+                "account_status": 1,
+                "created_at": 1,
+                "last_login_at": 1,
+                "last_login_app": 1,
+            },
+        )
+        .sort([("created_at", -1), ("email", 1)])
+        .limit(limit)
+    )
+    return {
+        "app": "main",
+        "admins": [
+            _admin_directory_user_payload(admin, app_name="main")
+            for admin in admins
+        ],
+        "count": len(admins),
+    }
+
+
+def _technical_admin_or_404(user_id: str) -> dict:
+    admin = raw_admins_collection.find_one({"user_id": user_id.strip()})
+    if not admin:
+        raise HTTPException(status_code=404, detail="Technical Admin was not found.")
+    if account_role_for_user(admin) == "super_admin":
+        raise HTTPException(
+            status_code=403,
+            detail="The Super Admin account cannot be managed from this action.",
+        )
+    return admin
+
+
+@router.post("/admins/{user_id}/deactivate")
+def deactivate_technical_admin(
+    user_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_super_admin_user(current_user)
+    admin = _technical_admin_or_404(user_id)
+    now = int(time.time() * 1000)
+    raw_admins_collection.update_one(
         {"_id": admin["_id"]},
         {
             "$set": {
-                "is_subscription_admin": True,
-                "account_role": ACCOUNT_ROLE_ADMIN,
-                "updated_at": int(time.time() * 1000),
+                "account_status": "deactivated",
+                "deactivated_at": now,
+                "updated_at": now,
+                "session_token": "",
+                "auth_sessions": [],
             }
         },
     )
-    admin = raw_users_collection.find_one({"_id": admin["_id"]}) or admin
-    return {
-        "message": "Administrator created successfully.",
-        "admin": sanitize_user_payload(admin),
-    }
+    return {"message": "Technical Admin deactivated successfully."}
+
+
+@router.post("/admins/{user_id}/reactivate")
+def reactivate_technical_admin(
+    user_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_super_admin_user(current_user)
+    admin = _technical_admin_or_404(user_id)
+    now = int(time.time() * 1000)
+    raw_admins_collection.update_one(
+        {"_id": admin["_id"]},
+        {
+            "$set": {
+                "account_status": "active",
+                "reactivated_at": now,
+                "updated_at": now,
+            },
+            "$unset": {"deactivated_at": ""},
+        },
+    )
+    return {"message": "Technical Admin reactivated successfully."}
 
 
 @router.get("/admin/access")
@@ -666,7 +756,11 @@ def _managed_customer_or_404(collection, user_id: str) -> dict:
     user = collection.find_one({"user_id": user_id.strip()})
     if not user:
         raise HTTPException(status_code=404, detail="User account was not found.")
-    if account_role_for_user(user) in {"admin", "super_admin"}:
+    if account_role_for_user(user) in {
+        "admin",
+        "technical_admin",
+        "super_admin",
+    }:
         raise HTTPException(
             status_code=403,
             detail="Admin Console accounts must be managed separately.",

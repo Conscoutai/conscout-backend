@@ -24,6 +24,7 @@ from core.config import (
     user_data_dir,
 )
 from core.database import (
+    raw_admins_collection,
     raw_floorplans_collection,
     raw_tours_collection,
     raw_users_collection,
@@ -31,20 +32,26 @@ from core.database import (
 )
 
 
-DEFAULT_BOOTSTRAP_EMAIL = "safwanc189@gmail.com"
-DEFAULT_BOOTSTRAP_PASSWORD = "1234567890"
-SUBSCRIPTION_ADMIN_EMAIL = "safwanc189@gmail.com"
 # ``role`` is kept for construction-project permissions (admin/stakeholder).
 # Console permissions are deliberately stored separately so customer accounts
 # never become Admin Console accounts merely because they can manage a project.
 ACCOUNT_ROLE_MAIN_USER = "main_user"
 ACCOUNT_ROLE_LITE_USER = "lite_user"
+# ``admin`` remains a supported access selector and legacy stored value.
+# Newly created non-superuser administrators use the explicit technical role.
 ACCOUNT_ROLE_ADMIN = "admin"
+ACCOUNT_ROLE_TECHNICAL_ADMIN = "technical_admin"
 ACCOUNT_ROLE_SUPER_ADMIN = "super_admin"
 ACCOUNT_ROLES = {
     ACCOUNT_ROLE_MAIN_USER,
     ACCOUNT_ROLE_LITE_USER,
     ACCOUNT_ROLE_ADMIN,
+    ACCOUNT_ROLE_TECHNICAL_ADMIN,
+    ACCOUNT_ROLE_SUPER_ADMIN,
+}
+ADMIN_ACCOUNT_ROLES = {
+    ACCOUNT_ROLE_ADMIN,
+    ACCOUNT_ROLE_TECHNICAL_ADMIN,
     ACCOUNT_ROLE_SUPER_ADMIN,
 }
 # ``APP_SURFACE`` is set by the server deployment and is the authoritative
@@ -99,6 +106,12 @@ def _resolve_accessible_floorplans_for_user(user: dict) -> list[dict]:
 
 
 def _build_user_access_payload(user: dict) -> dict:
+    if account_role_for_user(user) in ADMIN_ACCOUNT_ROLES:
+        return {
+            "role": "admin",
+            "accessible_project_names": [],
+            "accessible_floorplan_ids": [],
+        }
     accessible_floorplans = _resolve_accessible_floorplans_for_user(user)
     accessible_projects = sorted(
         {
@@ -131,11 +144,9 @@ def normalize_user_role(value: Optional[str]) -> str:
 def default_account_role(
     *, email: str = "", is_subscription_admin: bool = False
 ) -> str:
-    normalized_email = str(email or "").strip().lower()
-    if normalized_email == SUBSCRIPTION_ADMIN_EMAIL:
-        return ACCOUNT_ROLE_SUPER_ADMIN
+    del email
     if is_subscription_admin:
-        return ACCOUNT_ROLE_ADMIN
+        return ACCOUNT_ROLE_TECHNICAL_ADMIN
     return ACCOUNT_ROLE_LITE_USER if APP_SURFACE == "lite" else ACCOUNT_ROLE_MAIN_USER
 
 
@@ -146,6 +157,8 @@ def normalize_account_role(
     is_subscription_admin: bool = False,
 ) -> str:
     normalized = str(value or "").strip().lower()
+    if normalized == ACCOUNT_ROLE_ADMIN:
+        return ACCOUNT_ROLE_TECHNICAL_ADMIN
     if normalized in ACCOUNT_ROLES:
         return normalized
     return default_account_role(
@@ -176,13 +189,17 @@ def ensure_user_account_active(user: dict) -> None:
 
 def ensure_account_admin_access(user: dict, *, required_role: str = "admin") -> str:
     requested = str(required_role or "admin").strip().lower()
-    if requested not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
+    if requested not in {
+        ACCOUNT_ROLE_ADMIN,
+        ACCOUNT_ROLE_TECHNICAL_ADMIN,
+        ACCOUNT_ROLE_SUPER_ADMIN,
+    }:
         raise HTTPException(
             status_code=400, detail="Invalid Admin Console access type."
         )
 
     account_role = account_role_for_user(user)
-    if account_role not in {ACCOUNT_ROLE_ADMIN, ACCOUNT_ROLE_SUPER_ADMIN}:
+    if account_role not in ADMIN_ACCOUNT_ROLES:
         raise HTTPException(
             status_code=403,
             detail="This account is not authorized for the Admin Console.",
@@ -235,7 +252,7 @@ def ensure_subscription_admin_user(
     *,
     required_role: str = "admin",
 ) -> str:
-    stored_user = raw_users_collection.find_one(
+    stored_user = raw_admins_collection.find_one(
         {"user_id": user.user_id},
         {"email": 1, "account_role": 1, "is_subscription_admin": 1},
     )
@@ -248,6 +265,26 @@ def ensure_subscription_admin_user(
 
 def ensure_super_admin_user(user: AuthenticatedUser) -> None:
     ensure_subscription_admin_user(user, required_role=ACCOUNT_ROLE_SUPER_ADMIN)
+
+
+def _account_collection_for_user(user: dict):
+    if account_role_for_user(user) in ADMIN_ACCOUNT_ROLES:
+        return raw_admins_collection
+    return raw_users_collection
+
+
+def find_account_by_user_id(user_id: str) -> Optional[dict]:
+    normalized_user_id = user_id.strip()
+    if not normalized_user_id:
+        return None
+    return raw_admins_collection.find_one(
+        {"user_id": normalized_user_id}
+    ) or raw_users_collection.find_one({"user_id": normalized_user_id})
+
+
+def _find_account_by_session(field: str, token: str) -> Optional[dict]:
+    query = {field: token}
+    return raw_admins_collection.find_one(query) or raw_users_collection.find_one(query)
 
 
 def _hash_password(password: str, *, salt: Optional[str] = None) -> str:
@@ -354,8 +391,9 @@ def _save_auth_sessions(
         update_fields["last_login_at"] = resolved_login_at
     if app_name and record_login:
         update_fields["last_login_app"] = app_name
-    raw_users_collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
-    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+    collection = _account_collection_for_user(user)
+    collection.update_one({"_id": user["_id"]}, {"$set": update_fields})
+    return collection.find_one({"_id": user["_id"]}) or user
 
 
 def _find_session_by_access_token(user: dict, token: str) -> Optional[dict]:
@@ -370,44 +408,6 @@ def _find_session_by_refresh_token(user: dict, token: str) -> Optional[dict]:
         if session.get("refresh_token") == token:
             return session
     return None
-
-
-def bootstrap_default_user() -> dict:
-    existing = raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL})
-    if existing:
-        raw_users_collection.update_one(
-            {"_id": existing["_id"]},
-            {
-                "$set": {
-                    "name": "Conscout Admin",
-                    "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
-                    "role": "admin",
-                    "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
-                    "updated_at": _now_ms(),
-                }
-            },
-        )
-        return (
-            raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL})
-            or existing
-        )
-
-    now = _now_ms()
-    doc = {
-        "user_id": uuid.uuid4().hex,
-        "email": DEFAULT_BOOTSTRAP_EMAIL,
-        "name": "Conscout Admin",
-        "password_hash": _hash_password(DEFAULT_BOOTSTRAP_PASSWORD),
-        "role": "admin",
-        "allowed_apps": DEFAULT_ALLOWED_APPS.copy(),
-        "session_token": "",
-        "auth_sessions": [],
-        "last_login_at": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    raw_users_collection.insert_one(doc)
-    return raw_users_collection.find_one({"email": DEFAULT_BOOTSTRAP_EMAIL}) or doc
 
 
 def migrate_legacy_data_to_default_user(default_user: dict) -> None:
@@ -515,12 +515,6 @@ def migrate_legacy_files_to_user_folders() -> None:
         _merge_directory_contents(source_dir, target_dir)
 
 
-def ensure_default_user_and_migrate_legacy_data() -> None:
-    default_user = bootstrap_default_user()
-    migrate_legacy_data_to_default_user(default_user)
-    migrate_legacy_files_to_user_folders()
-
-
 def authenticate_user(email: str, password: str) -> Optional[dict]:
     user = raw_users_collection.find_one({"email": email.strip().lower()})
     if not user:
@@ -528,6 +522,17 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
     if not verify_password(password, user.get("password_hash", "")):
         return None
     ensure_user_account_active(user)
+    return user
+
+
+def authenticate_admin_user(email: str, password: str) -> Optional[dict]:
+    user = raw_admins_collection.find_one({"email": email.strip().lower()})
+    if not user:
+        return None
+    if not verify_password(password, user.get("password_hash", "")):
+        return None
+    ensure_user_account_active(user)
+    ensure_account_admin_access(user)
     return user
 
 
@@ -572,10 +577,41 @@ def create_user(
     return raw_users_collection.find_one({"email": normalized_email}) or doc
 
 
+def create_technical_admin(*, name: str, email: str, password: str) -> dict:
+    normalized_email = email.strip().lower()
+    if raw_admins_collection.find_one({"email": normalized_email}):
+        raise HTTPException(
+            status_code=409,
+            detail="An administrator with this email already exists.",
+        )
+
+    now = _now_ms()
+    doc = {
+        "user_id": uuid.uuid4().hex,
+        "email": normalized_email,
+        "name": name.strip(),
+        "workspace": "ConScout Administration",
+        "password_hash": _hash_password(password),
+        "role": "admin",
+        "account_role": ACCOUNT_ROLE_TECHNICAL_ADMIN,
+        "admin_type": ACCOUNT_ROLE_TECHNICAL_ADMIN,
+        "is_subscription_admin": True,
+        "account_status": "active",
+        "allowed_apps": ["main"],
+        "session_token": "",
+        "auth_sessions": [],
+        "last_login_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    raw_admins_collection.insert_one(doc)
+    return raw_admins_collection.find_one({"email": normalized_email}) or doc
+
+
 def change_user_password(
     *, user_id: str, current_password: str, new_password: str
 ) -> dict:
-    user = raw_users_collection.find_one({"user_id": user_id.strip()})
+    user = find_account_by_user_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     if not verify_password(current_password, user.get("password_hash", "")):
@@ -583,7 +619,8 @@ def change_user_password(
 
     now = _now_ms()
     new_hash = _hash_password(new_password)
-    raw_users_collection.update_one(
+    collection = _account_collection_for_user(user)
+    collection.update_one(
         {"_id": user["_id"]},
         {
             "$set": {
@@ -592,7 +629,7 @@ def change_user_password(
             }
         },
     )
-    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+    return collection.find_one({"_id": user["_id"]}) or user
 
 
 def update_user_profile(
@@ -609,7 +646,7 @@ def update_user_profile(
     if not resolved_name:
         raise HTTPException(status_code=400, detail="Name is required.")
 
-    user = raw_users_collection.find_one({"user_id": normalized_user_id})
+    user = find_account_by_user_id(normalized_user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
@@ -620,11 +657,12 @@ def update_user_profile(
     if workspace is not None:
         update_fields["workspace"] = workspace.strip()
 
-    raw_users_collection.update_one(
+    collection = _account_collection_for_user(user)
+    collection.update_one(
         {"_id": user["_id"]},
         {"$set": update_fields},
     )
-    return raw_users_collection.find_one({"_id": user["_id"]}) or user
+    return collection.find_one({"_id": user["_id"]}) or user
 
 
 def reset_user_password_by_email(*, email: str, new_password: str) -> dict:
@@ -685,8 +723,8 @@ def refresh_user_session(refresh_token: str, *, app_name: Optional[str] = None) 
     if not normalized_refresh_token:
         raise HTTPException(status_code=401, detail="Refresh token is required.")
 
-    user = raw_users_collection.find_one(
-        {"auth_sessions.refresh_token": normalized_refresh_token}
+    user = _find_account_by_session(
+        "auth_sessions.refresh_token", normalized_refresh_token
     )
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token.")
@@ -747,14 +785,14 @@ def revoke_user_session(
 
     user = None
     if normalized_access:
-        user = raw_users_collection.find_one(
-            {"auth_sessions.access_token": normalized_access}
+        user = _find_account_by_session(
+            "auth_sessions.access_token", normalized_access
         )
         if not user:
-            user = raw_users_collection.find_one({"session_token": normalized_access})
+            user = _find_account_by_session("session_token", normalized_access)
     if user is None and normalized_refresh:
-        user = raw_users_collection.find_one(
-            {"auth_sessions.refresh_token": normalized_refresh}
+        user = _find_account_by_session(
+            "auth_sessions.refresh_token", normalized_refresh
         )
     if not user:
         return
@@ -833,7 +871,7 @@ async def require_authenticated_user(
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required.")
 
-    user = raw_users_collection.find_one({"auth_sessions.access_token": token})
+    user = _find_account_by_session("auth_sessions.access_token", token)
     if user:
         ensure_user_account_active(user)
         session = _find_session_by_access_token(user, token)
@@ -862,7 +900,7 @@ async def require_authenticated_user(
                 reset_current_user(context_token)
             return
 
-    user = raw_users_collection.find_one({"session_token": token})
+    user = _find_account_by_session("session_token", token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session token.")
     ensure_user_account_active(user)

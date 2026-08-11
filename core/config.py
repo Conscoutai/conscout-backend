@@ -321,6 +321,10 @@ def tour_comments_dir(
 # ---------------------------------------------------------
 MONGO_URI = _required_env("MONGO_URI")
 DB_NAME = _env("DB_NAME", "construction_ai")
+# Admin identities and sessions are isolated from both product databases.
+# The main API is the only deployment that exposes the Admin Console, but the
+# directory lives in the same dedicated database for every environment.
+ADMIN_DB_NAME = _env("ADMIN_DB_NAME", "construction_ai_admin")
 # The Main API uses this only for the protected subscription-admin directory.
 # Both product databases live on the same MongoDB cluster, while user-facing
 # product endpoints remain strictly isolated by APP_SURFACE.
