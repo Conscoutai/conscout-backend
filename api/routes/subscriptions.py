@@ -1355,8 +1355,11 @@ def _checkout_page(session_doc: dict[str, Any]) -> str:
         setStatus(message);
       }};
 
-      checkoutConfig.on_redirect = function () {{
+      checkoutConfig.on_redirect = function (url) {{
         setStatus('Redirecting to secure bank or wallet confirmation...');
+        if (url) {{
+          window.location.assign(url);
+        }}
       }};
 
       if (!window.Moyasar || typeof window.Moyasar.init !== 'function') {{
