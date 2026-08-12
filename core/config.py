@@ -87,6 +87,7 @@ TOURS_DIR = _env("TOURS_DIR", os.path.join(DATA_DIR, "tours"))
 SITE_FLOORPLAN_DIRNAME = _env("SITE_FLOORPLAN_DIRNAME", "floorplan")
 SITE_DXF_DIRNAME = _env("SITE_DXF_DIRNAME", "dxf")
 SITE_BASELINE_DIRNAME = _env("SITE_BASELINE_DIRNAME", "baseline")
+SITE_ZONE_PLAN_DIRNAME = _env("SITE_ZONE_PLAN_DIRNAME", "zone-plans")
 DEFAULT_SITE_NAME = _env("DEFAULT_SITE_NAME", "site_unknown")
 
 TOUR_RAW_DIRNAME = _env("TOUR_RAW_DIRNAME", "raw")
@@ -214,6 +215,12 @@ def site_baseline_dir(site_name: str, *, owner_email: Optional[str] = None, owne
     return os.path.join(
         site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
         SITE_BASELINE_DIRNAME,
+    )
+
+def site_zone_plan_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
+        SITE_ZONE_PLAN_DIRNAME,
     )
 
 def tour_dir(

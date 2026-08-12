@@ -23,14 +23,21 @@ from services.subscription_access_service import (
     release_lite_project_creation,
     reserve_lite_project_creation,
 )
-from services.progress.work_schedule.baseline_service import import_schedule_baseline
+from services.progress.work_schedule.baseline_service import (
+    import_schedule_baseline,
+    import_schedule_zone_plan,
+)
+from services.progress.work_schedule.zone_plan_parser import (
+    ZonePlanParseError,
+    parse_zone_plan_pdf,
+)
 
 
 router = APIRouter(tags=["Floorplans"])
 
 # Creates a project floorplan upload. Project names are display labels and are
 # deliberately not used as identifiers: duplicate names are valid.
-# Accepts calibration points, optional DXF zip, optional site config JSON, optional baseline XER.
+# Accepts calibration points, optional DXF zip, site config, baseline XER and zone-plan PDF.
 # Triggers floorplan creation + optional DXF processing + optional config attach.
 
 
@@ -84,6 +91,7 @@ async def create_project_floorplan(
     dxf_zip: Optional[UploadFile] = File(None),
     site_config: Optional[UploadFile] = File(None),
     baseline_xer: Optional[UploadFile] = File(None),
+    zone_plan_pdf: Optional[UploadFile] = File(None),
     capture_mode: Literal["outdoor", "indoor"] = Form("outdoor"),
     currency_code: Optional[str] = Form(None),
     currency: Optional[str] = Form(None),
@@ -137,6 +145,20 @@ async def create_project_floorplan(
             baseline_xer_bytes,
         )
 
+    zone_plan_bytes = None
+    zone_plan_name = None
+    if zone_plan_pdf:
+        if not zone_plan_pdf.filename or not zone_plan_pdf.filename.lower().endswith(
+            ".pdf"
+        ):
+            raise HTTPException(400, "Zone plan must be a .pdf file")
+        zone_plan_bytes = await zone_plan_pdf.read()
+        zone_plan_name = zone_plan_pdf.filename
+        try:
+            parse_zone_plan_pdf(zone_plan_bytes, filename=zone_plan_name)
+        except ZonePlanParseError as error:
+            raise HTTPException(422, str(error)) from error
+
     result = create_floorplan(
         file=file,
         name=name,
@@ -173,6 +195,13 @@ async def create_project_floorplan(
             filename=baseline_xer_name,
             raw_bytes=baseline_xer_bytes,
             activate=True,
+        )
+
+    if zone_plan_bytes is not None and zone_plan_name:
+        result["schedule_zone_import"] = import_schedule_zone_plan(
+            project_ref=effective_project_id,
+            filename=zone_plan_name,
+            raw_bytes=zone_plan_bytes,
         )
 
     return result

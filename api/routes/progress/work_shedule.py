@@ -24,6 +24,7 @@ from services.progress.work_schedule.baseline_service import (
     activate_schedule_baseline,
     get_schedule_baseline,
     import_schedule_baseline,
+    import_schedule_zone_plan,
     list_schedule_baselines,
     get_schedule_zones,
     update_schedule_zones,
@@ -330,6 +331,21 @@ def project_schedule_zones(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     return get_schedule_zones(project_id)
+
+
+@router.post("/projects/{project_id}/schedule-zones/import")
+async def import_project_schedule_zones(
+    project_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    filename = file.filename or "zone-plan.pdf"
+    return import_schedule_zone_plan(
+        project_ref=project_id,
+        filename=filename,
+        raw_bytes=await file.read(),
+    )
 
 
 @router.put("/projects/{project_id}/schedule-zones")

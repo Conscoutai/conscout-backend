@@ -19,10 +19,11 @@ from core.database import (
     schedule_progress_snapshots_collection,
     schedule_relationships_collection,
 )
-from core.config import site_baseline_dir
+from core.config import site_baseline_dir, site_zone_plan_dir
 
 from .pdf_parser import PdfScheduleParseError, parse_pdf_schedule
 from .xer_parser import XerParseError, parse_xer
+from .zone_plan_parser import ZonePlanParseError, parse_zone_plan_pdf
 
 
 def project_filter(project_ref: str) -> dict[str, Any]:
@@ -351,6 +352,132 @@ def get_schedule_zones(project_ref: str) -> dict[str, Any]:
         "floorplan_id": project_context["floorplan_id"],
         "bounds": project.get("bounds") or {},
         "zones": project.get("schedule_zones") or [],
+        "zone_plan": project.get("schedule_zone_plan") or {},
+    }
+
+
+def import_schedule_zone_plan(
+    *, project_ref: str, filename: str, raw_bytes: bytes
+) -> dict[str, Any]:
+    project_context = resolve_project(project_ref)
+    project = project_context["document"]
+    project_id = project_context["project_id"]
+    safe_filename = Path(filename or "zone-plan.pdf").name
+    if Path(safe_filename).suffix.lower() != ".pdf":
+        raise HTTPException(400, "Zone plan must be a PDF file")
+
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    existing_plan = project.get("schedule_zone_plan") or {}
+    if (
+        isinstance(existing_plan, dict)
+        and existing_plan.get("source_sha256") == digest
+        and project.get("schedule_zones")
+    ):
+        return {
+            "status": "already_imported",
+            "project_id": project_id,
+            "floorplan_id": project_context["floorplan_id"],
+            "zone_plan": existing_plan,
+            "zones": project.get("schedule_zones") or [],
+            "summary": existing_plan.get("summary") or {},
+            "warnings": existing_plan.get("warnings") or [],
+            "activity_mapping": existing_plan.get("activity_mapping") or {},
+        }
+
+    try:
+        parsed = parse_zone_plan_pdf(
+            raw_bytes,
+            filename=safe_filename,
+            floorplan_bounds=project.get("bounds") or {},
+        )
+    except ZonePlanParseError as error:
+        raise HTTPException(422, str(error)) from error
+
+    now = datetime.now(timezone.utc)
+    version = int(existing_plan.get("version") or 0) + 1
+    zone_plan_id = f"zoneplan_{uuid4().hex}"
+    zone_directory = site_zone_plan_dir(project_id)
+    os.makedirs(zone_directory, exist_ok=True)
+    stored_filename = f"v{version}_{zone_plan_id}_{safe_filename}"
+    stored_path = os.path.join(zone_directory, stored_filename)
+    with open(stored_path, "wb") as zone_file:
+        zone_file.write(raw_bytes)
+
+    zones = [
+        {**zone, "updated_at": now}
+        for zone in parsed.get("zones") or []
+        if isinstance(zone, dict)
+    ]
+    zone_names = [str(zone.get("name") or "") for zone in zones]
+    mapped_baseline = schedule_baselines_collection.find_one(
+        {"project_id": project_id, "is_active": True},
+        sort=[("version", -1)],
+    ) or schedule_baselines_collection.find_one(
+        {"project_id": project_id}, sort=[("version", -1)]
+    )
+    activity_filter: dict[str, Any] = {
+        "baseline_id": str((mapped_baseline or {}).get("baseline_id") or "")
+    }
+    matched_activities = schedule_activities_collection.count_documents(
+        {**activity_filter, "zone": {"$in": zone_names}}
+    )
+    total_activities = schedule_activities_collection.count_documents(
+        activity_filter
+    )
+    activity_mapping = {
+        "baseline_id": activity_filter["baseline_id"],
+        "matched_activity_count": matched_activities,
+        "total_activity_count": total_activities,
+        "unmapped_activity_count": max(total_activities - matched_activities, 0),
+    }
+    zone_plan = {
+        "zone_plan_id": zone_plan_id,
+        "version": version,
+        "source_filename": safe_filename,
+        "source_url": f"/sites/{project_id}/zone-plans/{stored_filename}",
+        "source_sha256": digest,
+        "source_type": parsed.get("source_type") or "zone_plan_pdf",
+        "page_count": parsed.get("page_count") or 1,
+        "page_index": parsed.get("page_index") or 0,
+        "page_width": parsed.get("page_width"),
+        "page_height": parsed.get("page_height"),
+        "orientation": parsed.get("orientation") or "",
+        "summary": parsed.get("summary") or {},
+        "warnings": parsed.get("warnings") or [],
+        "activity_mapping": activity_mapping,
+        "uploaded_at": now,
+    }
+
+    try:
+        result = floorplans_collection.update_many(
+            project_filter(project_ref),
+            {
+                "$set": {
+                    "schedule_zones": zones,
+                    "schedule_zones_updated_at": now,
+                    "schedule_zone_plan": zone_plan,
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.matched_count == 0:
+            raise HTTPException(404, "Project not found")
+    except Exception:
+        try:
+            os.remove(stored_path)
+        except OSError:
+            pass
+        raise
+
+    return {
+        "status": "imported",
+        "project_id": project_id,
+        "floorplan_id": project_context["floorplan_id"],
+        "zone_plan": zone_plan,
+        "zones": zones,
+        "summary": zone_plan["summary"],
+        "warnings": zone_plan["warnings"],
+        "activity_mapping": activity_mapping,
     }
 
 

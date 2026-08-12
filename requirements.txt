@@ -11,6 +11,8 @@ ezdxf
 exif
 pdf2image
 pypdf
+pypdfium2
+pytesseract
 pyproj
 python-multipart
 requests
