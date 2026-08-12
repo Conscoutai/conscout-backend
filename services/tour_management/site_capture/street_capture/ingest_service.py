@@ -6,6 +6,7 @@ import shutil
 import time
 import uuid
 import math
+from datetime import datetime, timezone
 from typing import Optional
 
 from exif import Image as ExifImage
@@ -65,6 +66,21 @@ def _is_valid_lat_lon(lat, lon) -> bool:
     if abs(float(lat)) < 1e-9 and abs(float(lon)) < 1e-9:
         return False
     return True
+
+
+def _normalized_capture_timestamp(value) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _is_valid_yaw(value) -> bool:
@@ -268,6 +284,19 @@ def upload_streetview_image(
         x = max(0, min(x, floorplan["bounds"]["width"]))
         y = max(0, min(y, floorplan["bounds"]["height"]))
 
+    uploaded_at = datetime.now(timezone.utc).isoformat()
+    captured_at_value = _normalized_capture_timestamp(
+        captured_at or metadata.get("capturedAt") or metadata.get("captured_at")
+    )
+    project_id = str(
+        floorplan.get("project_id")
+        or floorplan.get("id")
+        or floorplan.get("dxf_project_id")
+        or ""
+    ).strip()
+    schedule_zone = str(
+        metadata.get("zone") or metadata.get("schedule_zone") or ""
+    ).strip()
     node = {
         "id": node_id,
         "tour_id": tour_id,
@@ -291,15 +320,40 @@ def upload_streetview_image(
         "object_counts": {},
         "camera_yaw": yaw,
         "comments": [],
-        "captured_at": captured_at or metadata.get("capturedAt"),
+        "captured_at": captured_at_value,
+        "uploaded_at": uploaded_at,
+        "schedule_zone": schedule_zone,
+        "metadata": {
+            "capturedAt": captured_at_value,
+            "latitude": lat,
+            "longitude": lon,
+            "zone": schedule_zone,
+            "source_filename": image.filename or "",
+        },
     }
 
     if existing:
-        update_set = {"storage_key": storage_key}
+        update_set = {
+            "storage_key": storage_key,
+            "project_id": project_id,
+            "uploaded_at": uploaded_at,
+            "status": existing.get("status") or "uploading",
+        }
         if site_name:
             update_set["site_name"] = site_name
         if not existing.get("name") and tour_name:
             update_set["name"] = tour_name
+        if captured_at_value:
+            existing_start = _normalized_capture_timestamp(
+                existing.get("capture_started_at")
+            )
+            existing_end = _normalized_capture_timestamp(existing.get("capture_ended_at"))
+            update_set["capture_started_at"] = min(
+                [value for value in (existing_start, captured_at_value) if value]
+            )
+            update_set["capture_ended_at"] = max(
+                [value for value in (existing_end, captured_at_value) if value]
+            )
         tours_collection.update_one(
             {"tour_id": tour_id},
             {"$set": update_set, "$push": {"nodes": node}}
@@ -311,7 +365,12 @@ def upload_streetview_image(
             "name": tour_name,
             "storage_key": storage_key,
             "site_name": site_name,
+            "project_id": project_id,
             "created_at": int(time.time() * 1000),
+            "uploaded_at": uploaded_at,
+            "capture_started_at": captured_at_value,
+            "capture_ended_at": captured_at_value,
+            "status": "uploading",
             "nodes": [node],
         })
 

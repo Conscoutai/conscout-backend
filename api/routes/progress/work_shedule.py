@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from pydantic import BaseModel, Field, validator
 
 from core.auth import ensure_admin_user, require_authenticated_user
@@ -16,6 +16,23 @@ from services.progress.work_schedule.work_schedule_notification_service import (
 )
 from services.progress.prediction_notification_service import (
     sync_prediction_notifications as sync_prediction_notifications_service,
+)
+from services.progress.work_schedule.analytics_service import (
+    baseline_comparison_or_404,
+)
+from services.progress.work_schedule.baseline_service import (
+    activate_schedule_baseline,
+    get_schedule_baseline,
+    import_schedule_baseline,
+    list_schedule_baselines,
+    get_schedule_zones,
+    update_schedule_zones,
+    update_activity_mapping,
+)
+from services.progress.work_schedule.evidence_service import (
+    analyze_tour_schedule,
+    review_schedule_evidence,
+    record_manual_activity_progress,
 )
 
 router = APIRouter(tags=["WorkSchedule"])
@@ -108,6 +125,45 @@ class WorkScheduleNotificationSyncRequest(BaseModel):
         return value.strip()
 
 
+class ScheduleActivityMappingRequest(BaseModel):
+    zone: Optional[str] = None
+    work_category: Optional[str] = None
+    photo_trackable: Optional[bool] = None
+    planned_quantity: Optional[float] = Field(None, ge=0)
+    quantity_unit: Optional[str] = None
+    weight: Optional[float] = Field(None, ge=0)
+    weight_source: Optional[str] = None
+    mapping_status: Optional[str] = None
+
+
+class ScheduleEvidenceReviewRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    approved_percent: Optional[float] = Field(None, ge=0, le=100)
+    verified_quantity: Optional[float] = Field(None, ge=0)
+    note: str = ""
+
+
+class ScheduleZonePoint(BaseModel):
+    x: float
+    y: float
+
+
+class ScheduleZonePayload(BaseModel):
+    name: str
+    points: List[ScheduleZonePoint]
+
+
+class ScheduleZonesRequest(BaseModel):
+    zones: List[ScheduleZonePayload]
+
+
+class ManualActivityProgressRequest(BaseModel):
+    observed_at: str
+    approved_percent: Optional[float] = Field(None, ge=0, le=100)
+    verified_quantity: Optional[float] = Field(None, ge=0)
+    note: str = ""
+
+
 # Saves a work schedule (manual/csv source with activities).
 @router.post("/work-schedules")
 def save_work_schedule(
@@ -167,4 +223,143 @@ def sync_work_schedule_notifications(
     return sync_schedule_delay_notifications_service(
         project_id=payload.project_id,
         current_user=current_user,
+    )
+
+
+@router.post("/projects/{project_id}/schedule-baselines")
+async def upload_schedule_baseline(
+    project_id: str,
+    file: UploadFile = File(...),
+    timezone_name: str = Form("UTC", alias="timezone"),
+    activate: bool = Form(False),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    filename = file.filename or "baseline.xer"
+    return import_schedule_baseline(
+        project_ref=project_id,
+        filename=filename,
+        raw_bytes=await file.read(),
+        timezone_name=timezone_name,
+        activate=activate,
+    )
+
+
+@router.get("/projects/{project_id}/schedule-baselines")
+def project_schedule_baselines(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return list_schedule_baselines(project_id)
+
+
+@router.get("/schedule-baselines/{baseline_id}")
+def schedule_baseline_detail(
+    baseline_id: str,
+    include_activities: bool = True,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return get_schedule_baseline(
+        baseline_id=baseline_id, include_activities=include_activities
+    )
+
+
+@router.post("/projects/{project_id}/schedule-baselines/{baseline_id}/activate")
+def activate_project_schedule_baseline(
+    project_id: str,
+    baseline_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return activate_schedule_baseline(project_ref=project_id, baseline_id=baseline_id)
+
+
+@router.patch("/schedule-baselines/{baseline_id}/activities/{activity_id}/mapping")
+def patch_schedule_activity_mapping(
+    baseline_id: str,
+    activity_id: str,
+    payload: ScheduleActivityMappingRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return update_activity_mapping(
+        baseline_id=baseline_id,
+        activity_id=activity_id,
+        updates=payload.dict(exclude_none=True),
+    )
+
+
+@router.get("/projects/{project_id}/schedule-analytics")
+def project_schedule_analytics(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return baseline_comparison_or_404(project_id)
+
+
+@router.post("/tours/{tour_id}/schedule-analysis")
+def analyze_tour_against_schedule(
+    tour_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return analyze_tour_schedule(tour_id)
+
+
+@router.patch("/schedule-evidence/{evidence_id}")
+def review_activity_evidence(
+    evidence_id: str,
+    payload: ScheduleEvidenceReviewRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return review_schedule_evidence(
+        evidence_id=evidence_id,
+        decision=payload.decision,
+        approved_percent=payload.approved_percent,
+        verified_quantity=payload.verified_quantity,
+        review_note=payload.note,
+        reviewer_user_id=current_user.user_id,
+        reviewer_email=current_user.email,
+    )
+
+
+@router.get("/projects/{project_id}/schedule-zones")
+def project_schedule_zones(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return get_schedule_zones(project_id)
+
+
+@router.put("/projects/{project_id}/schedule-zones")
+def put_project_schedule_zones(
+    project_id: str,
+    payload: ScheduleZonesRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return update_schedule_zones(
+        project_ref=project_id,
+        zones=[zone.dict() for zone in payload.zones],
+    )
+
+
+@router.post("/schedule-baselines/{baseline_id}/activities/{activity_id}/progress")
+def post_manual_activity_progress(
+    baseline_id: str,
+    activity_id: str,
+    payload: ManualActivityProgressRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return record_manual_activity_progress(
+        baseline_id=baseline_id,
+        activity_id=activity_id,
+        observed_at=payload.observed_at,
+        approved_percent=payload.approved_percent,
+        verified_quantity=payload.verified_quantity,
+        note=payload.note,
+        reviewer_user_id=current_user.user_id,
+        reviewer_email=current_user.email,
     )

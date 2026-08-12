@@ -23,6 +23,7 @@ from services.subscription_access_service import (
     release_lite_project_creation,
     reserve_lite_project_creation,
 )
+from services.progress.work_schedule.baseline_service import import_schedule_baseline
 
 
 router = APIRouter(tags=["Floorplans"])
@@ -123,15 +124,17 @@ async def create_project_floorplan(
 
     baseline_xer_url = None
     baseline_xer_name = None
+    baseline_xer_bytes = None
     if baseline_xer:
         if not baseline_xer.filename or not baseline_xer.filename.lower().endswith(
             ".xer"
         ):
             raise HTTPException(400, "Baseline file must be a .xer")
+        baseline_xer_bytes = await baseline_xer.read()
         baseline_xer_url, baseline_xer_name = save_baseline_xer(
             effective_project_id,
             baseline_xer.filename,
-            await baseline_xer.read(),
+            baseline_xer_bytes,
         )
 
     result = create_floorplan(
@@ -162,6 +165,14 @@ async def create_project_floorplan(
         floorplan_id = result.get("floorPlan", {}).get("id")
         upsert_floorplan_site_config(
             effective_project_id, parsed_site_config, floorplan_id
+        )
+
+    if baseline_xer_bytes is not None and baseline_xer_name:
+        result["schedule_baseline_import"] = import_schedule_baseline(
+            project_ref=effective_project_id,
+            filename=baseline_xer_name,
+            raw_bytes=baseline_xer_bytes,
+            activate=True,
         )
 
     return result

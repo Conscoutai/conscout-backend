@@ -12,13 +12,17 @@ def as_name_dict(names):
 
 def work_type_map():
     return {
-        # "Concrete Pore": ["asphalt_parking"],
         "painting": ["pedestrian_path", "cycle_path"],
         "paving_installation": ["concrete_paving_slabs"],
         "planting": ["shrubs", "palm", "tree", "tree_gates"],
-
-        # "Concreting": ["paint_patterns", "pedestrian_path"],
-        # "structural": ["street_light_poles", "seating_benches"],
+        "asphalt": ["asphalt", "asphalt_road", "asphalt_parking", "colored_asphalt"],
+        "curb_installation": ["curb", "kerb", "concrete_curb", "concrete_kerb"],
+        "street_lighting": ["street_light_pole", "street_light_poles", "light_pole"],
+        "furniture": ["seating_benches", "bench", "wheel_stopper", "shade_structure"],
+        "base_layer": ["base_layer", "road_base", "subbase"],
+        "excavation": ["excavation", "excavated_area", "trench"],
+        "backfilling": ["backfill", "backfilled_area"],
+        "site_clearance": ["cleared_area", "site_clearance"],
     }
 
 
@@ -38,7 +42,7 @@ def _boxes_to_mask(shape, boxes):
 
 
 def choose_work_type(class_instances, seg_model, worker_count, detections):
-    if worker_count <= 0 or not class_instances:
+    if not class_instances:
         return None, None
 
     name_by_id = as_name_dict(seg_model.names)
@@ -62,6 +66,7 @@ def choose_work_type(class_instances, seg_model, worker_count, detections):
         return None, None
 
     worker_mask = _boxes_to_mask(any_mask.shape[:2], worker_boxes)
+    use_worker_overlap = worker_count > 0 and bool(worker_boxes)
     work_type_label = None
     work_type_mask = None
     best_overlap = 0
@@ -74,7 +79,11 @@ def choose_work_type(class_instances, seg_model, worker_count, detections):
             if cls_id is None:
                 continue
             for mask in class_instances.get(int(cls_id), []):
-                overlap = int((mask & worker_mask).sum())
+                overlap = (
+                    int((mask & worker_mask).sum())
+                    if use_worker_overlap
+                    else int(mask.sum())
+                )
                 if overlap > best_type_overlap:
                     best_type_overlap = overlap
                     best_type_mask = mask

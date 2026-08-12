@@ -450,6 +450,12 @@ def _activity_progress(site_name: str) -> Optional[float]:
     if not activities:
         return None
 
+    summary = comparison.get("summary")
+    if isinstance(summary, dict):
+        verified_actual = _to_percent(summary.get("actual_percent"))
+        if verified_actual is not None:
+            return round(verified_actual, 2)
+
     total_weight = 0.0
     weighted_progress = 0.0
     for activity in activities:
@@ -581,6 +587,12 @@ def _work_activity_summary(site_name: str) -> Optional[dict]:
         "delayed": delayed,
         "critical": critical,
         "progress": progress,
+        "schedule_summary": comparison.get("summary")
+        if isinstance(comparison.get("summary"), dict)
+        else {},
+        "baseline": comparison.get("baseline")
+        if isinstance(comparison.get("baseline"), dict)
+        else {},
     }
 
 
@@ -1427,6 +1439,20 @@ def _answer_work_activity(site_name: str) -> dict:
     ]
     if summary.get("progress") is not None:
         lines.insert(1, f"- Activity progress: {float(summary['progress']):.1f}%")
+    schedule_summary = summary.get("schedule_summary") or {}
+    baseline = summary.get("baseline") or {}
+    if baseline:
+        lines.insert(
+            1,
+            f"- Active baseline: v{int(baseline.get('version') or 0)} ({_clean(baseline.get('source_type')).upper()})",
+        )
+    if schedule_summary:
+        planned = _to_percent(schedule_summary.get("planned_percent")) or 0.0
+        variance = _to_float(schedule_summary.get("variance_percent")) or 0.0
+        delay_days = int(_to_float(schedule_summary.get("delay_days")) or 0)
+        lines.insert(2, f"- Planned progress: {planned:.1f}%")
+        lines.insert(3, f"- Variance: {variance:+.1f}%")
+        lines.insert(4, f"- Forecast delay: {delay_days} days")
 
     top_risks = summary["delayed"][:3] or summary["in_progress"][:3] or summary["not_started"][:3]
     for activity in top_risks:

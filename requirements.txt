@@ -10,6 +10,7 @@ fpdf
 ezdxf
 exif
 pdf2image
+pypdf
 pyproj
 python-multipart
 requests

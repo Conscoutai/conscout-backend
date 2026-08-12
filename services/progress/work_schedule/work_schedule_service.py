@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 from fastapi import HTTPException
 
 from core.database import work_schedules_collection, floorplans_collection, tours_collection
+from services.progress.work_schedule.analytics_service import build_baseline_comparison
 
 
 SUPPORTED_WORK_SCHEDULE_DATE_FORMATS = (
@@ -15,7 +16,14 @@ SUPPORTED_WORK_SCHEDULE_DATE_FORMATS = (
 
 
 def _project_filter(project_id: str) -> dict:
-    return {"$or": [{"site_name": project_id}, {"dxf_project_id": project_id}]}
+    return {
+        "$or": [
+            {"id": project_id},
+            {"project_id": project_id},
+            {"site_name": project_id},
+            {"dxf_project_id": project_id},
+        ]
+    }
 
 
 def parse_work_schedule_date(value: str) -> Optional[datetime]:
@@ -236,6 +244,9 @@ def _evidence_observed_range(evidence: list) -> tuple[str, str]:
 def work_schedule_comparison(project_id: str) -> dict:
     if not project_id:
         raise HTTPException(400, "project_id is required")
+    baseline_comparison = build_baseline_comparison(project_id)
+    if baseline_comparison is not None:
+        return baseline_comparison
     floorplan_doc = floorplans_collection.find_one(
         _project_filter(project_id), sort=[("_id", -1)]
     )
@@ -256,7 +267,10 @@ def work_schedule_comparison(project_id: str) -> dict:
         evidence = _collect_activity_evidence(activity.get("activity_name", ""), tours, project_id)
         observed_start_date, observed_end_date = _evidence_observed_range(evidence)
         matched_nodes = len(evidence)
-        actual_percent = min(matched_nodes, 5) * 20
+        # Legacy schedules may still expose matching photos as evidence, but a
+        # photo count is not a physical completion measurement. Progress stays
+        # at zero until verified evidence supplies an approved percentage.
+        actual_percent = 0
 
         primary_status = "NOT STARTED"
         if actual_percent >= 100:
@@ -264,7 +278,7 @@ def work_schedule_comparison(project_id: str) -> dict:
         elif start_date and today < start_date:
             primary_status = "NOT STARTED"
         elif matched_nodes > 0 or _activity_has_work(activity.get("activity_name", ""), work_types):
-            primary_status = "IN PROGRESS"
+            primary_status = "NEEDS REVIEW"
 
         is_critical = bool(end_date and today > end_date and primary_status != "DONE")
 

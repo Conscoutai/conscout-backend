@@ -1,5 +1,6 @@
 import time
 import json
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
@@ -19,6 +20,10 @@ from services.tour_management.site_capture.street_capture import (
     list_all_street_capture_tours,
     rename_street_capture_tour,
     upload_street_capture_image,
+)
+from services.progress.work_schedule.evidence_service import analyze_tour_schedule
+from services.progress.work_schedule.work_schedule_notification_service import (
+    sync_schedule_delay_notifications,
 )
 
 router = APIRouter(tags=["StreetCapture"])
@@ -145,6 +150,7 @@ async def save_street_capture_tour(
         or ""
     ).strip()
 
+    finalized_at = datetime.now(timezone.utc)
     tours_collection.update_one(
         {"tour_id": tour_id},
         {"$set": {
@@ -153,10 +159,52 @@ async def save_street_capture_tour(
             "coverage": tour["coverage"],
             "site_objects": result["site_objects"],
             "status": "completed",
+            "tour_finalized_at": finalized_at,
+            "schedule_analysis_started_at": finalized_at,
             "site_name": resolved_site_name or tour.get("site_name"),
             "updated_at": time.time(),
         }}
     )
+
+    schedule_analysis = {
+        "status": "skipped",
+        "reason": "Schedule analysis was not available",
+    }
+    try:
+        schedule_analysis = analyze_tour_schedule(tour_id)
+    except Exception as error:
+        schedule_analysis = {"status": "failed", "reason": str(error)}
+    analysis_completed_at = datetime.now(timezone.utc)
+    tours_collection.update_one(
+        {"tour_id": tour_id},
+        {
+            "$set": {
+                "schedule_analysis": schedule_analysis,
+                "schedule_analysis_completed_at": analysis_completed_at,
+            }
+        },
+    )
+
+    schedule_notifications = {
+        "created_count": 0,
+        "updated_count": 0,
+        "resolved_count": 0,
+    }
+    schedule_project_ref = str(
+        (floorplan or {}).get("project_id")
+        or (floorplan or {}).get("id")
+        or resolved_site_name
+    ).strip()
+    if schedule_project_ref and schedule_analysis.get("status") != "skipped":
+        try:
+            schedule_notifications = sync_schedule_delay_notifications(
+                project_id=schedule_project_ref,
+                current_user=current_user,
+            )
+        except Exception:
+            # Schedule evidence has already been persisted; notification delivery
+            # must never make tour finalization fail.
+            pass
 
     notification_result = {
         "created_count": 0,
@@ -186,6 +234,8 @@ async def save_street_capture_tour(
     return {
         "message": "Tour finalized",
         "progress": result["progress"],
+        "schedule_analysis": schedule_analysis,
+        "schedule_notifications": schedule_notifications,
         "notifications": notification_result,
     }
 

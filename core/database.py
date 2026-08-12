@@ -61,6 +61,13 @@ class ScopedCollection:
     def insert_one(self, document, *args, **kwargs):
         return self._raw.insert_one(stamp_owned_document(document), *args, **kwargs)
 
+    def insert_many(self, documents, *args, **kwargs):
+        return self._raw.insert_many(
+            [stamp_owned_document(document) for document in documents],
+            *args,
+            **kwargs,
+        )
+
     def aggregate(self, pipeline, *args, **kwargs):
         owner_match = merge_owner_filter(None)
         if owner_match:
@@ -78,6 +85,12 @@ admin_db = client[ADMIN_DB_NAME]
 raw_floorplans_collection = db["sites"]
 raw_tours_collection = db["tours"]
 raw_work_schedules_collection = db["work_schedules"]
+raw_schedule_baselines_collection = db["schedule_baselines"]
+raw_schedule_activities_collection = db["schedule_activities"]
+raw_schedule_relationships_collection = db["schedule_relationships"]
+raw_schedule_assignments_collection = db["schedule_assignments"]
+raw_schedule_evidence_collection = db["schedule_evidence"]
+raw_schedule_progress_snapshots_collection = db["schedule_progress_snapshots"]
 raw_users_collection = db["users"]
 raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
@@ -101,11 +114,52 @@ def ensure_admin_directory_indexes() -> None:
         "auth_sessions.refresh_token", sparse=True, name="admin_refresh_token"
     )
 
+
+def ensure_schedule_indexes() -> None:
+    """Create indexes used by versioned baselines and tour evidence."""
+    raw_schedule_baselines_collection.create_index(
+        "baseline_id", unique=True, name="unique_schedule_baseline_id"
+    )
+    raw_schedule_baselines_collection.create_index(
+        [("project_id", 1), ("version", -1)], name="schedule_project_versions"
+    )
+    raw_schedule_activities_collection.create_index(
+        [("baseline_id", 1), ("activity_id", 1)],
+        unique=True,
+        name="unique_baseline_activity_id",
+    )
+    raw_schedule_relationships_collection.create_index(
+        [("baseline_id", 1), ("activity_internal_id", 1)],
+        name="schedule_relationship_activity",
+    )
+    raw_schedule_assignments_collection.create_index(
+        [("baseline_id", 1), ("activity_internal_id", 1)],
+        name="schedule_assignment_activity",
+    )
+    raw_schedule_evidence_collection.create_index(
+        [("baseline_id", 1), ("activity_internal_id", 1), ("tour_id", 1)],
+        unique=True,
+        name="unique_schedule_tour_evidence",
+    )
+    raw_schedule_progress_snapshots_collection.create_index(
+        [("baseline_id", 1), ("snapshot_date", 1)],
+        unique=True,
+        name="unique_schedule_snapshot_date",
+    )
+
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.
 floorplans_collection = ScopedCollection(raw_floorplans_collection)
 tours_collection = ScopedCollection(raw_tours_collection)
 work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
+schedule_baselines_collection = ScopedCollection(raw_schedule_baselines_collection)
+schedule_activities_collection = ScopedCollection(raw_schedule_activities_collection)
+schedule_relationships_collection = ScopedCollection(raw_schedule_relationships_collection)
+schedule_assignments_collection = ScopedCollection(raw_schedule_assignments_collection)
+schedule_evidence_collection = ScopedCollection(raw_schedule_evidence_collection)
+schedule_progress_snapshots_collection = ScopedCollection(
+    raw_schedule_progress_snapshots_collection
+)
 users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
 notifications_collection = raw_notifications_collection

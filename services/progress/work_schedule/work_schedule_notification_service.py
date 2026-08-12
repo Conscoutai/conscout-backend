@@ -34,7 +34,14 @@ def _now_ms() -> int:
 
 def _project_filter(project_id: str) -> dict[str, Any]:
     normalized = (project_id or "").strip()
-    return {"$or": [{"site_name": normalized}, {"dxf_project_id": normalized}]}
+    return {
+        "$or": [
+            {"id": normalized},
+            {"project_id": normalized},
+            {"site_name": normalized},
+            {"dxf_project_id": normalized},
+        ]
+    }
 
 
 def _parse_date(value: str) -> datetime | None:
@@ -364,17 +371,34 @@ def sync_schedule_delay_notifications(
     project = _project_doc(normalized_project_id)
     site_name = _site_name(project, normalized_project_id)
     comparison = work_schedule_comparison(normalized_project_id)
+    baseline = comparison.get("baseline")
+    if isinstance(baseline, dict) and baseline.get("is_active") is not True:
+        return {
+            "created_count": 0,
+            "updated_count": 0,
+            "resolved_count": 0,
+            "skipped_count": 1,
+            "reason": "Schedule baseline is awaiting activation",
+        }
     recipients = _resolve_project_recipients(project, current_user)
     if not recipients:
         raise HTTPException(status_code=400, detail="No project recipients found")
 
     now = datetime.now()
-    activity_payloads: list[dict[str, Any]] = []
+    all_activity_payloads: list[dict[str, Any]] = []
     for activity in comparison.get("activities", []) or []:
         enriched = {**activity, "site_name": site_name}
         payload = _activity_notification_payload(enriched, now)
         if payload is not None:
-            activity_payloads.append(payload)
+            all_activity_payloads.append(payload)
+
+    all_activity_payloads.sort(
+        key=lambda payload: (
+            0 if payload.get("severity") == "critical" else 1,
+            -int((payload.get("metadata") or {}).get("overdue_days") or 0),
+        )
+    )
+    activity_payloads = all_activity_payloads[:20]
 
     activity_active_ids = {
         str(payload.get("entity_id") or "").strip()
@@ -402,7 +426,7 @@ def sync_schedule_delay_notifications(
         active_entity_ids=activity_active_ids,
     )
 
-    summary_payload = _summary_notification_payload(site_name, activity_payloads)
+    summary_payload = _summary_notification_payload(site_name, all_activity_payloads)
     summary_active_ids: set[str] = set()
     if summary_payload is not None:
         summary_active_ids.add(str(summary_payload["entity_id"]))
