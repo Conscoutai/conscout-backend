@@ -23,6 +23,8 @@ from services.progress.work_schedule.analytics_service import (
 from services.progress.work_schedule.baseline_service import (
     activate_schedule_baseline,
     align_schedule_zones,
+    delete_project_schedule_baselines,
+    delete_project_schedule_zone_plan,
     get_schedule_baseline,
     import_schedule_baseline,
     import_schedule_zone_plan,
@@ -272,6 +274,15 @@ def project_schedule_baselines(
     return list_schedule_baselines(project_id)
 
 
+@router.delete("/projects/{project_id}/schedule-baselines")
+def delete_project_baselines(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return delete_project_schedule_baselines(project_id)
+
+
 @router.get("/schedule-baselines/{baseline_id}")
 def schedule_baseline_detail(
     baseline_id: str,
@@ -349,6 +360,15 @@ def project_schedule_zones(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     return get_schedule_zones(project_id)
+
+
+@router.delete("/projects/{project_id}/schedule-zones")
+def delete_project_schedule_zones(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return delete_project_schedule_zone_plan(project_id)
 
 
 @router.post("/projects/{project_id}/schedule-zones/import")

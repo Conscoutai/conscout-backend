@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Generator, Literal, Optional
 from uuid import uuid4
 
@@ -37,7 +38,7 @@ router = APIRouter(tags=["Floorplans"])
 
 # Creates a project floorplan upload. Project names are display labels and are
 # deliberately not used as identifiers: duplicate names are valid.
-# Accepts calibration points, optional DXF zip, site config, baseline XER and zone-plan PDF.
+# Accepts calibration points, optional DXF zip, site config, schedule baseline and zone-plan PDF.
 # Triggers floorplan creation + optional DXF processing + optional config attach.
 
 
@@ -91,6 +92,7 @@ async def create_project_floorplan(
     dxf_zip: Optional[UploadFile] = File(None),
     site_config: Optional[UploadFile] = File(None),
     baseline_xer: Optional[UploadFile] = File(None),
+    schedule_timezone: str = Form("UTC", alias="timezone"),
     zone_plan_pdf: Optional[UploadFile] = File(None),
     capture_mode: Literal["outdoor", "indoor"] = Form("outdoor"),
     currency_code: Optional[str] = Form(None),
@@ -134,10 +136,15 @@ async def create_project_floorplan(
     baseline_xer_name = None
     baseline_xer_bytes = None
     if baseline_xer:
-        if not baseline_xer.filename or not baseline_xer.filename.lower().endswith(
-            ".xer"
-        ):
-            raise HTTPException(400, "Baseline file must be a .xer")
+        baseline_suffix = (
+            Path(baseline_xer.filename).suffix.lower()
+            if baseline_xer.filename
+            else ""
+        )
+        if baseline_suffix not in {".xer", ".pdf"}:
+            raise HTTPException(
+                400, "Schedule baseline must be an .xer or .pdf file"
+            )
         baseline_xer_bytes = await baseline_xer.read()
         baseline_xer_url, baseline_xer_name = save_baseline_xer(
             effective_project_id,
@@ -194,6 +201,7 @@ async def create_project_floorplan(
             project_ref=effective_project_id,
             filename=baseline_xer_name,
             raw_bytes=baseline_xer_bytes,
+            timezone_name=schedule_timezone,
             activate=True,
         )
 

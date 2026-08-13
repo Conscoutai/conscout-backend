@@ -19,7 +19,16 @@ from core.database import (
     schedule_progress_snapshots_collection,
     schedule_relationships_collection,
 )
-from core.config import site_baseline_dir, site_storage_roots, site_zone_plan_dir
+from core.config import (
+    SITE_BASELINE_DIRNAME,
+    SITE_ZONE_PLAN_DIRNAME,
+    site_baseline_dir,
+    site_storage_roots,
+    site_zone_plan_dir,
+)
+from services.project_setup.project_assets_service import (
+    remove_project_asset_directories,
+)
 
 from .pdf_parser import PdfScheduleParseError, parse_pdf_schedule
 from .xer_parser import XerParseError, parse_xer
@@ -999,3 +1008,103 @@ def delete_baseline_data(baseline_id: str) -> None:
     schedule_evidence_collection.delete_many({"baseline_id": baseline_id})
     schedule_progress_snapshots_collection.delete_many({"baseline_id": baseline_id})
     schedule_baselines_collection.delete_one({"baseline_id": baseline_id})
+
+
+def delete_project_schedule_baselines(project_ref: str) -> dict[str, Any]:
+    """Delete every versioned baseline for a project, never legacy work schedules."""
+    project_context = resolve_project(project_ref)
+    project = project_context["document"]
+    project_id = project_context["project_id"]
+    baselines = list(schedule_baselines_collection.find({"project_id": project_id}))
+    baseline_ids = [
+        str(document.get("baseline_id") or "").strip()
+        for document in baselines
+        if str(document.get("baseline_id") or "").strip()
+    ]
+    for baseline_id in baseline_ids:
+        delete_baseline_data(baseline_id)
+
+    removed_directories, removed_files = remove_project_asset_directories(
+        project,
+        SITE_BASELINE_DIRNAME,
+        project_id,
+        project_ref,
+    )
+    now = datetime.now(timezone.utc)
+    result = floorplans_collection.update_many(
+        project_filter(project_ref),
+        {
+            "$unset": {
+                "active_schedule_baseline_id": "",
+                "active_schedule_baseline": "",
+                "schedule_baseline": "",
+                "schedule_baseline_exists": "",
+                "has_schedule_baseline": "",
+                "baseline_xer_url": "",
+                "baseline_xer_name": "",
+                "assets.schedule_baseline": "",
+                "project_assets.schedule_baseline": "",
+                "schedule_zone_plan.activity_mapping": "",
+                "proposed_schedule_zone_plan.activity_mapping": "",
+            },
+            "$set": {"updated_at": now},
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Project not found")
+    return {
+        "status": "deleted",
+        "asset": "schedule_baseline",
+        "versions_deleted": len(baseline_ids),
+        "directories_deleted": removed_directories,
+        "files_deleted": removed_files,
+    }
+
+
+def delete_project_schedule_zone_plan(project_ref: str) -> dict[str, Any]:
+    project_context = resolve_project(project_ref)
+    project = project_context["document"]
+    project_id = project_context["project_id"]
+    active_zones, active_plan, proposed_zones, proposed_plan = _zone_plan_state(
+        project
+    )
+    plan_ids = {
+        str(plan.get("zone_plan_id") or "").strip()
+        for plan in (active_plan, proposed_plan)
+        if str(plan.get("zone_plan_id") or "").strip()
+    }
+    removed_directories, removed_files = remove_project_asset_directories(
+        project,
+        SITE_ZONE_PLAN_DIRNAME,
+        project_id,
+        project_ref,
+    )
+    now = datetime.now(timezone.utc)
+    result = floorplans_collection.update_many(
+        project_filter(project_ref),
+        {
+            "$unset": {
+                "schedule_zones": "",
+                "schedule_zone_plan": "",
+                "schedule_zones_confirmed_at": "",
+                "proposed_schedule_zones": "",
+                "proposed_schedule_zone_plan": "",
+                "proposed_schedule_zones_updated_at": "",
+                "schedule_zone_plan_exists": "",
+                "has_schedule_zone_plan": "",
+                "assets.schedule_zone_plan": "",
+                "project_assets.schedule_zone_plan": "",
+            },
+            "$set": {"updated_at": now},
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Project not found")
+    return {
+        "status": "deleted",
+        "asset": "schedule_zone_plan",
+        "plans_deleted": len(plan_ids),
+        "zones_deleted": len(active_zones) + len(proposed_zones),
+        "directories_deleted": removed_directories,
+        "files_deleted": removed_files,
+    }

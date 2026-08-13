@@ -23,6 +23,7 @@ from services.project_setup.site_config_generation_service import (
     generate_site_config_from_saved_dxfs,
 )
 from services.project_setup.project_assets_service import (
+    delete_project_dxf_assets,
     replace_site_dxfs_from_zip,
     persist_project_assets_update,
     resolve_site_config_for_reprocess,
@@ -369,6 +370,15 @@ async def update_project_assets(
         },
         "total_objects": len(site_objects),
     }
+
+
+@router.delete("/projects/{site_name}/assets/dxf")
+def delete_project_dxf(
+    site_name: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return delete_project_dxf_assets(site_name)
 
 
 @router.post("/projects/{site_name}/site-config/generate")

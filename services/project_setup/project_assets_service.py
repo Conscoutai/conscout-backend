@@ -2,6 +2,7 @@
 # writes related site config/site objects updates to floorplan records.
 import os
 import json
+import shutil
 import tempfile
 import zipfile
 from datetime import datetime, timezone
@@ -12,9 +13,11 @@ from fastapi import HTTPException
 from core.database import floorplans_collection
 from core.config import (
     ENABLE_DXF_PROCESSING,
+    SITE_DXF_DIRNAME,
     site_dxf_dir,
     site_baseline_dir,
     site_dir,
+    site_storage_roots,
 )
 
 
@@ -26,6 +29,100 @@ def _project_filter(project_ref: str) -> dict:
             {"site_name": project_ref},
             {"dxf_project_id": project_ref},
         ]
+    }
+
+
+def _project_storage_keys(project: dict, *extra_keys: str) -> list[str]:
+    keys: list[str] = []
+    for raw_value in (
+        project.get("project_id"),
+        project.get("id"),
+        project.get("dxf_project_id"),
+        project.get("site_name"),
+        *extra_keys,
+    ):
+        value = str(raw_value or "").strip()
+        if (
+            not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or "\x00" in value
+            or value in keys
+        ):
+            continue
+        keys.append(value)
+    return keys
+
+
+def remove_project_asset_directories(
+    project: dict,
+    directory_name: str,
+    *extra_keys: str,
+) -> tuple[int, int]:
+    """Remove one exact project-asset directory from scoped and legacy roots."""
+    removed_directories = 0
+    removed_files = 0
+    roots = site_storage_roots(
+        owner_email=project.get("owner_email"),
+        owner_user_id=project.get("owner_user_id"),
+    )
+    for root in roots:
+        root_path = os.path.abspath(root)
+        for storage_key in _project_storage_keys(project, *extra_keys):
+            candidate = os.path.abspath(
+                os.path.join(root_path, storage_key, directory_name)
+            )
+            try:
+                is_scoped = os.path.commonpath([root_path, candidate]) == root_path
+            except ValueError:
+                is_scoped = False
+            if not is_scoped or not os.path.isdir(candidate):
+                continue
+            for _, _, filenames in os.walk(candidate):
+                removed_files += len(filenames)
+            shutil.rmtree(candidate)
+            removed_directories += 1
+    return removed_directories, removed_files
+
+
+def delete_project_dxf_assets(project_ref: str) -> dict:
+    normalized_ref = str(project_ref or "").strip()
+    if not normalized_ref:
+        raise HTTPException(400, "Project reference is required")
+    project = floorplans_collection.find_one(
+        _project_filter(normalized_ref),
+        sort=[("_id", -1)],
+    )
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    removed_directories, removed_files = remove_project_asset_directories(
+        project,
+        SITE_DXF_DIRNAME,
+        normalized_ref,
+    )
+    now = datetime.now(timezone.utc)
+    result = floorplans_collection.update_many(
+        _project_filter(normalized_ref),
+        {
+            "$unset": {
+                "dxf_project_id": "",
+                "dxf_updated_at": "",
+            },
+            "$set": {
+                "site_objects": [],
+                "updated_at": now,
+            },
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Project not found")
+    return {
+        "status": "deleted",
+        "asset": "dxf",
+        "directories_deleted": removed_directories,
+        "files_deleted": removed_files,
     }
 
 
