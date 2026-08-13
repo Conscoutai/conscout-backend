@@ -30,15 +30,20 @@ docker build -t conscout-backend-lite-api:latest .
 
 ```bash
 docker rm -f conscout-backend-api conscout-backend-ai
+docker network inspect conscout-main >/dev/null 2>&1 || docker network create conscout-main
 ```
 
 ```bash
-docker run -d --restart always -p 8000:8000 --env-file .env -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-api conscout-backend-api
+docker run -d --restart always --network conscout-main -p 8001:8001 --env-file .env -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-ai conscout-backend-ai
 ```
 
 ```bash
-docker run -d --restart always -p 8001:8001 --env-file .env -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-ai conscout-backend-ai
+docker run -d --restart always --network conscout-main -p 8000:8000 --env-file .env -e AI_SERVICE_URL=http://conscout-backend-ai:8001 -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-api conscout-backend-api
 ```
+
+The named `conscout-main` network is required: the Main API calls the AI
+container by its Docker DNS name. The explicit `AI_SERVICE_URL` override also
+prevents a stale value in `.env` from routing AI requests outside that network.
 
 ## 4. Restart the Lite API
 
@@ -69,6 +74,7 @@ URLs in screenshots, chat, or Git.
 
 ```bash
 docker ps
+docker exec conscout-backend-api python -c 'import os, urllib.request; response = urllib.request.urlopen(os.environ["AI_SERVICE_URL"].rstrip("/") + "/health", timeout=10); print(response.status, response.read().decode())'
 docker logs --tail 50 conscout-backend-api
 docker logs --tail 50 conscout-backend-ai
 docker logs --tail 50 conscout-backend-lite-api
