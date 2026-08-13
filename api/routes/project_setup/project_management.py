@@ -45,6 +45,10 @@ class CaptureModeRequest(BaseModel):
     capture_mode: Literal["outdoor", "indoor"]
 
 
+class LocationRequest(BaseModel):
+    location: str
+
+
 class CurrencyRequest(BaseModel):
     currency_code: str
 
@@ -223,6 +227,42 @@ def update_project_capture_mode(
         "status": "updated",
         "site_name": site_name,
         "capture_mode": payload.capture_mode,
+    }
+
+
+@router.patch("/projects/{site_name}")
+def update_project_location(
+    site_name: str,
+    payload: LocationRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    if not site_name:
+        raise HTTPException(400, "Project name is required")
+
+    location = payload.location.strip()
+    if not location:
+        raise HTTPException(400, "Project location is required")
+
+    update = floorplans_collection.update_many(
+        _project_filter(site_name),
+        {
+            "$set": {
+                "location": location,
+                "project_location": location,
+                "area_location": location,
+            }
+        },
+    )
+    if update.matched_count == 0:
+        raise HTTPException(404, "No floorplan found for this project")
+
+    return {
+        "status": "updated",
+        "site_name": site_name,
+        "location": location,
+        "project_location": location,
+        "area_location": location,
     }
 
 
