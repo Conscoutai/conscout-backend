@@ -61,7 +61,9 @@ def _point_in_polygon(x: float, y: float, points: list[dict[str, Any]]) -> bool:
         for point in points
         if isinstance(point, dict)
     ]
-    coordinates = [(px, py) for px, py in coordinates if px is not None and py is not None]
+    coordinates = [
+        (px, py) for px, py in coordinates if px is not None and py is not None
+    ]
     if len(coordinates) < 3:
         return False
     inside = False
@@ -90,6 +92,9 @@ def _node_zone(node: dict[str, Any], floorplan: dict[str, Any]) -> str:
     y = _number(node.get("y"))
     if x is None or y is None:
         return ""
+    zone_plan = floorplan.get("schedule_zone_plan") or {}
+    if str(zone_plan.get("confirmation_status") or "").strip() != "confirmed":
+        return ""
     for zone in floorplan.get("schedule_zones", []) or []:
         if not isinstance(zone, dict):
             continue
@@ -114,7 +119,11 @@ def _candidate_activity(
             {"baseline_id": baseline_id, "activity_id": explicit_id}, {"_id": 0}
         )
         if explicit:
-            return explicit, 0.98, "Explicit Activity ID supplied by the analysis result"
+            return (
+                explicit,
+                0.98,
+                "Explicit Activity ID supplied by the analysis result",
+            )
 
     query: dict[str, Any] = {
         "baseline_id": baseline_id,
@@ -125,9 +134,17 @@ def _candidate_activity(
         query["zone"] = zone
     candidates = list(schedule_activities_collection.find(query, {"_id": 0}))
     if not candidates:
-        return None, 0.0, "No photo-trackable activity matches the detected work and zone"
+        return (
+            None,
+            0.0,
+            "No photo-trackable activity matches the detected work and zone",
+        )
     if not zone and len(candidates) > 1:
-        return None, 0.0, "The panorama has no schedule zone and matches multiple activities"
+        return (
+            None,
+            0.0,
+            "The panorama has no schedule zone and matches multiple activities",
+        )
     if len(candidates) == 1:
         confidence = 0.86 if zone else 0.68
         return candidates[0], confidence, "Matched by work category and schedule zone"
@@ -145,7 +162,11 @@ def _candidate_activity(
         return abs((start_date - observed_date).days)
 
     candidates.sort(key=distance)
-    return candidates[0], 0.72, "Matched by work category, zone and nearest planned date"
+    return (
+        candidates[0],
+        0.72,
+        "Matched by work category, zone and nearest planned date",
+    )
 
 
 def analyze_tour_schedule(tour_id: str) -> dict[str, Any]:
@@ -250,7 +271,9 @@ def analyze_tour_schedule(tour_id: str) -> dict[str, Any]:
             "tour_id": tour_id,
         }
         existing = schedule_evidence_collection.find_one(evidence_filter)
-        evidence_id = str((existing or {}).get("evidence_id") or f"evidence_{uuid4().hex}")
+        evidence_id = str(
+            (existing or {}).get("evidence_id") or f"evidence_{uuid4().hex}"
+        )
         primary_node = evidence_nodes[0] if evidence_nodes else {}
         payload = {
             "evidence_id": evidence_id,
@@ -324,12 +347,15 @@ def review_schedule_evidence(
     evidence = schedule_evidence_collection.find_one({"evidence_id": evidence_id})
     if not evidence:
         raise HTTPException(404, "Schedule evidence not found")
-    activity = schedule_activities_collection.find_one(
-        {
-            "baseline_id": evidence.get("baseline_id"),
-            "activity_internal_id": evidence.get("activity_internal_id"),
-        }
-    ) or {}
+    activity = (
+        schedule_activities_collection.find_one(
+            {
+                "baseline_id": evidence.get("baseline_id"),
+                "activity_internal_id": evidence.get("activity_internal_id"),
+            }
+        )
+        or {}
+    )
     planned_quantity = float(activity.get("planned_quantity") or 0.0)
     if (
         normalized_decision == "approved"
@@ -337,7 +363,9 @@ def review_schedule_evidence(
         and verified_quantity is not None
         and planned_quantity > 0
     ):
-        approved_percent = min(100.0, max(0.0, verified_quantity * 100.0 / planned_quantity))
+        approved_percent = min(
+            100.0, max(0.0, verified_quantity * 100.0 / planned_quantity)
+        )
     if normalized_decision == "approved":
         if approved_percent is None or not 0 <= approved_percent <= 100:
             raise HTTPException(
@@ -350,12 +378,12 @@ def review_schedule_evidence(
         {
             "$set": {
                 "status": normalized_decision,
-                "approved_percent": approved_percent
-                if normalized_decision == "approved"
-                else None,
-                "verified_quantity": verified_quantity
-                if normalized_decision == "approved"
-                else None,
+                "approved_percent": (
+                    approved_percent if normalized_decision == "approved" else None
+                ),
+                "verified_quantity": (
+                    verified_quantity if normalized_decision == "approved" else None
+                ),
                 "review_note": str(review_note or "").strip(),
                 "review_source": "human",
                 "reviewed_at": now,

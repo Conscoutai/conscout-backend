@@ -4,7 +4,9 @@ import unittest
 import os
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from fastapi import HTTPException
 
 os.environ.setdefault("MONGO_URI", "mongodb://127.0.0.1:27017")
 
@@ -17,6 +19,7 @@ from services.progress.work_schedule.xer_parser import (
 )
 from services.progress.work_schedule.zone_plan_parser import parse_zone_plan_pdf
 from services.progress.work_schedule import zone_plan_parser as zone_parser
+from services.progress.work_schedule import baseline_service, evidence_service
 
 
 SAMPLE_XER_PATH = Path(
@@ -221,6 +224,326 @@ class ZonePlanParserTests(unittest.TestCase):
         )
         self.assertEqual(parsed["summary"]["extraction_method"], "ocr")
         self.assertTrue(parsed["summary"]["ocr_used"])
+
+
+class ZonePlanConfirmationTests(unittest.TestCase):
+    def test_manual_polygon_change_creates_a_reviewable_revision(self):
+        floorplans = Mock()
+        floorplans.update_many.return_value = Mock(matched_count=1)
+        with (
+            patch.object(
+                baseline_service,
+                "resolve_project",
+                return_value={
+                    "document": {
+                        "schedule_zone_plan": {
+                            "zone_plan_id": "zoneplan-3",
+                            "version": 3,
+                        }
+                    },
+                    "project_id": "project-1",
+                    "site_name": "Demo",
+                    "floorplan_id": "floorplan-1",
+                },
+            ),
+            patch.object(baseline_service, "floorplans_collection", floorplans),
+        ):
+            result = baseline_service.update_schedule_zones(
+                project_ref="project-1",
+                zones=[
+                    {
+                        "name": "Zone A",
+                        "points": [
+                            {"x": 0, "y": 0},
+                            {"x": 100, "y": 0},
+                            {"x": 100, "y": 100},
+                        ],
+                    }
+                ],
+            )
+
+        self.assertEqual(result["version"], 4)
+        self.assertEqual(result["confirmation_status"], "needs_review")
+        update = floorplans.update_many.call_args.args[1]["$set"]
+        self.assertEqual(update["proposed_schedule_zone_plan"]["version"], 4)
+        self.assertEqual(
+            update["proposed_schedule_zone_plan"]["parent_zone_plan_id"],
+            "zoneplan-3",
+        )
+
+    def test_unconfirmed_zone_plan_does_not_assign_tour_nodes(self):
+        node = {"x": 20, "y": 20}
+        floorplan = {
+            "schedule_zones": [
+                {
+                    "name": "Zone A",
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 100, "y": 0},
+                        {"x": 100, "y": 100},
+                        {"x": 0, "y": 100},
+                    ],
+                }
+            ],
+            "schedule_zone_plan": {"confirmation_status": "needs_review"},
+        }
+
+        self.assertEqual(evidence_service._node_zone(node, floorplan), "")
+        floorplan["schedule_zone_plan"]["confirmation_status"] = "confirmed"
+        self.assertEqual(evidence_service._node_zone(node, floorplan), "Zone A")
+
+    def test_confirmation_marks_current_zone_plan_as_reviewed(self):
+        project = {
+            "id": "floorplan-1",
+            "project_id": "project-1",
+            "site_name": "Demo",
+            "imageUrl": "/sites/floorplan-1/floorplan/layout.png",
+            "bounds": {"width": 100, "height": 100},
+            "schedule_zones": [
+                {
+                    "name": "Zone A",
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 100, "y": 0},
+                        {"x": 100, "y": 100},
+                    ],
+                }
+            ],
+            "schedule_zone_plan": {
+                "zone_plan_id": "zoneplan-1",
+                "version": 1,
+                "confirmation_status": "needs_review",
+            },
+        }
+        floorplans = Mock()
+        floorplans.update_many.return_value = Mock(matched_count=1)
+        baselines = Mock()
+        baselines.find_one.return_value = {
+            "baseline_id": "baseline-1",
+            "project_id": "project-1",
+        }
+        activities = Mock()
+        activities.count_documents.side_effect = [1, 1]
+
+        with (
+            patch.object(
+                baseline_service,
+                "resolve_project",
+                return_value={
+                    "document": project,
+                    "project_id": "project-1",
+                    "site_name": "Demo",
+                    "floorplan_id": "floorplan-1",
+                },
+            ),
+            patch.object(baseline_service, "floorplans_collection", floorplans),
+            patch.object(baseline_service, "schedule_baselines_collection", baselines),
+            patch.object(
+                baseline_service, "schedule_activities_collection", activities
+            ),
+            patch.object(
+                baseline_service, "_floorplan_asset_available", return_value=True
+            ),
+        ):
+            result = baseline_service.confirm_schedule_zone_plan(
+                project_ref="project-1",
+                reviewer_user_id="admin-1",
+                reviewer_email="admin@example.com",
+                expected_zone_plan_id="zoneplan-1",
+                expected_version=1,
+                floorplan_loaded=True,
+                note="Overlay checked",
+            )
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["zone_plan"]["confirmation_status"], "confirmed")
+        self.assertEqual(result["zone_plan"]["confirmation_note"], "Overlay checked")
+        confirmation_filter = floorplans.update_many.call_args.args[0]
+        self.assertIn(
+            {"schedule_zone_plan.zone_plan_id": "zoneplan-1"},
+            confirmation_filter["$and"],
+        )
+        update = floorplans.update_many.call_args.args[1]["$set"]
+        self.assertEqual(
+            update["schedule_zone_plan"]["confirmed_by_user_id"], "admin-1"
+        )
+
+    def test_confirmation_requires_a_loaded_floorplan_preview(self):
+        project = {
+            "imageUrl": "/sites/floorplan-1/floorplan/layout.png",
+            "bounds": {"width": 100, "height": 100},
+            "schedule_zones": [{"name": "Zone A"}],
+            "schedule_zone_plan": {
+                "zone_plan_id": "zoneplan-1",
+                "version": 1,
+                "confirmation_status": "needs_review",
+            },
+        }
+        with patch.object(
+            baseline_service,
+            "resolve_project",
+            return_value={
+                "document": project,
+                "project_id": "project-1",
+                "site_name": "Demo",
+                "floorplan_id": "floorplan-1",
+            },
+        ), patch.object(
+            baseline_service, "_floorplan_asset_available", return_value=True
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                baseline_service.confirm_schedule_zone_plan(
+                    project_ref="project-1",
+                    reviewer_user_id="admin-1",
+                    reviewer_email="admin@example.com",
+                    expected_zone_plan_id="zoneplan-1",
+                    expected_version=1,
+                    floorplan_loaded=False,
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("visually review", raised.exception.detail)
+
+    def test_proposed_revision_replaces_active_zones_only_after_confirmation(self):
+        project = {
+            "id": "floorplan-1",
+            "project_id": "project-1",
+            "site_name": "Demo",
+            "imageUrl": "/sites/floorplan-1/floorplan/layout.png",
+            "bounds": {"width": 100, "height": 100},
+            "schedule_zones": [{"name": "Old Zone"}],
+            "schedule_zone_plan": {
+                "zone_plan_id": "zoneplan-1",
+                "version": 1,
+                "confirmation_status": "confirmed",
+            },
+            "proposed_schedule_zones": [{"name": "New Zone"}],
+            "proposed_schedule_zone_plan": {
+                "zone_plan_id": "zoneplan-2",
+                "version": 2,
+                "confirmation_status": "needs_review",
+            },
+        }
+        floorplans = Mock()
+        floorplans.update_many.return_value = Mock(matched_count=1)
+        baselines = Mock()
+        baselines.find_one.return_value = None
+        with (
+            patch.object(
+                baseline_service,
+                "resolve_project",
+                return_value={
+                    "document": project,
+                    "project_id": "project-1",
+                    "site_name": "Demo",
+                    "floorplan_id": "floorplan-1",
+                },
+            ),
+            patch.object(baseline_service, "floorplans_collection", floorplans),
+            patch.object(baseline_service, "schedule_baselines_collection", baselines),
+            patch.object(
+                baseline_service, "_floorplan_asset_available", return_value=True
+            ),
+        ):
+            result = baseline_service.confirm_schedule_zone_plan(
+                project_ref="project-1",
+                reviewer_user_id="admin-1",
+                reviewer_email="admin@example.com",
+                expected_zone_plan_id="zoneplan-2",
+                expected_version=2,
+                floorplan_loaded=True,
+            )
+
+        self.assertEqual(result["zones"], [{"name": "New Zone"}])
+        update = floorplans.update_many.call_args.args[1]
+        self.assertEqual(update["$set"]["schedule_zones"], [{"name": "New Zone"}])
+        self.assertIn("proposed_schedule_zones", update["$unset"])
+
+    def test_three_point_alignment_transforms_proposed_polygons(self):
+        project = {
+            "bounds": {"width": 100, "height": 100},
+            "proposed_schedule_zones": [
+                {
+                    "name": "Zone A",
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 50, "y": 0},
+                        {"x": 50, "y": 100},
+                    ],
+                    "source_points": [
+                        {"x": 0, "y": 0},
+                        {"x": 50, "y": 0},
+                        {"x": 50, "y": 100},
+                    ],
+                }
+            ],
+            "proposed_schedule_zone_plan": {
+                "zone_plan_id": "zoneplan-1",
+                "version": 1,
+                "confirmation_status": "needs_review",
+            },
+        }
+        floorplans = Mock()
+        floorplans.update_many.return_value = Mock(matched_count=1)
+        with (
+            patch.object(
+                baseline_service,
+                "resolve_project",
+                return_value={
+                    "document": project,
+                    "project_id": "project-1",
+                    "site_name": "Demo",
+                    "floorplan_id": "floorplan-1",
+                },
+            ),
+            patch.object(baseline_service, "floorplans_collection", floorplans),
+        ):
+            result = baseline_service.align_schedule_zones(
+                project_ref="project-1",
+                expected_zone_plan_id="zoneplan-1",
+                expected_version=1,
+                source_points=[
+                    {"x": 0, "y": 0},
+                    {"x": 1, "y": 0},
+                    {"x": 0, "y": 1},
+                ],
+                floorplan_points=[
+                    {"x": 10, "y": 20},
+                    {"x": 90, "y": 20},
+                    {"x": 10, "y": 80},
+                ],
+            )
+
+        first_point = result["zones"][0]["points"][0]
+        self.assertAlmostEqual(first_point["x"], 10)
+        self.assertAlmostEqual(first_point["y"], 20)
+        self.assertEqual(result["alignment"]["method"], "three_point_affine")
+
+    def test_confirmation_rejects_a_stale_review(self):
+        with patch.object(
+            baseline_service,
+            "resolve_project",
+            return_value={
+                "document": {
+                    "schedule_zones": [{"name": "Zone A"}],
+                    "schedule_zone_plan": {
+                        "zone_plan_id": "zoneplan-2",
+                        "version": 2,
+                    },
+                },
+                "project_id": "project-1",
+                "site_name": "Demo",
+                "floorplan_id": "floorplan-1",
+            },
+        ):
+            with self.assertRaisesRegex(HTTPException, "changed during review"):
+                baseline_service.confirm_schedule_zone_plan(
+                    project_ref="project-1",
+                    reviewer_user_id="admin-1",
+                    reviewer_email="admin@example.com",
+                    expected_zone_plan_id="zoneplan-1",
+                    expected_version=1,
+                )
 
 
 class ScheduleAnalyticsTests(unittest.TestCase):

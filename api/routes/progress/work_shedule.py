@@ -22,10 +22,12 @@ from services.progress.work_schedule.analytics_service import (
 )
 from services.progress.work_schedule.baseline_service import (
     activate_schedule_baseline,
+    align_schedule_zones,
     get_schedule_baseline,
     import_schedule_baseline,
     import_schedule_zone_plan,
     list_schedule_baselines,
+    confirm_schedule_zone_plan,
     get_schedule_zones,
     update_schedule_zones,
     update_activity_mapping,
@@ -158,6 +160,20 @@ class ScheduleZonesRequest(BaseModel):
     zones: List[ScheduleZonePayload]
 
 
+class ScheduleZoneConfirmationRequest(BaseModel):
+    zone_plan_id: str = ""
+    version: Optional[int] = Field(None, ge=1)
+    floorplan_loaded: bool = False
+    note: str = Field("", max_length=500)
+
+
+class ScheduleZoneAlignmentRequest(BaseModel):
+    zone_plan_id: str = ""
+    version: Optional[int] = Field(None, ge=1)
+    source_points: List[ScheduleZonePoint] = Field(..., min_items=3, max_items=3)
+    floorplan_points: List[ScheduleZonePoint] = Field(..., min_items=3, max_items=3)
+
+
 class ManualActivityProgressRequest(BaseModel):
     observed_at: str
     approved_percent: Optional[float] = Field(None, ge=0, le=100)
@@ -209,8 +225,10 @@ def work_schedule_comparison(project_id: str):
     comparison["notification_sync"] = _best_effort_schedule_notification_sync(
         project_id,
     )
-    comparison["prediction_notification_sync"] = _best_effort_prediction_notification_sync(
-        project_id,
+    comparison["prediction_notification_sync"] = (
+        _best_effort_prediction_notification_sync(
+            project_id,
+        )
     )
     return comparison
 
@@ -358,6 +376,40 @@ def put_project_schedule_zones(
     return update_schedule_zones(
         project_ref=project_id,
         zones=[zone.dict() for zone in payload.zones],
+    )
+
+
+@router.post("/projects/{project_id}/schedule-zones/confirm")
+def confirm_project_schedule_zones(
+    project_id: str,
+    payload: ScheduleZoneConfirmationRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return confirm_schedule_zone_plan(
+        project_ref=project_id,
+        reviewer_user_id=current_user.user_id,
+        reviewer_email=current_user.email,
+        expected_zone_plan_id=payload.zone_plan_id,
+        expected_version=payload.version,
+        floorplan_loaded=payload.floorplan_loaded,
+        note=payload.note,
+    )
+
+
+@router.post("/projects/{project_id}/schedule-zones/align")
+def align_project_schedule_zones(
+    project_id: str,
+    payload: ScheduleZoneAlignmentRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return align_schedule_zones(
+        project_ref=project_id,
+        expected_zone_plan_id=payload.zone_plan_id,
+        expected_version=payload.version,
+        source_points=[point.dict() for point in payload.source_points],
+        floorplan_points=[point.dict() for point in payload.floorplan_points],
     )
 
 
