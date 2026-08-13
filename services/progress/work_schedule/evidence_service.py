@@ -55,6 +55,28 @@ def _timestamp(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _latest_approved_percent(
+    *,
+    baseline_id: str,
+    activity_internal_id: str,
+    exclude_evidence_id: str = "",
+) -> Optional[float]:
+    query: dict[str, Any] = {
+        "baseline_id": baseline_id,
+        "activity_internal_id": activity_internal_id,
+        "status": "approved",
+        "approved_percent": {"$ne": None},
+    }
+    if exclude_evidence_id:
+        query["evidence_id"] = {"$ne": exclude_evidence_id}
+    cursor = schedule_evidence_collection.find(
+        query,
+        {"_id": 0, "approved_percent": 1},
+    ).sort([("captured_at", -1), ("updated_at", -1)])
+    latest = next(iter(cursor), None)
+    return _number((latest or {}).get("approved_percent"))
+
+
 def _point_in_polygon(x: float, y: float, points: list[dict[str, Any]]) -> bool:
     coordinates = [
         (_number(point.get("x")), _number(point.get("y")))
@@ -373,6 +395,18 @@ def review_schedule_evidence(
                 "Provide approved_percent, or verified_quantity for an activity with a planned quantity",
             )
     now = datetime.now(timezone.utc)
+    previous_approved_percent = _number(evidence.get("previous_approved_percent"))
+    if previous_approved_percent is None:
+        previous_approved_percent = _latest_approved_percent(
+            baseline_id=str(evidence.get("baseline_id") or ""),
+            activity_internal_id=str(evidence.get("activity_internal_id") or ""),
+            exclude_evidence_id=evidence_id,
+        )
+    review_source = (
+        "manual"
+        if str(evidence.get("review_source") or "").strip().lower() == "manual"
+        else "human"
+    )
     schedule_evidence_collection.update_one(
         {"evidence_id": evidence_id},
         {
@@ -385,10 +419,12 @@ def review_schedule_evidence(
                     verified_quantity if normalized_decision == "approved" else None
                 ),
                 "review_note": str(review_note or "").strip(),
-                "review_source": "human",
+                "review_source": review_source,
                 "reviewed_at": now,
                 "reviewed_by_user_id": reviewer_user_id,
                 "reviewed_by_email": reviewer_email,
+                "previous_approved_percent": previous_approved_percent,
+                "quantity_unit": str(activity.get("quantity_unit") or "").strip(),
                 "updated_at": now,
             }
         },
@@ -463,6 +499,15 @@ def record_manual_activity_progress(
     )
     if existing:
         evidence_id = str(existing.get("evidence_id") or evidence_id)
+    previous_approved_percent = (
+        _number(existing.get("approved_percent")) if existing else None
+    )
+    if previous_approved_percent is None:
+        previous_approved_percent = _latest_approved_percent(
+            baseline_id=baseline_id,
+            activity_internal_id=str(activity.get("activity_internal_id") or ""),
+            exclude_evidence_id=evidence_id,
+        )
     now = datetime.now(timezone.utc)
     schedule_evidence_collection.update_one(
         {
@@ -491,6 +536,9 @@ def record_manual_activity_progress(
                 "confidence": 1.0,
                 "rationale": "Progress entered and verified by a project administrator",
                 "suggested_percent": approved_percent,
+                "previous_approved_percent": previous_approved_percent,
+                "verified_quantity": verified_quantity,
+                "quantity_unit": str(activity.get("quantity_unit") or "").strip(),
                 "status": "needs_review",
                 "review_source": "manual",
                 "updated_at": now,

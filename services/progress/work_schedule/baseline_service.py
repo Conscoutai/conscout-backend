@@ -452,6 +452,8 @@ def _schedule_zone_activity_mapping(
             "matched_activity_count": 0,
             "total_activity_count": 0,
             "unmapped_activity_count": 0,
+            "project_wide_activity_count": 0,
+            "zone_required_activity_count": 0,
             "zone_activity_counts": [
                 {"zone": zone_name, "activity_count": 0} for zone_name in zone_names
             ],
@@ -471,11 +473,26 @@ def _schedule_zone_activity_mapping(
     matched_activities = sum(
         int(item["activity_count"]) for item in zone_activity_counts
     )
+    unmatched_activities = max(total_activities - matched_activities, 0)
+    zone_required_activities = schedule_activities_collection.count_documents(
+        {
+            **activity_filter,
+            "photo_trackable": True,
+            "zone": {"$nin": zone_names},
+        }
+    )
+    project_wide_activities = max(
+        unmatched_activities - zone_required_activities,
+        0,
+    )
     return {
         "baseline_id": baseline_id,
         "matched_activity_count": matched_activities,
         "total_activity_count": total_activities,
-        "unmapped_activity_count": max(total_activities - matched_activities, 0),
+        # Kept for clients released before activity scope was introduced.
+        "unmapped_activity_count": unmatched_activities,
+        "project_wide_activity_count": project_wide_activities,
+        "zone_required_activity_count": zone_required_activities,
         "zone_activity_counts": zone_activity_counts,
     }
 

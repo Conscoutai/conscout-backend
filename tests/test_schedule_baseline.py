@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import os
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -19,7 +20,11 @@ from services.progress.work_schedule.xer_parser import (
 )
 from services.progress.work_schedule.zone_plan_parser import parse_zone_plan_pdf
 from services.progress.work_schedule import zone_plan_parser as zone_parser
-from services.progress.work_schedule import baseline_service, evidence_service
+from services.progress.work_schedule import (
+    analytics_service,
+    baseline_service,
+    evidence_service,
+)
 
 
 SAMPLE_XER_PATH = Path(
@@ -54,6 +59,33 @@ class XerParserTests(unittest.TestCase):
         self.assertEqual(zone_f_excavation["zone"], "Zone F")
         self.assertEqual(zone_f_excavation["work_category"], "excavation")
         self.assertTrue(zone_f_excavation["photo_trackable"])
+        project_wide = [
+            activity for activity in parsed["activities"] if not activity["zone"]
+        ]
+        self.assertEqual(len(project_wide), 104)
+        self.assertTrue(
+            all(not activity["photo_trackable"] for activity in project_wide)
+        )
+        self.assertTrue(all(activity["target_cost"] == 0 for activity in project_wide))
+        self.assertEqual(
+            Counter(activity["wbs_path"][1] for activity in project_wide),
+            {
+                "Materials Procurement": 78,
+                "Engineering": 16,
+                "Project Handing Over": 6,
+                "Project Milestones": 2,
+                "Mobilization & Preliminaries": 1,
+                "Testing & Commissioning": 1,
+            },
+        )
+        self.assertEqual(
+            sum(
+                1
+                for activity in parsed["activities"]
+                if activity["zone"] and activity["photo_trackable"]
+            ),
+            214,
+        )
 
     def test_invalid_xer_is_rejected(self):
         with self.assertRaises(XerParseError):
@@ -227,6 +259,28 @@ class ZonePlanParserTests(unittest.TestCase):
 
 
 class ZonePlanConfirmationTests(unittest.TestCase):
+    def test_activity_scope_separates_project_wide_from_zone_review(self):
+        baselines = Mock()
+        baselines.find_one.return_value = {"baseline_id": "baseline-1"}
+        activities = Mock()
+        activities.count_documents.side_effect = [398, 41, 51, 51, 50, 50, 51, 0]
+
+        with (
+            patch.object(baseline_service, "schedule_baselines_collection", baselines),
+            patch.object(
+                baseline_service, "schedule_activities_collection", activities
+            ),
+        ):
+            result = baseline_service._schedule_zone_activity_mapping(
+                project_id="project-1",
+                zones=[{"name": f"Zone {code}"} for code in "ABCDEF"],
+            )
+
+        self.assertEqual(result["matched_activity_count"], 294)
+        self.assertEqual(result["project_wide_activity_count"], 104)
+        self.assertEqual(result["zone_required_activity_count"], 0)
+        self.assertEqual(result["unmapped_activity_count"], 104)
+
     def test_manual_polygon_change_creates_a_reviewable_revision(self):
         floorplans = Mock()
         floorplans.update_many.return_value = Mock(matched_count=1)
@@ -323,7 +377,7 @@ class ZonePlanConfirmationTests(unittest.TestCase):
             "project_id": "project-1",
         }
         activities = Mock()
-        activities.count_documents.side_effect = [1, 1]
+        activities.count_documents.side_effect = [1, 1, 0]
 
         with (
             patch.object(
@@ -557,6 +611,116 @@ class ScheduleAnalyticsTests(unittest.TestCase):
         self.assertEqual(_planned_percent(activity, date(2026, 8, 14)), 100)
         self.assertGreater(_planned_percent(activity, date(2026, 8, 7)), 0)
         self.assertLess(_planned_percent(activity, date(2026, 8, 7)), 100)
+
+
+class _EvidenceCursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+
+class EvidenceHistoryTests(unittest.TestCase):
+    def test_manual_review_preserves_source_and_adds_audit_fields(self):
+        evidence_collection = Mock()
+        evidence_collection.find_one.side_effect = [
+            {
+                "evidence_id": "evidence-1",
+                "baseline_id": "baseline-1",
+                "project_id": "project-1",
+                "activity_internal_id": "activity-1",
+                "captured_at": "2026-08-13T06:31:00Z",
+                "review_source": "manual",
+            },
+            {"evidence_id": "evidence-1", "status": "approved"},
+        ]
+        activities = Mock()
+        activities.find_one.return_value = {
+            "planned_quantity": 500,
+            "quantity_unit": "m2",
+        }
+
+        with (
+            patch.object(
+                evidence_service,
+                "schedule_evidence_collection",
+                evidence_collection,
+            ),
+            patch.object(
+                evidence_service,
+                "schedule_activities_collection",
+                activities,
+            ),
+            patch.object(
+                evidence_service,
+                "_latest_approved_percent",
+                return_value=25,
+            ),
+            patch.object(
+                evidence_service,
+                "build_baseline_comparison",
+                return_value=None,
+            ),
+        ):
+            evidence_service.review_schedule_evidence(
+                evidence_id="evidence-1",
+                decision="approved",
+                approved_percent=40,
+                verified_quantity=200,
+                review_note="Measured on site",
+                reviewer_user_id="admin-1",
+                reviewer_email="admin@example.com",
+            )
+
+        stored = evidence_collection.update_one.call_args.args[1]["$set"]
+        self.assertEqual(stored["review_source"], "manual")
+        self.assertEqual(stored["previous_approved_percent"], 25)
+        self.assertEqual(stored["approved_percent"], 40)
+        self.assertEqual(stored["verified_quantity"], 200)
+        self.assertEqual(stored["quantity_unit"], "m2")
+        self.assertEqual(stored["reviewed_by_email"], "admin@example.com")
+
+    def test_activity_evidence_response_includes_audit_metadata(self):
+        evidence_collection = Mock()
+        evidence_collection.find.return_value = _EvidenceCursor(
+            [
+                {
+                    "evidence_id": "evidence-1",
+                    "baseline_id": "baseline-1",
+                    "activity_internal_id": "activity-1",
+                    "tour_id": "manual:2026-08-13",
+                    "tour_name": "Manual verified update",
+                    "captured_at": "2026-08-13T06:31:00Z",
+                    "status": "approved",
+                    "approved_percent": 100,
+                    "previous_approved_percent": 40,
+                    "verified_quantity": 500,
+                    "quantity_unit": "m2",
+                    "review_source": "manual",
+                    "reviewed_at": "2026-08-13T06:32:00Z",
+                    "reviewed_by_email": "admin@example.com",
+                    "review_note": "Completed",
+                    "rationale": "Verified by a project administrator",
+                }
+            ]
+        )
+
+        with patch.object(
+            analytics_service,
+            "schedule_evidence_collection",
+            evidence_collection,
+        ):
+            _, evidence_by_activity, _ = analytics_service._evidence_by_activity(
+                baseline_id="baseline-1",
+                as_of=date(2026, 8, 13),
+                timezone_name="Asia/Riyadh",
+            )
+
+        public_item = evidence_by_activity["activity-1"][0]
+        self.assertEqual(public_item["review_source"], "manual")
+        self.assertEqual(public_item["previous_approved_percent"], 40)
+        self.assertEqual(public_item["verified_quantity"], 500)
+        self.assertEqual(public_item["quantity_unit"], "m2")
+        self.assertEqual(public_item["reviewed_by_email"], "admin@example.com")
+        self.assertEqual(public_item["review_note"], "Completed")
 
 
 if __name__ == "__main__":

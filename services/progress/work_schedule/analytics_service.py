@@ -216,7 +216,16 @@ def _evidence_by_activity(
             "status": str(evidence.get("status") or "needs_review"),
             "suggested_percent": evidence.get("suggested_percent"),
             "approved_percent": evidence.get("approved_percent"),
+            "previous_approved_percent": evidence.get(
+                "previous_approved_percent"
+            ),
+            "verified_quantity": evidence.get("verified_quantity"),
+            "quantity_unit": str(evidence.get("quantity_unit") or ""),
             "review_note": str(evidence.get("review_note") or ""),
+            "review_source": str(evidence.get("review_source") or ""),
+            "reviewed_at": evidence.get("reviewed_at"),
+            "reviewed_by_email": str(evidence.get("reviewed_by_email") or ""),
+            "rationale": str(evidence.get("rationale") or ""),
         }
         evidence_by_activity[activity_key].append(public_item)
         if evidence.get("status") == "approved" and evidence.get("approved_percent") is not None:
