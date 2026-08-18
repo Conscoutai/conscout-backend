@@ -1208,6 +1208,27 @@ def _filter_records(
     return [item for item in records if matches(item)]
 
 
+def _automated_workforce_observations(
+    records: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return only observations produced by tour/CV analysis."""
+    accepted_sources = {
+        "existing_tour_ai",
+        "tour_ai",
+        "ai_model",
+        "computer_vision",
+    }
+    automated: list[dict[str, Any]] = []
+    for item in records:
+        source = str(item.get("source") or "").strip().lower()
+        linked_analysis = bool(item.get("analysis_job_id")) and bool(
+            item.get("tour_id")
+        )
+        if source in accepted_sources or linked_analysis:
+            automated.append(item)
+    return automated
+
+
 def _manpower_history(
     plans: list[dict[str, Any]],
     observations: list[dict[str, Any]],
@@ -1236,11 +1257,14 @@ def _manpower_history(
         record_day = cursor.isoformat()
         plan = latest_plans.get(record_day) or {}
         observation = latest_observations.get(record_day) or {}
+        planned_raw = plan.get("planned_workers")
         observed_raw = observation.get("observed_workers")
         history.append(
             {
                 "record_date": record_day,
-                "planned_workers": int(plan.get("planned_workers") or 0),
+                "planned_workers": int(planned_raw)
+                if planned_raw is not None
+                else None,
                 "observed_workers": int(observed_raw) if observed_raw is not None else None,
                 "source": observation.get("source"),
                 "requires_review": bool(observation.get("requires_review")),
@@ -1310,12 +1334,13 @@ def build_dashboard(
     project = context.get("document") or {}
     bounds = project.get("bounds") if isinstance(project.get("bounds"), dict) else {}
     day = record_date or today_iso()
-    plans = list_records(project_ref, "workforce_plan", limit=1000)
-    observations = _filter_records(
-        list_records(project_ref, "workforce_observation", limit=1000),
-        shift=shift,
-        tour_id=tour_id,
-        zone_id=zone_id,
+    observations = _automated_workforce_observations(
+        _filter_records(
+            list_records(project_ref, "workforce_observation", limit=1000),
+            shift=shift,
+            tour_id=tour_id,
+            zone_id=zone_id,
+        )
     )
     findings = _filter_records(
         list_records(project_ref, "safety_finding", limit=1000),
@@ -1337,26 +1362,25 @@ def build_dashboard(
     weather_events = list_records(project_ref, "weather_observation", limit=25)
     jobs = list_analysis_jobs(project_ref, limit=10)
     weather = get_weather(project_ref)
-    plan = _latest_by_date(plans, day)
     observation = _latest_by_date(observations, day)
-    history = _manpower_history(plans, observations, through_date=day)
+    history = _manpower_history([], observations, through_date=day)
     schedule_plans, schedule_partial = _schedule_manpower_for_dates(
         project_ref, [item["record_date"] for item in history]
     )
-    manual_plan_dates = {str(item.get("record_date") or "") for item in plans}
     for item in history:
         record_day = item["record_date"]
-        if record_day not in manual_plan_dates and record_day in schedule_plans:
+        if record_day in schedule_plans:
             item.update(schedule_plans[record_day])
     schedule_plan = schedule_plans.get(day) or {}
-    planned = int(
-        (plan or {}).get("planned_workers")
-        if plan is not None
-        else schedule_plan.get("planned_workers") or 0
-    )
+    planned_raw = schedule_plan.get("planned_workers")
+    planned = int(planned_raw) if planned_raw is not None else None
     observed_raw = (observation or {}).get("observed_workers")
     observed = int(observed_raw) if observed_raw is not None else None
-    variance = observed - planned if observed is not None else None
+    variance = (
+        observed - planned
+        if observed is not None and planned is not None
+        else None
+    )
     open_findings = [item for item in findings if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified"}]
     open_hazards = [item for item in hazards if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified"}]
     critical = [
@@ -1397,7 +1421,7 @@ def build_dashboard(
                 if observation is not None
                 else f"Tour safety analysis is {latest_job_status.replace('_', ' ')}"
                 if latest_job_status
-                else "No reviewed or manual workforce observation is available"
+                else "No tour AI workforce observation is available"
             )
             + "; compliance is unknown"
         )
@@ -1416,10 +1440,8 @@ def build_dashboard(
             "variance": variance,
             "observation_source": (observation or {}).get("source"),
             "requires_review": bool((observation or {}).get("requires_review")),
-            "planned_source": "manual" if plan is not None else schedule_plan.get("source", "unavailable"),
-            "planned_labor_hours": (plan or {}).get(
-                "planned_labor_hours", schedule_plan.get("planned_labor_hours")
-            ),
+            "planned_source": schedule_plan.get("source", "unavailable"),
+            "planned_labor_hours": schedule_plan.get("planned_labor_hours"),
             "plan_period_start": schedule_plan.get("period_start"),
             "plan_period_end": schedule_plan.get("period_end"),
             "labor_loaded_activity_count": schedule_plan.get(
@@ -1441,7 +1463,10 @@ def build_dashboard(
                 ]
                 or [0]
             ),
-            "observation_coverage": (observation or {}).get("sample_count"),
+            "observation_coverage": (observation or {}).get(
+                "sample_count",
+                ((observation or {}).get("calculation") or {}).get("sample_count"),
+            ),
             "observation_confidence": (observation or {}).get("confidence"),
         },
         "weather": weather,

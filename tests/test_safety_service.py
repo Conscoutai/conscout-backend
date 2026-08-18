@@ -134,6 +134,70 @@ def test_schedule_manpower_includes_week_and_labor_loading_coverage():
     assert plan["schedule_activity_count"] == 398
 
 
+def test_dashboard_ignores_manual_demo_manpower_records():
+    day = "2024-10-16"
+    manual_observation = {
+        "record_id": "manual_1",
+        "record_date": day,
+        "observed_workers": 30,
+        "source": "manual",
+    }
+    ai_observation = {
+        "record_id": "ai_1",
+        "record_date": day,
+        "observed_workers": 8,
+        "source": "existing_tour_ai",
+        "tour_id": "tour_1",
+        "requires_review": False,
+    }
+
+    def records(_project_ref, record_type, *, limit=1000):
+        del limit
+        if record_type == "workforce_observation":
+            return [manual_observation, ai_observation]
+        return []
+
+    schedule_plan = {
+        day: {
+            "planned_workers": 3,
+            "planned_labor_hours": 141.47,
+            "source": "active_schedule",
+            "period_start": "2024-10-13",
+            "period_end": "2024-10-19",
+            "labor_loaded_activity_count": 7,
+            "schedule_activity_count": 398,
+        }
+    }
+    context = {
+        "project_id": "project_1",
+        "site_name": "Fozan",
+        "floorplan_id": "floorplan_1",
+        "document": {},
+    }
+    with patch(
+        "services.safety.safety_service.project_context", return_value=context
+    ), patch(
+        "services.safety.safety_service.list_records", side_effect=records
+    ), patch(
+        "services.safety.safety_service.list_analysis_jobs", return_value=[]
+    ), patch(
+        "services.safety.safety_service.get_weather",
+        return_value={"work_state": "safe", "reasons": []},
+    ), patch(
+        "services.safety.safety_service._schedule_manpower_for_dates",
+        return_value=(schedule_plan, True),
+    ):
+        dashboard = safety_service.build_dashboard("project_1", record_date=day)
+
+    assert dashboard["manpower"]["planned_workers"] == 3
+    assert dashboard["manpower"]["planned_source"] == "active_schedule"
+    assert dashboard["manpower"]["observed_workers"] == 8
+    assert dashboard["manpower"]["variance"] == 5
+    assert [item["record_id"] for item in dashboard["recent"]["observations"]] == [
+        "ai_1"
+    ]
+
+
 def test_permit_verification_requires_active_dates_and_confirmed_controls():
     now = datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc)
     permit = {
