@@ -19,7 +19,11 @@ from core.config import (
     APP_VERSION,
     DATA_DIR,
 )
-from core.database import ensure_admin_directory_indexes, ensure_schedule_indexes
+from core.database import (
+    ensure_admin_directory_indexes,
+    ensure_safety_indexes,
+    ensure_schedule_indexes,
+)
 from services.progress.weekly_progress_notification_service import (
     ensure_weekly_progress_scheduler_started,
 )
@@ -53,6 +57,7 @@ for directory in (DATA_DIR,):
 def startup_background_jobs():
     if APP_SURFACE == "main":
         ensure_admin_directory_indexes()
+        ensure_safety_indexes()
         ensure_schedule_indexes()
     ensure_weekly_progress_scheduler_started()
     ensure_subscription_billing_scheduler_started()

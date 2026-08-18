@@ -3,7 +3,15 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Depends
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
 
 from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
@@ -25,6 +33,7 @@ from services.progress.work_schedule.evidence_service import analyze_tour_schedu
 from services.progress.work_schedule.work_schedule_notification_service import (
     sync_schedule_delay_notifications,
 )
+from services.safety.safety_service import create_analysis_job, run_analysis_job
 
 router = APIRouter(tags=["StreetCapture"])
 
@@ -120,6 +129,7 @@ async def rename_street_capture(
 async def save_street_capture_tour(
     tour_id: str,
     payload: dict,
+    background_tasks: BackgroundTasks,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
@@ -206,6 +216,30 @@ async def save_street_capture_tour(
             # must never make tour finalization fail.
             pass
 
+    safety_analysis = {
+        "status": "skipped",
+        "reason": "Project identity was unavailable",
+    }
+    if schedule_project_ref:
+        try:
+            safety_job, created = create_analysis_job(
+                schedule_project_ref,
+                tour_id=tour_id,
+                user=current_user,
+            )
+            if created:
+                background_tasks.add_task(run_analysis_job, safety_job["job_id"])
+            safety_analysis = {
+                "status": str(safety_job.get("status") or "queued"),
+                "created": created,
+                "job_id": safety_job.get("job_id"),
+                "analysis_version": safety_job.get("analysis_version"),
+            }
+        except Exception as error:
+            # Tour save is authoritative. Safety analysis can be retried from
+            # its own endpoint without rolling back a completed upload.
+            safety_analysis = {"status": "failed_to_queue", "reason": str(error)}
+
     notification_result = {
         "created_count": 0,
         "duplicate_count": 0,
@@ -236,6 +270,7 @@ async def save_street_capture_tour(
         "progress": result["progress"],
         "schedule_analysis": schedule_analysis,
         "schedule_notifications": schedule_notifications,
+        "safety_analysis": safety_analysis,
         "notifications": notification_result,
     }
 

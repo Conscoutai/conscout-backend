@@ -681,3 +681,61 @@ def sync_safety_issue_notifications(
         "updated_count": updated_count,
         "resolved_count": resolved_count,
     }
+
+
+def sync_safety_record_notification(
+    *,
+    project_id: str,
+    record: dict[str, Any],
+    current_user: AuthenticatedUser | None = None,
+) -> dict[str, Any]:
+    """Create or resolve a push notification for a Phase 1 hazard/finding."""
+    record_id = str(record.get("record_id") or "").strip()
+    if not record_id:
+        return {"status": "skipped", "reason": "missing_record_id"}
+    project = _project_doc(project_id)
+    site_name = _site_name(project, project_id)
+    status = str(record.get("status") or "open").strip().lower()
+    severity = str(record.get("severity") or "medium").strip().lower()
+    if status in CLOSED_STATUSES or severity not in {"high", "critical"}:
+        resolved = _resolve_notifications_for_source(
+            site_name=site_name,
+            entity_id=record_id,
+        )
+        return {"status": "resolved", "resolved_count": resolved}
+
+    title = str(record.get("title") or "Site safety hazard").strip()
+    entity_type = str(record.get("record_type") or "hazard").strip()
+    point = record.get("point") if isinstance(record.get("point"), dict) else {}
+    payload = {
+        "title": "Safety compliance issue",
+        "message": f"{title} in {site_name}.",
+        "severity": severity,
+        "entity_id": record_id,
+        "entity_type": entity_type,
+        "route": f"/projects/{site_name}/safety",
+        "metadata": {
+            "project_name": site_name,
+            "issue_id": record_id,
+            "issue_category": entity_type.replace("_", " ").title(),
+            "risk_level": severity.title(),
+            "source": str(record.get("source") or "safety_dashboard"),
+            "floor_level": str(record.get("floor_level") or ""),
+            "point": point,
+        },
+    }
+    created = 0
+    updated = 0
+    for recipient in _dedup_recipients(
+        _project_users(project, fallback_user=current_user)
+    ):
+        outcome = _upsert_notification(
+            recipient=recipient,
+            site_name=site_name,
+            payload=payload,
+        )
+        if outcome == "created":
+            created += 1
+        elif outcome == "updated":
+            updated += 1
+    return {"status": "synced", "created_count": created, "updated_count": updated}

@@ -358,6 +358,13 @@ AI_SERVICE_URL = _env("AI_SERVICE_URL", "http://localhost:8001")
 AI_SYNC_TIMEOUT_SECONDS = _env_int("AI_SYNC_TIMEOUT_SECONDS", 300)
 AI_PROCESS_TIMEOUT_SECONDS = _env_int("AI_PROCESS_TIMEOUT_SECONDS", 900)
 
+# Phase 1 live weather. Production/commercial deployments should configure the
+# licensed customer endpoint and key supplied by their weather provider.
+WEATHER_API_URL = _env(
+    "WEATHER_API_URL", "https://api.open-meteo.com/v1/forecast"
+)
+WEATHER_API_KEY = _env("WEATHER_API_KEY", "")
+
 # ---------------------------------------------------------
 # AI Inference
 # ---------------------------------------------------------

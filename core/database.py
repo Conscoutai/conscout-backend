@@ -96,6 +96,9 @@ raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
 raw_notifications_collection = db["notifications"]
 raw_notification_devices_collection = db["notification_devices"]
+raw_safety_records_collection = db["safety_records"]
+raw_safety_analysis_jobs_collection = db["safety_analysis_jobs"]
+raw_safety_audit_events_collection = db["safety_audit_events"]
 raw_subscription_requests_collection = db["subscription_requests"]
 raw_subscription_checkout_sessions_collection = db["subscription_checkout_sessions"]
 raw_subscription_payments_collection = db["subscription_payments"]
@@ -147,6 +150,33 @@ def ensure_schedule_indexes() -> None:
         name="unique_schedule_snapshot_date",
     )
 
+
+def ensure_safety_indexes() -> None:
+    """Create the Phase 1 safety/manpower query and idempotency indexes."""
+    raw_safety_records_collection.create_index(
+        "record_id", unique=True, name="unique_safety_record_id"
+    )
+    raw_safety_records_collection.create_index(
+        [("project_id", 1), ("record_type", 1), ("record_date", -1)],
+        name="safety_project_type_date",
+    )
+    raw_safety_records_collection.create_index(
+        [("project_id", 1), ("record_type", 1), ("status", 1)],
+        name="safety_project_type_status",
+    )
+    raw_safety_analysis_jobs_collection.create_index(
+        "job_id", unique=True, name="unique_safety_analysis_job_id"
+    )
+    raw_safety_analysis_jobs_collection.create_index(
+        [("project_id", 1), ("tour_id", 1), ("analysis_version", 1)],
+        unique=True,
+        name="unique_safety_tour_analysis_version",
+    )
+    raw_safety_audit_events_collection.create_index(
+        [("project_id", 1), ("created_at", -1)],
+        name="safety_audit_project_created",
+    )
+
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.
 floorplans_collection = ScopedCollection(raw_floorplans_collection)
@@ -164,3 +194,6 @@ users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
 notifications_collection = raw_notifications_collection
 notification_devices_collection = raw_notification_devices_collection
+safety_records_collection = ScopedCollection(raw_safety_records_collection)
+safety_analysis_jobs_collection = ScopedCollection(raw_safety_analysis_jobs_collection)
+safety_audit_events_collection = ScopedCollection(raw_safety_audit_events_collection)

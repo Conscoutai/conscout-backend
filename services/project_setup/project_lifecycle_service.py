@@ -7,6 +7,9 @@ from core.database import (
     floorplans_collection,
     inspections_collection,
     notifications_collection,
+    safety_analysis_jobs_collection,
+    safety_audit_events_collection,
+    safety_records_collection,
     tours_collection,
     work_schedules_collection,
 )
@@ -62,6 +65,11 @@ def delete_project(site_name: str) -> None:
         for doc in floorplans
         if str(doc.get("id") or "").strip()
     ]
+    project_ids = [
+        str(doc.get("project_id") or doc.get("id") or "").strip()
+        for doc in floorplans
+        if str(doc.get("project_id") or doc.get("id") or "").strip()
+    ]
     tour_filter = {
         "$or": [
             {"site_name": normalized_site},
@@ -93,15 +101,23 @@ def delete_project(site_name: str) -> None:
     site_dirs_to_remove.add(os.path.abspath(os.path.join(SITES_DIR, normalized_site)))
 
     for doc in [*floorplans, *tours]:
-        site_dirs_to_remove.add(
-            os.path.abspath(
-                site_dir(
-                    normalized_site,
-                    owner_email=doc.get("owner_email"),
-                    owner_user_id=doc.get("owner_user_id"),
+        directory_names = {
+            normalized_site,
+            str(doc.get("project_id") or "").strip(),
+            str(doc.get("id") or "").strip(),
+        }
+        for directory_name in directory_names:
+            if not directory_name:
+                continue
+            site_dirs_to_remove.add(
+                os.path.abspath(
+                    site_dir(
+                        directory_name,
+                        owner_email=doc.get("owner_email"),
+                        owner_user_id=doc.get("owner_user_id"),
+                    )
                 )
             )
-        )
 
     floorplans_collection.delete_many(
         site_filter
@@ -114,6 +130,17 @@ def delete_project(site_name: str) -> None:
     )
     inspections_collection.delete_many({"site_name": normalized_site})
     notifications_collection.delete_many({"site_name": normalized_site})
+    safety_filter = {
+        "$or": [
+            {"project_id": normalized_site},
+            {"site_name": normalized_site},
+            *([{"project_id": {"$in": project_ids}}] if project_ids else []),
+            *([{"floorplan_id": {"$in": floorplan_ids}}] if floorplan_ids else []),
+        ]
+    }
+    safety_records_collection.delete_many(safety_filter)
+    safety_analysis_jobs_collection.delete_many(safety_filter)
+    safety_audit_events_collection.delete_many(safety_filter)
 
     for project_dir in site_dirs_to_remove:
         if os.path.isdir(project_dir):
@@ -151,6 +178,15 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         tours_collection.update_many(
             {"floorplan_id": project_id},
             {"$set": {"site_name": new_site}},
+        )
+        safety_records_collection.update_many(
+            {"project_id": project_id}, {"$set": {"site_name": new_site}}
+        )
+        safety_analysis_jobs_collection.update_many(
+            {"project_id": project_id}, {"$set": {"site_name": new_site}}
+        )
+        safety_audit_events_collection.update_many(
+            {"project_id": project_id}, {"$set": {"site_name": new_site}}
         )
         return
 
@@ -196,3 +232,12 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         {"project_id": old_site},
         {"$set": {"project_id": new_site}},
     )
+    for collection in (
+        safety_records_collection,
+        safety_analysis_jobs_collection,
+        safety_audit_events_collection,
+    ):
+        collection.update_many(
+            {"site_name": old_site},
+            {"$set": {"site_name": new_site}},
+        )

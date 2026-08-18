@@ -9,6 +9,9 @@ from core.database import (
     raw_floorplans_collection,
     raw_inspections_collection,
     raw_notifications_collection,
+    raw_safety_analysis_jobs_collection,
+    raw_safety_audit_events_collection,
+    raw_safety_records_collection,
     raw_tours_collection,
     raw_users_collection,
     raw_work_schedules_collection,
@@ -97,6 +100,15 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
     inspections_deleted = raw_inspections_collection.delete_many(
         owned_filter
     ).deleted_count
+    safety_records_deleted = raw_safety_records_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    safety_jobs_deleted = raw_safety_analysis_jobs_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    safety_audit_events_deleted = raw_safety_audit_events_collection.delete_many(
+        owned_filter
+    ).deleted_count
 
     stakeholder_refs_removed = 0
     if normalized_email:
@@ -118,6 +130,9 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
         "tours_deleted": tours_deleted,
         "work_schedules_deleted": work_schedules_deleted,
         "inspections_deleted": inspections_deleted,
+        "safety_records_deleted": safety_records_deleted,
+        "safety_jobs_deleted": safety_jobs_deleted,
+        "safety_audit_events_deleted": safety_audit_events_deleted,
         "notifications_deleted": notifications_deleted,
         "stakeholder_refs_removed": stakeholder_refs_removed,
         "users_deleted": users_deleted,
