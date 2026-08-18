@@ -17,6 +17,7 @@ from pymongo.errors import DuplicateKeyError
 from core.auth_context import AuthenticatedUser
 from core.config import WEATHER_API_KEY, WEATHER_API_URL, site_dir
 from core.database import (
+    raw_inspections_collection,
     raw_safety_analysis_jobs_collection,
     raw_safety_records_collection,
     raw_tours_collection,
@@ -135,6 +136,67 @@ def _identity(context: dict[str, Any]) -> dict[str, str]:
         "site_name": context["site_name"],
         "floorplan_id": context["floorplan_id"],
     }
+
+
+_COMPLETED_PROJECT_INSPECTION_STATUSES = {
+    "closed",
+    "complete",
+    "completed",
+    "resolved",
+    "verified",
+}
+
+
+def _project_inspection_status_records(
+    context: dict[str, Any], *, through_date: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Expose the existing Project Details inspections to the Safety dashboard."""
+    site_name = str(context.get("site_name") or "").strip()
+    if not site_name:
+        return [], []
+    try:
+        reference_day = date.fromisoformat(through_date[:10])
+    except (TypeError, ValueError):
+        reference_day = date.today()
+    documents = list(
+        raw_inspections_collection.find({"site_name": site_name})
+        .sort([("updated_at", -1), ("created_at", -1)])
+        .limit(250)
+    )
+    records: list[dict[str, Any]] = []
+    overdue: list[dict[str, Any]] = []
+    for document in documents:
+        status = str(document.get("status") or "pending").strip().lower()
+        due_value = str(document.get("due_date") or "").strip()
+        try:
+            due_day = date.fromisoformat(due_value[:10]) if due_value else None
+        except ValueError:
+            due_day = None
+        is_completed = status in _COMPLETED_PROJECT_INSPECTION_STATUSES
+        is_overdue = not is_completed and (
+            status in {"delayed", "overdue"}
+            or (due_day is not None and due_day < reference_day)
+        )
+        record = {
+            "record_id": str(document.get("inspection_id") or "").strip(),
+            "record_type": "project_inspection",
+            "record_date": due_value,
+            "title": str(document.get("title") or "Project inspection").strip(),
+            "description": str(document.get("description") or "").strip(),
+            "notes": str(document.get("completion_note") or "").strip(),
+            "status": "overdue" if is_overdue else status,
+            "assigned_to": str(document.get("assigned_to") or "").strip(),
+            "due_at": due_value,
+            "department": str(document.get("department") or "").strip(),
+            "linked_tours": list(document.get("linked_tours") or []),
+            "source": "project_inspections",
+            "created_at": document.get("created_at"),
+            "updated_at": document.get("updated_at"),
+        }
+        records.append(record)
+        if is_overdue:
+            overdue.append(record)
+    return records, overdue
 
 
 def _record_id(record_type: str) -> str:
@@ -1355,8 +1417,9 @@ def build_dashboard(
         zone_id=zone_id,
     )
     permits = list_records(project_ref, "permit", limit=1000)
-    checks = list_records(project_ref, "check_run", limit=1000)
-    check_templates = list_records(project_ref, "check_template", limit=250)
+    checks, overdue_checks = _project_inspection_status_records(
+        context, through_date=day
+    )
     zones = list_records(project_ref, "safety_zone", limit=1000)
     reports = list_records(project_ref, "daily_report", limit=25)
     weather_events = list_records(project_ref, "weather_observation", limit=25)
@@ -1403,7 +1466,6 @@ def build_dashboard(
     )
     ppe_evaluated = ppe_compliant + ppe_non_compliant
     active_permits = [item for item in permits if str(item.get("status") or "").lower() in {"approved", "active"}]
-    overdue_checks = [item for item in checks if str(item.get("status") or "").lower() == "overdue"]
     work_state = str(weather.get("work_state") or "unknown")
     reasons = list(weather.get("reasons") or [])
     latest_job_status = str((jobs[0] if jobs else {}).get("status") or "").lower()
@@ -1528,7 +1590,7 @@ def build_dashboard(
             "hazards": hazards[:10],
             "permits": permits[:10],
             "checks": checks[:10],
-            "check_templates": check_templates[:10],
+            "check_templates": [],
             "zones": zones[:10],
             "reports": reports[:10],
             "weather_events": weather_events[:10],
@@ -1684,7 +1746,7 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
         f"Weather: wind {weather.get('wind_kph', 'N/A')} km/h, apparent heat {weather.get('apparent_temperature_c', 'N/A')} C, rain {weather.get('precipitation_mm_h', 'N/A')} mm/h",
         f"Open hazards: {counts.get('open_hazards', 0)}",
         f"Active permits: {counts.get('active_permits', 0)}",
-        f"Overdue checks: {counts.get('overdue_checks', 0)}",
+        f"Overdue project inspections: {counts.get('overdue_checks', 0)}",
         f"Active exclusion zones: {counts.get('active_zones', 0)}",
         f"Workforce records included: {len(recent.get('observations') or [])}",
         f"Safety findings included: {len(recent.get('findings') or [])}",

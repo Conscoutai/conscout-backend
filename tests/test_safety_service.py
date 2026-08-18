@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 
@@ -186,6 +186,9 @@ def test_dashboard_ignores_manual_demo_manpower_records():
     ), patch(
         "services.safety.safety_service._schedule_manpower_for_dates",
         return_value=(schedule_plan, True),
+    ), patch(
+        "services.safety.safety_service._project_inspection_status_records",
+        return_value=([], []),
     ):
         dashboard = safety_service.build_dashboard("project_1", record_date=day)
 
@@ -196,6 +199,49 @@ def test_dashboard_ignores_manual_demo_manpower_records():
     assert [item["record_id"] for item in dashboard["recent"]["observations"]] == [
         "ai_1"
     ]
+
+
+def test_safety_dashboard_reuses_project_detail_inspections():
+    collection = MagicMock()
+    collection.find.return_value.sort.return_value.limit.return_value = [
+        {
+            "inspection_id": "inspection_overdue",
+            "site_name": "Fozan",
+            "title": "Scaffold tag inspection",
+            "status": "Pending",
+            "due_date": "2026-08-17",
+            "assigned_to": "Inspector One",
+        },
+        {
+            "inspection_id": "inspection_complete",
+            "site_name": "Fozan",
+            "title": "Machinery pre-start",
+            "status": "Completed",
+            "due_date": "2026-08-16",
+        },
+    ]
+    context = {
+        "project_id": "project_1",
+        "site_name": "Fozan",
+        "floorplan_id": "floorplan_1",
+        "document": {},
+    }
+
+    with patch(
+        "services.safety.safety_service.raw_inspections_collection", collection
+    ):
+        records, overdue = safety_service._project_inspection_status_records(
+            context,
+            through_date="2026-08-18",
+        )
+
+    assert [item["record_id"] for item in records] == [
+        "inspection_overdue",
+        "inspection_complete",
+    ]
+    assert records[0]["status"] == "overdue"
+    assert records[0]["source"] == "project_inspections"
+    assert [item["record_id"] for item in overdue] == ["inspection_overdue"]
 
 
 def test_permit_verification_requires_active_dates_and_confirmed_controls():
