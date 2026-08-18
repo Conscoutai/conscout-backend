@@ -22,6 +22,7 @@ from services.safety.safety_service import (
     list_analysis_jobs,
     list_audit_events,
     list_records,
+    review_daily_report,
     render_daily_report_pdf,
     run_analysis_job,
     save_record_attachment,
@@ -79,6 +80,14 @@ class SafetyConfigPayload(BaseModel):
     timezone: Optional[str] = None
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    daily_report_cutoff: Optional[str] = None
+    auto_daily_reports: Optional[bool] = None
+    report_recipients: Optional[list[str]] = None
+    hazard_categories: Optional[list[str]] = None
+    hazard_resolution_hours: Optional[int] = Field(default=None, ge=1)
+    permit_types: Optional[list[str]] = None
+    required_permit_approvals: Optional[int] = Field(default=None, ge=0)
+    shift_names: Optional[list[str]] = None
 
 
 class AnalysisJobPayload(BaseModel):
@@ -102,6 +111,11 @@ class GeofenceEvaluationPayload(BaseModel):
     entity_type: str = "worker"
     entity_id: str = ""
     create_findings: bool = False
+
+
+class PermitStartPayload(BaseModel):
+    activity_type: Optional[str] = None
+    zone_id: Optional[str] = None
 
 
 def _payload(model: BaseModel) -> dict[str, Any]:
@@ -130,8 +144,20 @@ def save_safety_config(
 
 
 @router.get("/projects/{project_id}/safety/dashboard")
-def safety_dashboard(project_id: str, record_date: str = ""):
-    return build_dashboard(project_id, record_date=record_date)
+def safety_dashboard(
+    project_id: str,
+    record_date: str = "",
+    shift: str = "",
+    tour_id: str = "",
+    zone_id: str = "",
+):
+    return build_dashboard(
+        project_id,
+        record_date=record_date,
+        shift=shift,
+        tour_id=tour_id,
+        zone_id=zone_id,
+    )
 
 
 def _list(project_id: str, record_type: str, status: str, record_date: str, limit: int):
@@ -269,6 +295,25 @@ def review_safety_finding(
     return update_record(project_id, record_type="safety_finding", record_id=record_id, payload=values, user=current_user)
 
 
+@router.post("/projects/{project_id}/safety/findings/{record_id}/attachments", status_code=201)
+async def add_finding_attachment(
+    project_id: str,
+    record_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    content = await file.read()
+    return save_record_attachment(
+        project_id,
+        record_type="safety_finding",
+        record_id=record_id,
+        filename=file.filename or "attachment",
+        content_type=file.content_type or "application/octet-stream",
+        content=content,
+        user=current_user,
+    )
+
+
 @router.get("/projects/{project_id}/safety/weather")
 def current_weather(project_id: str, refresh: bool = False):
     return get_weather(project_id, refresh=refresh)
@@ -287,6 +332,29 @@ def manual_weather_observation(
 @router.get("/projects/{project_id}/safety/weather/events")
 def weather_events(project_id: str, limit: int = Query(250, ge=1, le=1000)):
     return _list(project_id, "weather_observation", "", "", limit)
+
+
+@router.put("/projects/{project_id}/safety/weather/events/{record_id}")
+def update_weather_event(
+    project_id: str,
+    record_id: str,
+    payload: FlexiblePayload,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    _ensure_manager(current_user)
+    values = _payload(payload)
+    values["acknowledged_by"] = {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "name": current_user.name,
+    }
+    return update_record(
+        project_id,
+        record_type="weather_observation",
+        record_id=record_id,
+        payload=values,
+        user=current_user,
+    )
 
 
 @router.post("/projects/{project_id}/safety/geofence/evaluate")
@@ -354,13 +422,40 @@ def update_permit(project_id: str, record_id: str, payload: FlexiblePayload, cur
     return update_record(project_id, record_type="permit", record_id=record_id, payload=_payload(payload), user=current_user)
 
 
+@router.post("/projects/{project_id}/safety/permits/{record_id}/attachments", status_code=201)
+async def add_permit_attachment(
+    project_id: str,
+    record_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    content = await file.read()
+    return save_record_attachment(
+        project_id,
+        record_type="permit",
+        record_id=record_id,
+        filename=file.filename or "attachment",
+        content_type=file.content_type or "application/octet-stream",
+        content=content,
+        user=current_user,
+    )
+
+
 @router.post("/projects/{project_id}/safety/permits/{record_id}/verify-start")
 def verify_permit(
     project_id: str,
     record_id: str,
+    payload: Optional[PermitStartPayload] = None,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
-    return verify_permit_record(project_id, record_id, user=current_user)
+    values = _payload(payload) if payload else {}
+    return verify_permit_record(
+        project_id,
+        record_id,
+        user=current_user,
+        expected_activity_type=str(values.get("activity_type") or ""),
+        expected_zone_id=str(values.get("zone_id") or ""),
+    )
 
 
 @router.post("/projects/{project_id}/safety/check-templates", status_code=201)
@@ -382,6 +477,25 @@ def create_check_run(project_id: str, payload: FlexiblePayload, current_user: Au
 @router.put("/projects/{project_id}/safety/check-runs/{record_id}")
 def update_check_run(project_id: str, record_id: str, payload: FlexiblePayload, current_user: AuthenticatedUser = Depends(require_authenticated_user)):
     return update_record(project_id, record_type="check_run", record_id=record_id, payload=_payload(payload), user=current_user)
+
+
+@router.post("/projects/{project_id}/safety/check-runs/{record_id}/attachments", status_code=201)
+async def add_check_attachment(
+    project_id: str,
+    record_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    content = await file.read()
+    return save_record_attachment(
+        project_id,
+        record_type="check_run",
+        record_id=record_id,
+        filename=file.filename or "attachment",
+        content_type=file.content_type or "application/octet-stream",
+        content=content,
+        user=current_user,
+    )
 
 
 @router.post("/projects/{project_id}/safety/hazards", status_code=201)
@@ -425,7 +539,13 @@ def generate_report(project_id: str, payload: ReportGeneratePayload, current_use
 @router.put("/projects/{project_id}/safety/daily-reports/{record_id}/review")
 def review_report(project_id: str, record_id: str, payload: FlexiblePayload, current_user: AuthenticatedUser = Depends(require_authenticated_user)):
     _ensure_manager(current_user)
-    return update_record(project_id, record_type="daily_report", record_id=record_id, payload=_payload(payload), user=current_user)
+    values = _payload(payload)
+    return review_daily_report(
+        project_id,
+        record_id,
+        notes=str(values.get("notes") or values.get("review_notes") or ""),
+        user=current_user,
+    )
 
 
 @router.post("/projects/{project_id}/safety/daily-reports/{record_id}/finalize")

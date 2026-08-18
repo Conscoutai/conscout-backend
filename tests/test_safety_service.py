@@ -1,6 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
+from core.auth_context import AuthenticatedUser
+
 from services.safety import safety_service
 from services.safety.safety_service import (
     DEFAULT_SAFETY_CONFIG,
@@ -8,8 +12,11 @@ from services.safety.safety_service import (
     point_in_polygon,
     preliminary_worker_count,
     render_daily_report_pdf,
+    finalize_daily_report,
     verify_permit_for_start,
+    validate_safety_config,
 )
+from services.safety.daily_report_scheduler import due_report_date
 
 
 def test_weather_thresholds_return_safe_caution_and_stop_work():
@@ -112,6 +119,55 @@ def test_permit_verification_requires_active_dates_and_confirmed_controls():
     assert "Fire watch assigned" in blocked["reasons"][-1]
 
 
+def test_permit_verification_enforces_signed_approval_chain():
+    now = datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc)
+    permit = {
+        "status": "approved",
+        "valid_from": (now - timedelta(hours=1)).isoformat(),
+        "valid_until": (now + timedelta(hours=1)).isoformat(),
+        "controls": [{"label": "Barricade", "confirmed": True}],
+        "approvals": [],
+    }
+    blocked = verify_permit_for_start(permit, at=now, required_approvals=1)
+    assert blocked["allowed"] is False
+    assert "signed approval" in blocked["reasons"][-1]
+
+    permit["approvals"] = [
+        {
+            "approver_name": "Safety Manager",
+            "signature": "approval-ref-123",
+            "status": "approved",
+        }
+    ]
+    assert verify_permit_for_start(
+        permit, at=now, required_approvals=1
+    )["allowed"] is True
+
+
+def test_daily_report_cutoff_uses_project_timezone():
+    config = {
+        **DEFAULT_SAFETY_CONFIG,
+        "auto_daily_reports": True,
+        "timezone": "Asia/Kolkata",
+        "daily_report_cutoff": "18:00",
+    }
+    before = datetime(2026, 8, 18, 11, 30, tzinfo=timezone.utc)
+    after = datetime(2026, 8, 18, 12, 31, tzinfo=timezone.utc)
+    assert due_report_date(config, now=before) is None
+    assert due_report_date(config, now=after) == "2026-08-18"
+
+
+def test_extended_safety_config_validation_accepts_phase1_controls():
+    config = {
+        **DEFAULT_SAFETY_CONFIG,
+        "timezone": "UTC",
+        "daily_report_cutoff": "19:30",
+        "hazard_resolution_hours": 12,
+        "required_permit_approvals": 2,
+    }
+    assert validate_safety_config(config) is config
+
+
 def test_geofence_includes_inside_and_boundary_points():
     polygon = [
         {"x": 0, "y": 0},
@@ -157,3 +213,40 @@ def test_daily_report_renderer_returns_a_pdf():
 
     assert content.startswith(b"%PDF")
     assert filename == "safety-manpower-2026-08-18.pdf"
+
+
+def test_daily_report_must_be_reviewed_before_finalization():
+    context = {
+        "project_id": "project_1",
+        "site_name": "Test Project",
+        "floorplan_id": "floorplan_1",
+        "document": {},
+    }
+    user = AuthenticatedUser(
+        user_id="manager_1", email="manager@example.com", name="Manager"
+    )
+    with patch(
+        "services.safety.safety_service.project_context", return_value=context
+    ), patch.object(
+        safety_service.safety_records_collection,
+        "find_one",
+        return_value={"record_id": "report_1", "status": "draft"},
+    ):
+        try:
+            finalize_daily_report("project_1", "report_1", user=user)
+            assert False, "draft report finalization should fail"
+        except HTTPException as error:
+            assert error.status_code == 409
+
+    with patch(
+        "services.safety.safety_service.project_context", return_value=context
+    ), patch.object(
+        safety_service.safety_records_collection,
+        "find_one",
+        return_value={"record_id": "report_1", "status": "reviewed"},
+    ), patch(
+        "services.safety.safety_service.update_record",
+        return_value={"record_id": "report_1", "status": "finalized"},
+    ):
+        finalized = finalize_daily_report("project_1", "report_1", user=user)
+    assert finalized["status"] == "finalized"

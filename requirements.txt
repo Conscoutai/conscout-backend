@@ -16,5 +16,6 @@ pytesseract
 pyproj
 python-multipart
 requests
+tzdata
 opencv-python
 firebase-admin

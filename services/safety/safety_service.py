@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 import statistics
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from fastapi import HTTPException
@@ -23,6 +25,7 @@ from core.database import (
     safety_records_collection,
 )
 from services.progress.work_schedule.baseline_service import resolve_project
+from services.progress.work_schedule.analytics_service import build_baseline_comparison
 from services.project_setup.safety_notification_service import (
     sync_safety_record_notification,
 )
@@ -45,6 +48,28 @@ DEFAULT_SAFETY_CONFIG: dict[str, Any] = {
     "timezone": "UTC",
     "latitude": None,
     "longitude": None,
+    "daily_report_cutoff": "18:00",
+    "auto_daily_reports": False,
+    "report_recipients": [],
+    "hazard_categories": [
+        "unsafe_condition",
+        "unsafe_act",
+        "housekeeping",
+        "access_egress",
+        "work_at_height",
+        "plant_equipment",
+    ],
+    "hazard_resolution_hours": 24,
+    "permit_types": [
+        "hot_work",
+        "work_at_height",
+        "lifting",
+        "confined_space",
+        "excavation",
+        "electrical",
+    ],
+    "required_permit_approvals": 1,
+    "shift_names": ["day"],
 }
 
 RECORD_PREFIXES = {
@@ -125,6 +150,34 @@ def _actor(user: AuthenticatedUser) -> dict[str, str]:
     }
 
 
+def validate_safety_config(config: dict[str, Any]) -> dict[str, Any]:
+    for warning_key, stop_key, label in (
+        ("wind_warning_kph", "wind_stop_kph", "Wind"),
+        ("heat_warning_c", "heat_stop_c", "Heat"),
+        ("rain_warning_mm_h", "rain_stop_mm_h", "Rain"),
+    ):
+        if float(config[warning_key]) > float(config[stop_key]):
+            raise HTTPException(
+                422,
+                f"{label} warning threshold cannot exceed its stop threshold",
+            )
+    timezone_name = str(config.get("timezone") or "UTC").strip()
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise HTTPException(422, "Project timezone is invalid") from error
+    cutoff = str(config.get("daily_report_cutoff") or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", cutoff):
+        raise HTTPException(422, "Daily report cutoff must use 24-hour HH:MM format")
+    required_approvals = int(config.get("required_permit_approvals") or 0)
+    if required_approvals < 0:
+        raise HTTPException(422, "Required permit approvals cannot be negative")
+    resolution_hours = int(config.get("hazard_resolution_hours") or 0)
+    if resolution_hours <= 0:
+        raise HTTPException(422, "Hazard resolution SLA must be greater than zero hours")
+    return config
+
+
 def write_audit_event(
     *,
     context: dict[str, Any],
@@ -182,16 +235,7 @@ def update_config(
     record_id = str((existing or {}).get("record_id") or _record_id("safety_config"))
     config = {**DEFAULT_SAFETY_CONFIG, **((existing or {}).get("config") or {})}
     config.update({key: value for key, value in payload.items() if value is not None})
-    for warning_key, stop_key, label in (
-        ("wind_warning_kph", "wind_stop_kph", "Wind"),
-        ("heat_warning_c", "heat_stop_c", "Heat"),
-        ("rain_warning_mm_h", "rain_stop_mm_h", "Rain"),
-    ):
-        if float(config[warning_key]) > float(config[stop_key]):
-            raise HTTPException(
-                422,
-                f"{label} warning threshold cannot exceed its stop threshold",
-            )
+    validate_safety_config(config)
     safety_records_collection.update_one(
         {"record_id": record_id},
         {
@@ -252,6 +296,18 @@ def create_record(
     user: AuthenticatedUser,
 ) -> dict[str, Any]:
     context = project_context(project_ref)
+    project = context.get("document") or {}
+    client_reference_id = str(payload.get("client_reference_id") or "").strip()
+    if client_reference_id:
+        existing = safety_records_collection.find_one(
+            {
+                "project_id": context["project_id"],
+                "record_type": record_type,
+                "client_reference_id": client_reference_id,
+            }
+        )
+        if existing:
+            return public_document(existing)
     now = utc_now()
     record_id = _record_id(record_type)
     document = {
@@ -266,7 +322,27 @@ def create_record(
         "created_by": _actor(user),
         "updated_by": _actor(user),
     }
-    safety_records_collection.insert_one(document)
+    owner_user_id = str(project.get("owner_user_id") or "").strip()
+    owner_email = str(project.get("owner_email") or "").strip().lower()
+    if owner_user_id:
+        document.setdefault("owner_user_id", owner_user_id)
+    if owner_email:
+        document.setdefault("owner_email", owner_email)
+    try:
+        safety_records_collection.insert_one(document)
+    except DuplicateKeyError:
+        if not client_reference_id:
+            raise
+        concurrent = safety_records_collection.find_one(
+            {
+                "project_id": context["project_id"],
+                "record_type": record_type,
+                "client_reference_id": client_reference_id,
+            }
+        )
+        if concurrent:
+            return public_document(concurrent)
+        raise
     write_audit_event(
         context=context,
         user=user,
@@ -303,6 +379,8 @@ def update_record(
     existing = safety_records_collection.find_one(query)
     if not existing:
         raise HTTPException(404, f"{record_type.replace('_', ' ').title()} not found")
+    if record_type == "daily_report" and str(existing.get("status") or "").lower() == "finalized":
+        raise HTTPException(409, "Finalized daily reports are immutable; generate a new revision")
     protected = {
         "_id",
         "record_id",
@@ -316,7 +394,27 @@ def update_record(
         "created_by",
     }
     changes = {key: value for key, value in payload.items() if key not in protected}
-    changes.update({"updated_at": utc_now(), "updated_by": _actor(user)})
+    now = utc_now()
+    previous_status = str(existing.get("status") or "").lower()
+    next_status = str(changes.get("status") or previous_status).lower()
+    if record_type == "hazard" and next_status != previous_status:
+        if next_status in {"resolved", "closed", "verified"}:
+            changes.setdefault("resolved_at", now.isoformat())
+            changes.setdefault("resolved_by", _actor(user))
+        elif previous_status in {"resolved", "closed", "verified"}:
+            changes["reopened_at"] = now.isoformat()
+            changes["reopened_by"] = _actor(user)
+            changes["resolved_at"] = None
+            changes["resolved_by"] = None
+    if record_type in {"workforce_observation", "safety_finding"} and next_status in {
+        "confirmed",
+        "dismissed",
+        "verified",
+    }:
+        changes.setdefault("requires_review", False)
+        changes.setdefault("reviewed_at", now.isoformat())
+        changes.setdefault("reviewed_by", _actor(user))
+    changes.update({"updated_at": now, "updated_by": _actor(user)})
     safety_records_collection.update_one(query, {"$set": changes})
     write_audit_event(
         context=context,
@@ -391,6 +489,13 @@ def save_record_attachment(
     if len(content) > MAX_ATTACHMENT_BYTES:
         raise HTTPException(413, "Attachment exceeds the 20 MB limit")
     safe_name = Path(filename or "attachment").name
+    for existing_attachment in record.get("attachments") or []:
+        if (
+            isinstance(existing_attachment, dict)
+            and str(existing_attachment.get("filename") or "") == safe_name
+            and int(existing_attachment.get("size_bytes") or -1) == len(content)
+        ):
+            return public_document(existing_attachment)
     extension = Path(safe_name).suffix.lower()
     if extension not in ALLOWED_ATTACHMENT_EXTENSIONS:
         raise HTTPException(415, "Unsupported safety attachment type")
@@ -532,7 +637,8 @@ def get_weather(project_ref: str, *, refresh: bool = False) -> dict[str, Any]:
             "latitude": latitude,
             "longitude": longitude,
             "current": (
-                "apparent_temperature,precipitation,wind_speed_10m,"
+                "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                "precipitation,wind_speed_10m,"
                 "wind_gusts_10m,weather_code"
             ),
             "wind_speed_unit": "kmh",
@@ -577,6 +683,10 @@ def get_weather(project_ref: str, *, refresh: bool = False) -> dict[str, Any]:
             "wind_speed_kph": wind_speed,
             "wind_gust_kph": wind_gust,
             "apparent_temperature_c": heat,
+            "temperature_c": _float(current.get("temperature_2m")),
+            "relative_humidity_percent": _float(
+                current.get("relative_humidity_2m")
+            ),
             "precipitation_mm_h": rain,
             "weather_code": current.get("weather_code"),
             "work_state": risk["work_state"],
@@ -901,7 +1011,17 @@ def get_analysis_job(project_ref: str, job_id: str) -> dict[str, Any]:
     return public_document(job)
 
 
-def verify_permit_for_start(permit: dict[str, Any], *, at: Optional[datetime] = None) -> dict[str, Any]:
+def verify_permit_for_start(
+    permit: dict[str, Any],
+    *,
+    at: Optional[datetime] = None,
+    required_approvals: int = 0,
+    weather_state: str = "",
+    expected_activity_type: str = "",
+    expected_zone_id: str = "",
+    valid_check_ids: Optional[set[str]] = None,
+    critical_block_count: int = 0,
+) -> dict[str, Any]:
     now = at or utc_now()
     reasons: list[str] = []
     status = str(permit.get("status") or "draft").lower()
@@ -933,11 +1053,57 @@ def verify_permit_for_start(permit: dict[str, Any], *, at: Optional[datetime] = 
     ]
     if incomplete:
         reasons.append("Unconfirmed controls: " + ", ".join(incomplete))
+    approvals = [
+        approval
+        for approval in (permit.get("approvals") or [])
+        if isinstance(approval, dict)
+        and str(approval.get("status") or "approved").lower() == "approved"
+        and str(approval.get("approver_name") or approval.get("name") or "").strip()
+        and str(approval.get("signature") or approval.get("signed_at") or "").strip()
+    ]
+    if len(approvals) < max(0, required_approvals):
+        reasons.append(
+            f"Permit requires {required_approvals} signed approval(s); {len(approvals)} recorded"
+        )
+    checklist = permit.get("checklist_items") or []
+    incomplete_checks = [
+        str(item.get("label") or item.get("name") or "Unnamed check")
+        for item in checklist
+        if isinstance(item, dict) and item.get("confirmed") is not True
+    ]
+    if incomplete_checks:
+        reasons.append("Incomplete permit checks: " + ", ".join(incomplete_checks))
+    if permit.get("weather_sensitive") is True and weather_state in {"stop_work", "unknown"}:
+        reasons.append(
+            "Weather-dependent work is blocked because current weather is "
+            + ("unavailable" if weather_state == "unknown" else "at stop-work level")
+        )
+    permit_activity = str(permit.get("activity_type") or "").strip()
+    if expected_activity_type and permit_activity != expected_activity_type:
+        reasons.append("Permit does not match the requested high-risk activity")
+    permit_zone = str(permit.get("zone_id") or "").strip()
+    if expected_zone_id and permit_zone != expected_zone_id:
+        reasons.append("Permit does not match the requested safety zone")
+    required_check_ids = {
+        str(value).strip()
+        for value in (permit.get("required_check_ids") or [])
+        if str(value).strip()
+    }
+    missing_checks = sorted(required_check_ids - (valid_check_ids or set()))
+    if missing_checks:
+        reasons.append("Required safety checks are incomplete: " + ", ".join(missing_checks))
+    if critical_block_count > 0:
+        reasons.append(f"{critical_block_count} unresolved critical safety block(s) apply")
     return {"allowed": not reasons, "status": "verified" if not reasons else "blocked", "reasons": reasons, "checked_at": now.isoformat()}
 
 
 def verify_permit_record(
-    project_ref: str, permit_id: str, *, user: AuthenticatedUser
+    project_ref: str,
+    permit_id: str,
+    *,
+    user: AuthenticatedUser,
+    expected_activity_type: str = "",
+    expected_zone_id: str = "",
 ) -> dict[str, Any]:
     context = project_context(project_ref)
     permit = safety_records_collection.find_one(
@@ -945,7 +1111,55 @@ def verify_permit_record(
     )
     if not permit:
         raise HTTPException(404, "Permit not found")
-    result = {"permit_id": permit_id, **verify_permit_for_start(permit)}
+    config = get_config(project_ref)["config"]
+    weather_state = ""
+    if permit.get("weather_sensitive") is True:
+        weather_state = str(get_weather(project_ref).get("work_state") or "unknown")
+    required_check_ids = {
+        str(value).strip()
+        for value in (permit.get("required_check_ids") or [])
+        if str(value).strip()
+    }
+    valid_check_ids: set[str] = set()
+    if required_check_ids:
+        valid_checks = safety_records_collection.find(
+            {
+                "project_id": context["project_id"],
+                "record_type": "check_run",
+                "record_id": {"$in": list(required_check_ids)},
+                "status": {"$in": ["completed", "verified", "ready"]},
+            },
+            {"record_id": 1},
+        )
+        valid_check_ids = {str(item.get("record_id") or "") for item in valid_checks}
+    block_query: dict[str, Any] = {
+        "project_id": context["project_id"],
+        "record_type": {"$in": ["hazard", "safety_finding"]},
+        "severity": {"$in": ["high", "critical"]},
+        "status": {"$nin": ["closed", "resolved", "verified", "dismissed"]},
+    }
+    zone_to_check = expected_zone_id or str(permit.get("zone_id") or "")
+    if zone_to_check:
+        block_query["$or"] = [
+            {"zone_id": zone_to_check},
+            {"zone_id": {"$in": [None, ""]}},
+            {"zone_id": {"$exists": False}},
+        ]
+    critical_block_count = sum(
+        1 for _ in safety_records_collection.find(block_query, {"_id": 1})
+    )
+    result = {
+        "permit_id": permit_id,
+        **verify_permit_for_start(
+            permit,
+            required_approvals=int(config.get("required_permit_approvals") or 0),
+            weather_state=weather_state,
+            expected_activity_type=expected_activity_type,
+            expected_zone_id=expected_zone_id,
+            valid_check_ids=valid_check_ids,
+            critical_block_count=critical_block_count,
+        ),
+    }
     safety_records_collection.update_one(
         {
             "project_id": context["project_id"],
@@ -975,23 +1189,160 @@ def _latest_by_date(records: list[dict[str, Any]], record_date: str) -> Optional
     return next((record for record in records if record.get("record_date") == record_date), None)
 
 
-def build_dashboard(project_ref: str, *, record_date: str = "") -> dict[str, Any]:
+def _filter_records(
+    records: list[dict[str, Any]],
+    *,
+    shift: str = "",
+    tour_id: str = "",
+    zone_id: str = "",
+) -> list[dict[str, Any]]:
+    def matches(item: dict[str, Any]) -> bool:
+        if shift and str(item.get("shift") or item.get("shift_name") or "") != shift:
+            return False
+        if tour_id and str(item.get("tour_id") or "") != tour_id:
+            return False
+        if zone_id and str(item.get("zone_id") or "") != zone_id:
+            return False
+        return True
+
+    return [item for item in records if matches(item)]
+
+
+def _manpower_history(
+    plans: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    *,
+    through_date: str,
+    days: int = 14,
+) -> list[dict[str, Any]]:
+    try:
+        through = date.fromisoformat(through_date)
+    except ValueError:
+        through = date.today()
+    start = through - timedelta(days=max(1, days) - 1)
+    latest_plans: dict[str, dict[str, Any]] = {}
+    latest_observations: dict[str, dict[str, Any]] = {}
+    for item in plans:
+        record_day = str(item.get("record_date") or "")
+        if record_day and record_day not in latest_plans:
+            latest_plans[record_day] = item
+    for item in observations:
+        record_day = str(item.get("record_date") or "")
+        if record_day and record_day not in latest_observations:
+            latest_observations[record_day] = item
+    history: list[dict[str, Any]] = []
+    cursor = start
+    while cursor <= through:
+        record_day = cursor.isoformat()
+        plan = latest_plans.get(record_day) or {}
+        observation = latest_observations.get(record_day) or {}
+        observed_raw = observation.get("observed_workers")
+        history.append(
+            {
+                "record_date": record_day,
+                "planned_workers": int(plan.get("planned_workers") or 0),
+                "observed_workers": int(observed_raw) if observed_raw is not None else None,
+                "source": observation.get("source"),
+                "requires_review": bool(observation.get("requires_review")),
+            }
+        )
+        cursor += timedelta(days=1)
+    return history
+
+
+def _schedule_manpower_for_dates(
+    project_ref: str, record_dates: Iterable[str]
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    try:
+        comparison = build_baseline_comparison(project_ref)
+    except Exception:
+        return {}, False
+    if not comparison:
+        return {}, False
+    manpower = comparison.get("manpower") or {}
+    weekly_points = manpower.get("points") or []
+    resolved: dict[str, dict[str, Any]] = {}
+    for raw_day in record_dates:
+        try:
+            target = date.fromisoformat(raw_day)
+        except ValueError:
+            continue
+        matching: Optional[dict[str, Any]] = None
+        for point in weekly_points:
+            try:
+                start = date.fromisoformat(str(point.get("date") or ""))
+            except ValueError:
+                continue
+            if start <= target <= start + timedelta(days=6):
+                matching = point
+                break
+        if matching:
+            resolved[raw_day] = {
+                "planned_workers": int(round(float(matching.get("planned_workers") or 0))),
+                "planned_labor_hours": float(
+                    matching.get("planned_labor_hours") or 0
+                ),
+                "source": "active_schedule",
+            }
+    return resolved, bool(manpower.get("is_partial"))
+
+
+def build_dashboard(
+    project_ref: str,
+    *,
+    record_date: str = "",
+    shift: str = "",
+    tour_id: str = "",
+    zone_id: str = "",
+) -> dict[str, Any]:
     context = project_context(project_ref)
     project = context.get("document") or {}
     bounds = project.get("bounds") if isinstance(project.get("bounds"), dict) else {}
     day = record_date or today_iso()
     plans = list_records(project_ref, "workforce_plan", limit=1000)
-    observations = list_records(project_ref, "workforce_observation", limit=1000)
-    findings = list_records(project_ref, "safety_finding", limit=1000)
-    hazards = list_records(project_ref, "hazard", limit=1000)
+    observations = _filter_records(
+        list_records(project_ref, "workforce_observation", limit=1000),
+        shift=shift,
+        tour_id=tour_id,
+        zone_id=zone_id,
+    )
+    findings = _filter_records(
+        list_records(project_ref, "safety_finding", limit=1000),
+        shift=shift,
+        tour_id=tour_id,
+        zone_id=zone_id,
+    )
+    hazards = _filter_records(
+        list_records(project_ref, "hazard", limit=1000),
+        shift=shift,
+        tour_id=tour_id,
+        zone_id=zone_id,
+    )
     permits = list_records(project_ref, "permit", limit=1000)
     checks = list_records(project_ref, "check_run", limit=1000)
+    check_templates = list_records(project_ref, "check_template", limit=250)
     zones = list_records(project_ref, "safety_zone", limit=1000)
+    reports = list_records(project_ref, "daily_report", limit=25)
+    weather_events = list_records(project_ref, "weather_observation", limit=25)
     jobs = list_analysis_jobs(project_ref, limit=10)
     weather = get_weather(project_ref)
     plan = _latest_by_date(plans, day)
     observation = _latest_by_date(observations, day)
-    planned = int((plan or {}).get("planned_workers") or 0)
+    history = _manpower_history(plans, observations, through_date=day)
+    schedule_plans, schedule_partial = _schedule_manpower_for_dates(
+        project_ref, [item["record_date"] for item in history]
+    )
+    manual_plan_dates = {str(item.get("record_date") or "") for item in plans}
+    for item in history:
+        record_day = item["record_date"]
+        if record_day not in manual_plan_dates and record_day in schedule_plans:
+            item.update(schedule_plans[record_day])
+    schedule_plan = schedule_plans.get(day) or {}
+    planned = int(
+        (plan or {}).get("planned_workers")
+        if plan is not None
+        else schedule_plan.get("planned_workers") or 0
+    )
     observed_raw = (observation or {}).get("observed_workers")
     observed = int(observed_raw) if observed_raw is not None else None
     variance = observed - planned if observed is not None else None
@@ -1001,19 +1352,51 @@ def build_dashboard(project_ref: str, *, record_date: str = "") -> dict[str, Any
         item for item in [*open_findings, *open_hazards]
         if str(item.get("severity") or "").lower() in {"critical", "high"}
     ]
+    ppe_compliant = len(
+        [item for item in findings if str(item.get("ppe_status") or "").lower() == "compliant"]
+    )
+    ppe_non_compliant = len(
+        [
+            item
+            for item in findings
+            if str(item.get("ppe_status") or "").lower()
+            in {"non_compliant", "missing"}
+        ]
+    )
+    ppe_unknown = len(
+        [item for item in findings if str(item.get("ppe_status") or "").lower() == "unknown"]
+    )
+    ppe_evaluated = ppe_compliant + ppe_non_compliant
     active_permits = [item for item in permits if str(item.get("status") or "").lower() in {"approved", "active"}]
     overdue_checks = [item for item in checks if str(item.get("status") or "").lower() == "overdue"]
     work_state = str(weather.get("work_state") or "unknown")
     reasons = list(weather.get("reasons") or [])
+    latest_job_status = str((jobs[0] if jobs else {}).get("status") or "").lower()
+    analysis_unavailable = observation is None or bool(
+        (observation or {}).get("requires_review")
+    )
     if critical:
         work_state = "stop_work"
         reasons.append(f"{len(critical)} high/critical unresolved safety item(s)")
+    elif work_state != "stop_work" and analysis_unavailable:
+        work_state = "unknown"
+        reasons.append(
+            (
+                "Workforce observation is awaiting human review"
+                if observation is not None
+                else f"Tour safety analysis is {latest_job_status.replace('_', ' ')}"
+                if latest_job_status
+                else "No reviewed or manual workforce observation is available"
+            )
+            + "; compliance is unknown"
+        )
     elif work_state == "safe" and (open_findings or open_hazards or overdue_checks):
         work_state = "caution"
         reasons.append("Open safety actions require attention")
     return {
         **_identity(context),
         "record_date": day,
+        "filters": {"shift": shift, "tour_id": tour_id, "zone_id": zone_id},
         "generated_at": utc_now().isoformat(),
         "work_state": {"status": work_state, "reasons": reasons},
         "manpower": {
@@ -1022,12 +1405,39 @@ def build_dashboard(project_ref: str, *, record_date: str = "") -> dict[str, Any
             "variance": variance,
             "observation_source": (observation or {}).get("source"),
             "requires_review": bool((observation or {}).get("requires_review")),
+            "planned_source": "manual" if plan is not None else schedule_plan.get("source", "unavailable"),
+            "planned_labor_hours": (plan or {}).get(
+                "planned_labor_hours", schedule_plan.get("planned_labor_hours")
+            ),
+            "schedule_resource_warning": (
+                "Active schedule labor resources are partial."
+                if plan is None and schedule_partial
+                else ""
+            ),
+            "peak_observed_workers": max(
+                [
+                    int(item["observed_workers"])
+                    for item in history
+                    if item.get("observed_workers") is not None
+                ]
+                or [0]
+            ),
+            "observation_coverage": (observation or {}).get("sample_count"),
+            "observation_confidence": (observation or {}).get("confidence"),
         },
         "weather": weather,
         "ppe": {
-            "status": "preliminary" if findings else "unknown",
+            "status": "preliminary" if ppe_evaluated else "unknown",
             "open_findings": len(open_findings),
             "high_or_critical": len(critical),
+            "compliant": ppe_compliant,
+            "non_compliant": ppe_non_compliant,
+            "unknown": ppe_unknown,
+            "compliance_percent": (
+                round(ppe_compliant * 100 / ppe_evaluated, 1)
+                if ppe_evaluated
+                else None
+            ),
             "model_note": "Dedicated PPE model upgrade is deferred to Phase 2.",
         },
         "counts": {
@@ -1035,7 +1445,14 @@ def build_dashboard(project_ref: str, *, record_date: str = "") -> dict[str, Any
             "active_permits": len(active_permits),
             "overdue_checks": len(overdue_checks),
             "active_zones": len([zone for zone in zones if str(zone.get("status") or "active").lower() == "active"]),
+            "pending_reviews": len(
+                [item for item in [*observations, *findings] if item.get("requires_review") is True]
+            ),
+            "failed_analysis_jobs": len(
+                [item for item in jobs if str(item.get("status") or "").lower() in {"failed", "partially_completed"}]
+            ),
         },
+        "manpower_history": history,
         "spatial": {
             "floorplan_width": _float(bounds.get("width")),
             "floorplan_height": _float(bounds.get("height")),
@@ -1062,10 +1479,15 @@ def build_dashboard(project_ref: str, *, record_date: str = "") -> dict[str, Any
             ],
         },
         "recent": {
-            "findings": open_findings[:5],
-            "hazards": open_hazards[:5],
-            "permits": permits[:5],
-            "checks": checks[:5],
+            "observations": observations[:10],
+            "findings": findings[:10],
+            "hazards": hazards[:10],
+            "permits": permits[:10],
+            "checks": checks[:10],
+            "check_templates": check_templates[:10],
+            "zones": zones[:10],
+            "reports": reports[:10],
+            "weather_events": weather_events[:10],
             "analysis_jobs": jobs[:5],
         },
     }
@@ -1078,22 +1500,85 @@ def generate_daily_report(
     day = record_date or today_iso()
     snapshot = build_dashboard(project_ref, record_date=day)
     existing = safety_records_collection.find_one(
-        {"project_id": context["project_id"], "record_type": "daily_report", "record_date": day}
+        {"project_id": context["project_id"], "record_type": "daily_report", "record_date": day},
+        sort=[("revision", -1), ("created_at", -1)],
     )
-    if existing and str(existing.get("status") or "") == "finalized":
-        return public_document(existing)
-    if existing:
+    existing_status = str((existing or {}).get("status") or "").lower()
+    if existing and existing_status != "finalized":
         return update_record(
             project_ref,
             record_type="daily_report",
             record_id=existing["record_id"],
-            payload={"snapshot": snapshot, "status": "draft", "generated_at": utc_now().isoformat()},
+            payload={
+                "snapshot": snapshot,
+                "status": "draft",
+                "generated_at": utc_now().isoformat(),
+                "reviewed_at": None,
+                "reviewed_by": None,
+                "review_notes": "",
+            },
             user=user,
         )
-    return create_record(
+    revision = int((existing or {}).get("revision") or 0) + 1
+    try:
+        return create_record(
+            project_ref,
+            record_type="daily_report",
+            payload={
+                "record_date": day,
+                "status": "draft",
+                "revision": revision,
+                "snapshot": snapshot,
+                "generated_at": utc_now().isoformat(),
+            },
+            user=user,
+        )
+    except DuplicateKeyError:
+        concurrent = safety_records_collection.find_one(
+            {
+                "project_id": context["project_id"],
+                "record_type": "daily_report",
+                "record_date": day,
+                "revision": revision,
+            }
+        )
+        if concurrent:
+            return public_document(concurrent)
+        raise
+
+
+def review_daily_report(
+    project_ref: str,
+    report_id: str,
+    *,
+    notes: str,
+    user: AuthenticatedUser,
+) -> dict[str, Any]:
+    context = project_context(project_ref)
+    report = safety_records_collection.find_one(
+        {
+            "project_id": context["project_id"],
+            "record_type": "daily_report",
+            "record_id": report_id,
+        }
+    )
+    if not report:
+        raise HTTPException(404, "Daily safety report not found")
+    status = str(report.get("status") or "draft").lower()
+    if status == "finalized":
+        raise HTTPException(409, "Finalized daily reports cannot be reviewed again")
+    if status not in {"draft", "reviewed"}:
+        raise HTTPException(409, "Only draft daily reports can be reviewed")
+    return update_record(
         project_ref,
         record_type="daily_report",
-        payload={"record_date": day, "status": "draft", "snapshot": snapshot, "generated_at": utc_now().isoformat()},
+        record_id=report_id,
+        payload={
+            "status": "reviewed",
+            "review_notes": notes,
+            "reviewed_at": utc_now().isoformat(),
+            "reviewed_by": _actor(user),
+        },
         user=user,
     )
 
@@ -1101,6 +1586,18 @@ def generate_daily_report(
 def finalize_daily_report(
     project_ref: str, report_id: str, *, user: AuthenticatedUser
 ) -> dict[str, Any]:
+    context = project_context(project_ref)
+    report = safety_records_collection.find_one(
+        {
+            "project_id": context["project_id"],
+            "record_type": "daily_report",
+            "record_id": report_id,
+        }
+    )
+    if not report:
+        raise HTTPException(404, "Daily safety report not found")
+    if str(report.get("status") or "draft").lower() != "reviewed":
+        raise HTTPException(409, "Review the daily report before finalizing it")
     return update_record(
         project_ref,
         record_type="daily_report",
@@ -1123,6 +1620,7 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
     counts = snapshot.get("counts") or {}
     weather = snapshot.get("weather") or {}
     state = snapshot.get("work_state") or {}
+    recent = snapshot.get("recent") or {}
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
@@ -1131,6 +1629,10 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
     lines = [
         f"Project: {context['site_name']}",
         f"Date: {report.get('record_date') or 'N/A'}",
+        f"Revision / status: {report.get('revision', 1)} / {str(report.get('status') or 'draft').upper()}",
+        f"Generated at: {report.get('generated_at') or 'N/A'}",
+        f"Reviewed at: {report.get('reviewed_at') or 'N/A'}",
+        f"Finalized at: {report.get('finalized_at') or 'N/A'}",
         f"Work state: {str(state.get('status') or 'unknown').upper()}",
         f"Planned / observed workforce: {manpower.get('planned_workers', 0)} / {manpower.get('observed_workers', 'N/A')}",
         f"Workforce variance: {manpower.get('variance', 'N/A')}",
@@ -1140,6 +1642,10 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
         f"Active permits: {counts.get('active_permits', 0)}",
         f"Overdue checks: {counts.get('overdue_checks', 0)}",
         f"Active exclusion zones: {counts.get('active_zones', 0)}",
+        f"Workforce records included: {len(recent.get('observations') or [])}",
+        f"Safety findings included: {len(recent.get('findings') or [])}",
+        f"Permit records included: {len(recent.get('permits') or [])}",
+        f"Safety checks included: {len(recent.get('checks') or [])}",
     ]
     for line in lines:
         pdf.multi_cell(0, 7, str(line).encode("latin-1", errors="replace").decode("latin-1"))
@@ -1153,5 +1659,7 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
             pdf.multi_cell(0, 7, f"- {reason}".encode("latin-1", errors="replace").decode("latin-1"))
     output = pdf.output(dest="S")
     content = output.encode("latin-1") if isinstance(output, str) else bytes(output)
-    filename = f"safety-manpower-{report.get('record_date') or today_iso()}.pdf"
+    revision = report.get("revision")
+    suffix = f"-r{revision}" if revision else ""
+    filename = f"safety-manpower-{report.get('record_date') or today_iso()}{suffix}.pdf"
     return content, filename

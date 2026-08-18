@@ -164,6 +164,18 @@ def ensure_safety_indexes() -> None:
         [("project_id", 1), ("record_type", 1), ("status", 1)],
         name="safety_project_type_status",
     )
+    raw_safety_records_collection.create_index(
+        [("project_id", 1), ("record_type", 1), ("record_date", 1), ("revision", 1)],
+        unique=True,
+        partialFilterExpression={"record_type": "daily_report", "revision": {"$exists": True}},
+        name="unique_safety_daily_report_revision",
+    )
+    raw_safety_records_collection.create_index(
+        [("project_id", 1), ("record_type", 1), ("client_reference_id", 1)],
+        unique=True,
+        partialFilterExpression={"client_reference_id": {"$exists": True}},
+        name="unique_safety_client_reference",
+    )
     raw_safety_analysis_jobs_collection.create_index(
         "job_id", unique=True, name="unique_safety_analysis_job_id"
     )

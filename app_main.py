@@ -27,6 +27,9 @@ from core.database import (
 from services.progress.weekly_progress_notification_service import (
     ensure_weekly_progress_scheduler_started,
 )
+from services.safety.daily_report_scheduler import (
+    ensure_daily_report_scheduler_started,
+)
 from services.subscription_billing_service import (
     ensure_subscription_billing_scheduler_started,
 )
@@ -59,6 +62,7 @@ def startup_background_jobs():
         ensure_admin_directory_indexes()
         ensure_safety_indexes()
         ensure_schedule_indexes()
+        ensure_daily_report_scheduler_started()
     ensure_weekly_progress_scheduler_started()
     ensure_subscription_billing_scheduler_started()
 
