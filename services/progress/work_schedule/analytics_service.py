@@ -513,6 +513,7 @@ def _manpower_points(
         points.append(
             {
                 "date": cursor.isoformat(),
+                "period_end": week_end.isoformat(),
                 "planned_workers": round(worker_days / working_days_in_week, 2),
                 "planned_labor_hours": round(labor_hours, 2),
                 "observed_workers": None,
@@ -716,6 +717,11 @@ def build_baseline_comparison(
                 or 0
             )
             < len(activities),
+            "labor_loaded_activity_count": int(
+                (baseline.get("summary") or {}).get("labor_loaded_activity_count")
+                or 0
+            ),
+            "activity_count": len(activities),
             "points": _manpower_points(baseline=baseline, activities=activities),
         },
         "activities": activity_rows,

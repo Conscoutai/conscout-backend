@@ -100,6 +100,40 @@ def test_preliminary_tour_count_uses_maximum_not_sum():
     assert result["method"] == "max_existing_worker_count_per_tour"
 
 
+def test_schedule_manpower_includes_week_and_labor_loading_coverage():
+    comparison = {
+        "manpower": {
+            "is_partial": True,
+            "labor_loaded_activity_count": 7,
+            "activity_count": 398,
+            "points": [
+                {
+                    "date": "2024-10-13",
+                    "period_end": "2024-10-19",
+                    "planned_workers": 2.95,
+                    "planned_labor_hours": 141.47,
+                }
+            ],
+        }
+    }
+    with patch(
+        "services.safety.safety_service.build_baseline_comparison",
+        return_value=comparison,
+    ):
+        plans, is_partial = safety_service._schedule_manpower_for_dates(
+            "project_1", ["2024-10-16"]
+        )
+
+    plan = plans["2024-10-16"]
+    assert is_partial is True
+    assert plan["planned_workers"] == 3
+    assert plan["planned_labor_hours"] == 141.47
+    assert plan["period_start"] == "2024-10-13"
+    assert plan["period_end"] == "2024-10-19"
+    assert plan["labor_loaded_activity_count"] == 7
+    assert plan["schedule_activity_count"] == 398
+
+
 def test_permit_verification_requires_active_dates_and_confirmed_controls():
     now = datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc)
     permit = {

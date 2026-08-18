@@ -1261,6 +1261,10 @@ def _schedule_manpower_for_dates(
         return {}, False
     manpower = comparison.get("manpower") or {}
     weekly_points = manpower.get("points") or []
+    labor_loaded_activity_count = int(
+        manpower.get("labor_loaded_activity_count") or 0
+    )
+    schedule_activity_count = int(manpower.get("activity_count") or 0)
     resolved: dict[str, dict[str, Any]] = {}
     for raw_day in record_dates:
         try:
@@ -1283,6 +1287,13 @@ def _schedule_manpower_for_dates(
                     matching.get("planned_labor_hours") or 0
                 ),
                 "source": "active_schedule",
+                "period_start": start.isoformat(),
+                "period_end": str(
+                    matching.get("period_end")
+                    or (start + timedelta(days=6)).isoformat()
+                ),
+                "labor_loaded_activity_count": labor_loaded_activity_count,
+                "schedule_activity_count": schedule_activity_count,
             }
     return resolved, bool(manpower.get("is_partial"))
 
@@ -1409,9 +1420,17 @@ def build_dashboard(
             "planned_labor_hours": (plan or {}).get(
                 "planned_labor_hours", schedule_plan.get("planned_labor_hours")
             ),
+            "plan_period_start": schedule_plan.get("period_start"),
+            "plan_period_end": schedule_plan.get("period_end"),
+            "labor_loaded_activity_count": schedule_plan.get(
+                "labor_loaded_activity_count", 0
+            ),
+            "schedule_activity_count": schedule_plan.get(
+                "schedule_activity_count", 0
+            ),
             "schedule_resource_warning": (
                 "Active schedule labor resources are partial."
-                if plan is None and schedule_partial
+                if schedule_plan and schedule_partial
                 else ""
             ),
             "peak_observed_workers": max(
