@@ -45,6 +45,40 @@ def test_unknown_weather_never_defaults_to_safe():
     assert result["work_state"] == "unknown"
 
 
+def test_weather_cache_accepts_mongodb_naive_utc_datetime():
+    now = datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc)
+    context = {
+        "project_id": "project_1",
+        "site_name": "Test Project",
+        "floorplan_id": "floorplan_1",
+        "document": {},
+    }
+    cached_weather = {
+        "project_id": "project_1",
+        "record_type": "weather_observation",
+        "provider": "cached",
+        "created_at": (now - timedelta(minutes=5)).replace(tzinfo=None),
+    }
+
+    with patch(
+        "services.safety.safety_service.project_context", return_value=context
+    ), patch(
+        "services.safety.safety_service.get_config",
+        return_value={"config": DEFAULT_SAFETY_CONFIG},
+    ), patch(
+        "services.safety.safety_service._latest_weather",
+        return_value=cached_weather,
+    ), patch(
+        "services.safety.safety_service.utc_now", return_value=now
+    ), patch(
+        "services.safety.safety_service.requests.get"
+    ) as weather_request:
+        result = safety_service.get_weather("project_1")
+
+    assert result["provider"] == "cached"
+    weather_request.assert_not_called()
+
+
 def test_preliminary_tour_count_uses_maximum_not_sum():
     result = preliminary_worker_count(
         [

@@ -66,6 +66,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def today_iso() -> str:
     return date.today().isoformat()
 
@@ -498,10 +506,10 @@ def get_weather(project_ref: str, *, refresh: bool = False) -> dict[str, Any]:
     config_payload = get_config(project_ref)
     config = config_payload["config"]
     latest = _latest_weather(context)
-    latest_created = (latest or {}).get("created_at")
+    latest_created = as_utc_datetime((latest or {}).get("created_at"))
     if (
         not refresh
-        and isinstance(latest_created, datetime)
+        and latest_created is not None
         and latest_created >= utc_now() - timedelta(minutes=WEATHER_CACHE_MINUTES)
     ):
         return public_document(latest)
