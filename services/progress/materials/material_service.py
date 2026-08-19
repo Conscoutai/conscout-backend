@@ -45,9 +45,17 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 2
+MATERIAL_PROCESSING_VERSION = 3
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
+AUTO_CORRECT_DETECTED_TYPES = {
+    "boq",
+    "weekly_report",
+    "purchase_order",
+    "customer_shipment",
+    "mir_grn",
+    "progress_invoice",
+}
 
 _UNIT_ALIASES = {
     "MTR": "M",
@@ -95,6 +103,12 @@ _BOQ_BLOCK_VALUE = re.compile(
 )
 _DATE = re.compile(
     r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b"
+)
+_REFERENCE_IDENTIFIER_LABEL = re.compile(
+    r"^(?:DELIVERY NOTE|DELIVERY ID|PACK ID|PACK DELIVERY ID|"
+    r"ORDER NO|ORDER NUMBER|ORDER ID|PO NO|PO NUMBER|PO ID|"
+    r"MIR|MIR NO|MIR NUMBER|MIR SN|GRN|GRN NO|GRN NUMBER|"
+    r"DOCUMENT NO|DOCUMENT NUMBER|CUSTOMER SHIPMENT)$"
 )
 
 
@@ -362,6 +376,25 @@ def classify_material_document(text: str, filename: str = "") -> str:
     return "boq" if "boq" in Path(filename).stem.lower() else "delivery_note"
 
 
+def resolve_material_document_type(
+    requested_type: str, detected_type: str
+) -> tuple[str, bool]:
+    """Auto-correct only strong classifications; delivery_note is the fallback."""
+    if requested_type == "auto":
+        return detected_type, False
+    should_correct = (
+        requested_type != detected_type and detected_type in AUTO_CORRECT_DETECTED_TYPES
+    )
+    return (detected_type, True) if should_correct else (requested_type, False)
+
+
+def _looks_like_reference_identifier_row(description: str) -> bool:
+    """Reject headers such as `Delivery Note NO 374694` as material rows."""
+    return bool(
+        _REFERENCE_IDENTIFIER_LABEL.fullmatch(normalize_description(description))
+    )
+
+
 def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str, Any]]]:
     try:
         from pypdf import PdfReader
@@ -574,6 +607,18 @@ def extract_structured_lines(
                     continue
                 values = match.groupdict()
                 description = values["description"].strip(" -:")
+                if _looks_like_reference_identifier_row(description):
+                    if not any(
+                        item.get("code") == "reference_identifier_ignored"
+                        for item in warnings
+                    ):
+                        warnings.append(
+                            {
+                                "code": "reference_identifier_ignored",
+                                "message": "Document, order, pack, and delivery identifiers were excluded from material quantities.",
+                            }
+                        )
+                    continue
                 if len(normalize_description(description)) < 4:
                     continue
                 key = (
@@ -726,7 +771,9 @@ def upload_material_document(
     pages, extraction_method, extraction_warnings = _extract_pdf_pages(raw_bytes)
     text = "\n\f\n".join(pages)
     detected_type = classify_material_document(text, safe_filename)
-    resolved_type = detected_type if requested_type == "auto" else requested_type
+    resolved_type, classification_auto_corrected = resolve_material_document_type(
+        requested_type, detected_type
+    )
     lines, line_warnings = extract_structured_lines(pages, document_type=resolved_type)
     if resolved_type in {"delivery_note", "customer_shipment"} and lines:
         baseline_materials = project_materials_collection.find(
@@ -767,11 +814,21 @@ def upload_material_document(
 
     warnings = [*extraction_warnings, *line_warnings]
     if requested_type != "auto" and requested_type != detected_type:
+        warning_code = (
+            "classification_auto_corrected"
+            if classification_auto_corrected
+            else "classification_mismatch"
+        )
+        warning_message = (
+            f"Selected as {requested_type}, but content was safely reclassified as {detected_type}."
+            if classification_auto_corrected
+            else f"Selected as {requested_type}, but content resembles {detected_type}."
+        )
         warnings.insert(
             0,
             {
-                "code": "classification_mismatch",
-                "message": f"Selected as {requested_type}, but content resembles {detected_type}.",
+                "code": warning_code,
+                "message": warning_message,
             },
         )
     document = {
@@ -782,6 +839,7 @@ def upload_material_document(
         "document_type": resolved_type,
         "requested_document_type": requested_type,
         "detected_document_type": detected_type,
+        "classification_auto_corrected": classification_auto_corrected,
         "original_filename": safe_filename,
         "stored_filename": stored_filename,
         "storage_path": stored_path,

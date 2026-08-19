@@ -14,6 +14,7 @@ from services.progress.materials.material_service import (
     classify_material_document,
     enrich_delivery_lines_with_baseline,
     extract_structured_lines,
+    resolve_material_document_type,
     validate_linked_material_line,
 )
 
@@ -80,6 +81,55 @@ def test_document_classifier_handles_the_supplied_material_document_types():
         classify_material_document("MATERIAL INSPECTION REQUEST", "mir.pdf")
         == "mir_grn"
     )
+
+
+def test_strong_mir_classification_overrides_wrong_delivery_note_selection():
+    resolved, corrected = resolve_material_document_type("delivery_note", "mir_grn")
+
+    assert resolved == "mir_grn"
+    assert corrected is True
+
+    # delivery_note is the weak fallback classification, so it must not
+    # override a deliberate MIR selection when content is ambiguous.
+    resolved, corrected = resolve_material_document_type("mir_grn", "delivery_note")
+    assert resolved == "mir_grn"
+    assert corrected is False
+
+
+def test_delivery_reference_identifier_is_not_a_material_quantity():
+    lines, warnings = extract_structured_lines(
+        [
+            "Delivery Note NO 374694",
+            "MAT-001 Flush curb concrete 378 LM",
+        ],
+        document_type="delivery_note",
+    )
+
+    assert len(lines) == 1
+    assert lines[0]["material_code"] == "MAT-001"
+    assert lines[0]["delivered_qty"] == 378
+    assert any(item["code"] == "reference_identifier_ignored" for item in warnings)
+
+
+def test_pending_mir_reference_does_not_create_delivered_or_inspected_quantity():
+    text = """
+    MATERIAL INSPECTION REQUEST (MIR)
+    Description of material UPVC 50mm
+    Delivery Note NO 374694
+    INSPECTION RESULTS
+    A. Accepted without objection [ ]
+    B. Accepted subject to notes [ ]
+    C. Rejected [ ]
+    """
+    detected = classify_material_document(text, "MIR - 04.pdf")
+    resolved, corrected = resolve_material_document_type("delivery_note", detected)
+    lines, warnings = extract_structured_lines([text], document_type=resolved)
+
+    assert detected == "mir_grn"
+    assert resolved == "mir_grn"
+    assert corrected is True
+    assert lines == []
+    assert any(item["code"] == "manual_line_review_required" for item in warnings)
 
 
 def test_customer_shipment_parser_accepts_unit_before_quantity_from_client_ocr():
