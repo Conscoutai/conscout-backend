@@ -336,9 +336,56 @@ def test_daily_report_renderer_returns_a_pdf():
                 "variance": -2,
             },
             "ppe": {"status": "preliminary", "open_findings": 1},
-            "weather": {"wind_kph": 22, "apparent_temperature_c": 39},
-            "counts": {"open_hazards": 1, "active_permits": 2},
+            "weather": {
+                "provider": "open_meteo",
+                "observed_at": "2026-08-18T10:00:00+00:00",
+                "temperature_c": 34,
+                "wind_kph": 22,
+                "apparent_temperature_c": 39,
+                "precipitation_mm_h": 0,
+                "relative_humidity_percent": 43,
+            },
+            "counts": {
+                "open_hazards": 1,
+                "active_permits": 2,
+                "overdue_checks": 1,
+                "active_zones": 1,
+                "pending_reviews": 1,
+            },
+            "manpower_history": [
+                {
+                    "record_date": "2026-08-17",
+                    "planned_workers": 20,
+                    "observed_workers": 17,
+                },
+                {
+                    "record_date": "2026-08-18",
+                    "planned_workers": 20,
+                    "observed_workers": 18,
+                },
+            ],
+            "recent": {
+                "hazards": [
+                    {
+                        "title": "Open edge",
+                        "status": "open",
+                        "severity": "high",
+                    }
+                ],
+                "findings": [],
+                "permits": [
+                    {
+                        "title": "Hot work",
+                        "status": "active",
+                        "permit_type": "hot_work",
+                    }
+                ],
+                "checks": [],
+            },
         },
+        "revision": 1,
+        "status": "finalized",
+        "generated_at": "2026-08-18T10:05:00+00:00",
     }
     context = {
         "project_id": "project_1",
@@ -356,7 +403,9 @@ def test_daily_report_renderer_returns_a_pdf():
         content, filename = render_daily_report_pdf("project_1", "report_1")
 
     assert content.startswith(b"%PDF")
-    assert filename == "safety-manpower-2026-08-18.pdf"
+    assert len(content) > 10_000
+    assert content.count(b"/Type /Page") >= 2
+    assert filename == "safety-manpower-2026-08-18-r1.pdf"
 
 
 def test_daily_report_must_be_reviewed_before_finalization():

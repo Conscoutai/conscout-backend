@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from fastapi import HTTPException
-from fpdf import FPDF
 from pymongo.errors import DuplicateKeyError
 
 from core.auth_context import AuthenticatedUser
@@ -30,6 +29,7 @@ from services.progress.work_schedule.analytics_service import build_baseline_com
 from services.project_setup.safety_notification_service import (
     sync_safety_record_notification,
 )
+from services.safety.daily_report_pdf import build_daily_report_pdf
 
 
 ANALYSIS_VERSION = "phase1-existing-worker-v1"
@@ -1720,51 +1720,7 @@ def render_daily_report_pdf(project_ref: str, report_id: str) -> tuple[bytes, st
     )
     if not report:
         raise HTTPException(404, "Daily safety report not found")
-    snapshot = report.get("snapshot") or {}
-    manpower = snapshot.get("manpower") or {}
-    ppe = snapshot.get("ppe") or {}
-    counts = snapshot.get("counts") or {}
-    weather = snapshot.get("weather") or {}
-    state = snapshot.get("work_state") or {}
-    recent = snapshot.get("recent") or {}
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "Safety and Manpower Daily Report", ln=1)
-    pdf.set_font("Arial", size=10)
-    lines = [
-        f"Project: {context['site_name']}",
-        f"Date: {report.get('record_date') or 'N/A'}",
-        f"Revision / status: {report.get('revision', 1)} / {str(report.get('status') or 'draft').upper()}",
-        f"Generated at: {report.get('generated_at') or 'N/A'}",
-        f"Reviewed at: {report.get('reviewed_at') or 'N/A'}",
-        f"Finalized at: {report.get('finalized_at') or 'N/A'}",
-        f"Work state: {str(state.get('status') or 'unknown').upper()}",
-        f"Planned / observed workforce: {manpower.get('planned_workers', 0)} / {manpower.get('observed_workers', 'N/A')}",
-        f"Workforce variance: {manpower.get('variance', 'N/A')}",
-        f"PPE status: {ppe.get('status', 'unknown')} ({ppe.get('open_findings', 0)} open findings)",
-        f"Weather: wind {weather.get('wind_kph', 'N/A')} km/h, apparent heat {weather.get('apparent_temperature_c', 'N/A')} C, rain {weather.get('precipitation_mm_h', 'N/A')} mm/h",
-        f"Open hazards: {counts.get('open_hazards', 0)}",
-        f"Active permits: {counts.get('active_permits', 0)}",
-        f"Overdue project inspections: {counts.get('overdue_checks', 0)}",
-        f"Active exclusion zones: {counts.get('active_zones', 0)}",
-        f"Workforce records included: {len(recent.get('observations') or [])}",
-        f"Safety findings included: {len(recent.get('findings') or [])}",
-        f"Permit records included: {len(recent.get('permits') or [])}",
-        f"Safety checks included: {len(recent.get('checks') or [])}",
-    ]
-    for line in lines:
-        pdf.multi_cell(0, 7, str(line).encode("latin-1", errors="replace").decode("latin-1"))
-    reasons = state.get("reasons") or []
-    if reasons:
-        pdf.ln(2)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 8, "Safety reasons / actions", ln=1)
-        pdf.set_font("Arial", size=10)
-        for reason in reasons:
-            pdf.multi_cell(0, 7, f"- {reason}".encode("latin-1", errors="replace").decode("latin-1"))
-    output = pdf.output(dest="S")
-    content = output.encode("latin-1") if isinstance(output, str) else bytes(output)
+    content = build_daily_report_pdf(context=context, report=report)
     revision = report.get("revision")
     suffix = f"-r{revision}" if revision else ""
     filename = f"safety-manpower-{report.get('record_date') or today_iso()}{suffix}.pdf"
