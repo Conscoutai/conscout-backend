@@ -21,6 +21,7 @@ from core.config import (
 )
 from core.database import (
     ensure_admin_directory_indexes,
+    ensure_material_indexes,
     ensure_safety_indexes,
     ensure_schedule_indexes,
 )
@@ -60,6 +61,7 @@ for directory in (DATA_DIR,):
 def startup_background_jobs():
     if APP_SURFACE == "main":
         ensure_admin_directory_indexes()
+        ensure_material_indexes()
         ensure_safety_indexes()
         ensure_schedule_indexes()
         ensure_daily_report_scheduler_started()

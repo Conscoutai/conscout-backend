@@ -91,6 +91,9 @@ raw_schedule_relationships_collection = db["schedule_relationships"]
 raw_schedule_assignments_collection = db["schedule_assignments"]
 raw_schedule_evidence_collection = db["schedule_evidence"]
 raw_schedule_progress_snapshots_collection = db["schedule_progress_snapshots"]
+raw_material_documents_collection = db["material_documents"]
+raw_project_materials_collection = db["project_materials"]
+raw_material_audit_events_collection = db["material_audit_events"]
 raw_users_collection = db["users"]
 raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
@@ -151,6 +154,35 @@ def ensure_schedule_indexes() -> None:
     )
 
 
+def ensure_material_indexes() -> None:
+    """Create project-isolated material document, ledger, and audit indexes."""
+    raw_material_documents_collection.create_index(
+        "document_id", unique=True, name="unique_material_document_id"
+    )
+    raw_material_documents_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("source_sha256", 1)],
+        unique=True,
+        name="unique_project_material_document_hash",
+    )
+    raw_material_documents_collection.create_index(
+        [("project_id", 1), ("document_type", 1), ("status", 1), ("uploaded_at", -1)],
+        name="material_project_type_status",
+    )
+    raw_project_materials_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("material_id", 1)],
+        unique=True,
+        name="unique_project_material_id",
+    )
+    raw_project_materials_collection.create_index(
+        [("project_id", 1), ("status", 1), ("description", 1)],
+        name="material_ledger_lookup",
+    )
+    raw_material_audit_events_collection.create_index(
+        [("project_id", 1), ("created_at", -1)],
+        name="material_audit_project_created",
+    )
+
+
 def ensure_safety_indexes() -> None:
     """Create the Phase 1 safety/manpower query and idempotency indexes."""
     raw_safety_records_collection.create_index(
@@ -202,6 +234,9 @@ schedule_evidence_collection = ScopedCollection(raw_schedule_evidence_collection
 schedule_progress_snapshots_collection = ScopedCollection(
     raw_schedule_progress_snapshots_collection
 )
+material_documents_collection = ScopedCollection(raw_material_documents_collection)
+project_materials_collection = ScopedCollection(raw_project_materials_collection)
+material_audit_events_collection = ScopedCollection(raw_material_audit_events_collection)
 users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
 notifications_collection = raw_notifications_collection

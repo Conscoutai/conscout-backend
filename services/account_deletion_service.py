@@ -8,11 +8,14 @@ from core.config import DATA_DIR, user_data_dir
 from core.database import (
     raw_floorplans_collection,
     raw_inspections_collection,
+    raw_material_audit_events_collection,
+    raw_material_documents_collection,
     raw_notifications_collection,
     raw_safety_analysis_jobs_collection,
     raw_safety_audit_events_collection,
     raw_safety_records_collection,
     raw_tours_collection,
+    raw_project_materials_collection,
     raw_users_collection,
     raw_work_schedules_collection,
 )
@@ -109,6 +112,15 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
     safety_audit_events_deleted = raw_safety_audit_events_collection.delete_many(
         owned_filter
     ).deleted_count
+    material_documents_deleted = raw_material_documents_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    project_materials_deleted = raw_project_materials_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    material_audit_events_deleted = raw_material_audit_events_collection.delete_many(
+        owned_filter
+    ).deleted_count
 
     stakeholder_refs_removed = 0
     if normalized_email:
@@ -133,6 +145,9 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
         "safety_records_deleted": safety_records_deleted,
         "safety_jobs_deleted": safety_jobs_deleted,
         "safety_audit_events_deleted": safety_audit_events_deleted,
+        "material_documents_deleted": material_documents_deleted,
+        "project_materials_deleted": project_materials_deleted,
+        "material_audit_events_deleted": material_audit_events_deleted,
         "notifications_deleted": notifications_deleted,
         "stakeholder_refs_removed": stakeholder_refs_removed,
         "users_deleted": users_deleted,

@@ -6,10 +6,13 @@ from fastapi import HTTPException
 from core.database import (
     floorplans_collection,
     inspections_collection,
+    material_audit_events_collection,
+    material_documents_collection,
     notifications_collection,
     safety_analysis_jobs_collection,
     safety_audit_events_collection,
     safety_records_collection,
+    project_materials_collection,
     tours_collection,
     work_schedules_collection,
 )
@@ -141,6 +144,17 @@ def delete_project(site_name: str) -> None:
     safety_records_collection.delete_many(safety_filter)
     safety_analysis_jobs_collection.delete_many(safety_filter)
     safety_audit_events_collection.delete_many(safety_filter)
+    material_filter = {
+        "$or": [
+            {"project_id": normalized_site},
+            {"site_name": normalized_site},
+            *([{"project_id": {"$in": project_ids}}] if project_ids else []),
+            *([{"floorplan_id": {"$in": floorplan_ids}}] if floorplan_ids else []),
+        ]
+    }
+    material_documents_collection.delete_many(material_filter)
+    project_materials_collection.delete_many(material_filter)
+    material_audit_events_collection.delete_many(material_filter)
 
     for project_dir in site_dirs_to_remove:
         if os.path.isdir(project_dir):
@@ -188,6 +202,12 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         safety_audit_events_collection.update_many(
             {"project_id": project_id}, {"$set": {"site_name": new_site}}
         )
+        material_documents_collection.update_many(
+            {"project_id": project_id}, {"$set": {"site_name": new_site}}
+        )
+        project_materials_collection.update_many(
+            {"project_id": project_id}, {"$set": {"site_name": new_site}}
+        )
         return
 
     existing = floorplans_collection.find_one(
@@ -232,6 +252,15 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         {"project_id": old_site},
         {"$set": {"project_id": new_site}},
     )
+    for collection in (
+        material_documents_collection,
+        project_materials_collection,
+        material_audit_events_collection,
+    ):
+        collection.update_many(
+            {"$or": [{"project_id": old_site}, {"site_name": old_site}]},
+            {"$set": {"project_id": new_site, "site_name": new_site}},
+        )
     for collection in (
         safety_records_collection,
         safety_analysis_jobs_collection,
