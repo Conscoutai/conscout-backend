@@ -12,6 +12,7 @@ from services.progress.materials.material_service import (
     _validated_confirmed_lines,
     build_material_ledger,
     classify_material_document,
+    enrich_delivery_lines_with_baseline,
     extract_structured_lines,
     validate_linked_material_line,
 )
@@ -68,9 +69,17 @@ def test_real_client_boq_extracts_the_two_curb_baseline_candidates():
 
 def test_document_classifier_handles_the_supplied_material_document_types():
     assert classify_material_document("BILL OF QUANTITIES", "contract.pdf") == "boq"
-    assert classify_material_document("WEEKLY REPORT #38", "report.pdf") == "weekly_report"
-    assert classify_material_document("CUSTOMER SHIPMENT Pack/Delivery ID", "ship.pdf") == "customer_shipment"
-    assert classify_material_document("MATERIAL INSPECTION REQUEST", "mir.pdf") == "mir_grn"
+    assert (
+        classify_material_document("WEEKLY REPORT #38", "report.pdf") == "weekly_report"
+    )
+    assert (
+        classify_material_document("CUSTOMER SHIPMENT Pack/Delivery ID", "ship.pdf")
+        == "customer_shipment"
+    )
+    assert (
+        classify_material_document("MATERIAL INSPECTION REQUEST", "mir.pdf")
+        == "mir_grn"
+    )
 
 
 def test_customer_shipment_parser_accepts_unit_before_quantity_from_client_ocr():
@@ -84,6 +93,78 @@ def test_customer_shipment_parser_accepts_unit_before_quantity_from_client_ocr()
     assert lines[0]["description"] == "uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP"
     assert lines[0]["unit"] == "PCS"
     assert lines[0]["delivered_qty"] == 199
+
+
+def test_customer_shipment_auto_matches_50mm_conduit_and_converts_pieces_to_lm():
+    lines, _ = extract_structured_lines(
+        ["1 111050310 uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP PC 199.00"],
+        document_type="customer_shipment",
+    )
+    enriched = enrich_delivery_lines_with_baseline(
+        lines,
+        [
+            {
+                "material_id": "mat-100mm",
+                "boq_item_number": "11",
+                "description": "100MM uPVC Ducts",
+                "unit": "LM",
+            },
+            {
+                "material_id": "mat-50mm",
+                "boq_item_number": "11",
+                "description": "50MM Upvc Conduit",
+                "unit": "LM",
+            },
+            {
+                "material_id": "mat-300mm",
+                "boq_item_number": "2",
+                "description": "PVC pipes class 3-6 bar for Sleeves - 300 mm",
+                "unit": "LM",
+            },
+        ],
+    )
+
+    line = enriched[0]
+    assert line["source_unit"] == "PCS"
+    assert line["source_delivered_qty"] == 199
+    assert line["suggested_material_id"] == "mat-50mm"
+    assert line["linked_material_id"] == "mat-50mm"
+    assert line["match_status"] == "suggested"
+    assert line["match_confidence"] >= 0.78
+    assert line["piece_length_m"] == 6
+    assert line["conversion_factor"] == 6
+    assert line["converted_qty"] == 1194
+    assert line["delivered_qty"] == 1194
+    assert line["unit"] == "LM"
+    assert line["conversion_status"] == "suggested"
+
+
+def test_suggested_unit_conversion_must_be_reviewed_before_confirmation():
+    line = {
+        "description": "uPVC Pipe 50x1.8 mm 6 Mt",
+        "source_unit": "PCS",
+        "source_delivered_qty": 199,
+        "unit": "LM",
+        "delivered_qty": 1194,
+        "converted_qty": 1194,
+        "conversion_factor": 6,
+        "conversion_status": "suggested",
+        "linked_material_id": "mat-50mm",
+    }
+    document = {"document_type": "customer_shipment", "reviewed_lines": [line]}
+
+    try:
+        _validated_confirmed_lines(document)
+    except HTTPException as error:
+        assert error.status_code == 422
+        assert "conversion must be reviewed" in str(error.detail)
+    else:
+        raise AssertionError("An AI unit conversion must be reviewed before posting")
+
+    line["conversion_status"] = "reviewed"
+    confirmed = _validated_confirmed_lines(document)
+    assert confirmed[0]["delivered_qty"] == 1194
+    assert confirmed[0]["source_delivered_qty"] == 199
 
 
 def test_delivery_parser_preserves_quantity_before_unit_layout():

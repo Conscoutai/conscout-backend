@@ -45,6 +45,9 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
+MATERIAL_PROCESSING_VERSION = 2
+AUTO_MATCH_MIN_CONFIDENCE = 0.78
+AUTO_MATCH_MIN_MARGIN = 0.15
 
 _UNIT_ALIASES = {
     "MTR": "M",
@@ -76,13 +79,11 @@ _DELIVERY_LINE_PREFIX = (
 )
 _DELIVERY_LINE_PATTERNS = (
     re.compile(
-        _DELIVERY_LINE_PREFIX
-        + rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s*$",
+        _DELIVERY_LINE_PREFIX + rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s*$",
         re.IGNORECASE,
     ),
     re.compile(
-        _DELIVERY_LINE_PREFIX
-        + rf"(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})\s*$",
+        _DELIVERY_LINE_PREFIX + rf"(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})\s*$",
         re.IGNORECASE,
     ),
 )
@@ -124,15 +125,234 @@ def normalize_description(value: Any) -> str:
     return " ".join(description.split())
 
 
+def _description_tokens(value: Any) -> set[str]:
+    ignored = {
+        "A",
+        "AN",
+        "AND",
+        "AS",
+        "FOR",
+        "OF",
+        "PER",
+        "S",
+        "SUPPLY",
+        "THE",
+        "WITH",
+    }
+    return {
+        token
+        for token in normalize_description(value).split()
+        if token not in ignored and len(token) > 1
+    }
+
+
+def _nominal_diameter_mm(value: Any) -> float:
+    """Return the first pipe diameter, including values such as 50x1.8 mm."""
+    text = str(value or "").upper().replace("×", "X")
+    match = re.search(
+        r"(?<![A-Z0-9])(?P<diameter>\d{1,4}(?:\.\d+)?)"
+        r"(?:\s*X\s*\d+(?:\.\d+)?)?\s*MM\b",
+        text,
+    )
+    return _number(match.group("diameter")) if match else 0.0
+
+
+def _piece_length_m(value: Any) -> float:
+    """Return an explicit per-piece length such as 6 Mt, 6 MTR, or 6 metres."""
+    text = str(value or "").upper()
+    matches = re.findall(
+        r"(?<![A-Z0-9.])(?P<length>\d+(?:\.\d+)?)\s*"
+        r"(?:METRES?|METERS?|MTRS?|MTS?|MT|M)(?![A-Z])",
+        text,
+    )
+    sensible = [_number(value) for value in matches if 0 < _number(value) <= 30]
+    return sensible[-1] if sensible else 0.0
+
+
+def _polymer_family(value: Any) -> str:
+    normalized = normalize_description(value)
+    if "UPVC" in normalized:
+        return "UPVC"
+    if "PVC" in normalized:
+        return "PVC"
+    if "HDPE" in normalized:
+        return "HDPE"
+    return ""
+
+
+def _is_pipe_family(value: Any) -> bool:
+    tokens = _description_tokens(value)
+    return bool(
+        tokens.intersection(
+            {
+                "PIPE",
+                "PIPES",
+                "CONDUIT",
+                "CONDUITS",
+                "DUCT",
+                "DUCTS",
+                "SLEEVE",
+                "SLEEVES",
+            }
+        )
+    )
+
+
+def _can_convert_units(source_unit: str, baseline_unit: str, description: Any) -> bool:
+    return (
+        normalize_unit(source_unit) == "PCS"
+        and normalize_unit(baseline_unit) in {"LM", "M"}
+        and _piece_length_m(description) > 0
+    )
+
+
+def _material_match_score(
+    source_line: dict[str, Any], material: dict[str, Any]
+) -> tuple[float, list[str]]:
+    source_description = str(source_line.get("description") or "")
+    baseline_description = str(material.get("description") or "")
+    source_tokens = _description_tokens(source_description)
+    baseline_tokens = _description_tokens(baseline_description)
+    overlap = source_tokens.intersection(baseline_tokens)
+    union = source_tokens.union(baseline_tokens)
+    score = (len(overlap) / len(union) * 0.22) if union else 0.0
+    reasons: list[str] = []
+
+    source_polymer = _polymer_family(source_description)
+    baseline_polymer = _polymer_family(baseline_description)
+    if source_polymer and baseline_polymer:
+        if source_polymer == baseline_polymer:
+            score += 0.24
+            reasons.append(f"same {source_polymer} material family")
+        elif {source_polymer, baseline_polymer} == {"UPVC", "PVC"}:
+            score += 0.16
+            reasons.append("compatible PVC material family")
+        else:
+            score -= 0.25
+
+    source_diameter = _nominal_diameter_mm(source_description)
+    baseline_diameter = _nominal_diameter_mm(baseline_description)
+    if source_diameter and baseline_diameter:
+        if abs(source_diameter - baseline_diameter) < 0.01:
+            score += 0.42
+            reasons.append(f"same {source_diameter:g} mm nominal diameter")
+        else:
+            score -= 0.6
+
+    if _is_pipe_family(source_description) and _is_pipe_family(baseline_description):
+        score += 0.16
+        reasons.append("same pipe/conduit family")
+
+    source_unit = normalize_unit(source_line.get("unit"))
+    baseline_unit = normalize_unit(material.get("unit"))
+    if source_unit and source_unit == baseline_unit:
+        score += 0.08
+        reasons.append("same unit")
+    elif _can_convert_units(source_unit, baseline_unit, source_description):
+        score += 0.08
+        reasons.append("explicit per-piece length supports unit conversion")
+
+    return max(0.0, min(round(score, 4), 1.0)), reasons
+
+
+def enrich_delivery_lines_with_baseline(
+    lines: list[dict[str, Any]], materials: Iterable[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Add auditable match/conversion suggestions without losing source values."""
+    baseline_materials = list(materials)
+    enriched: list[dict[str, Any]] = []
+    for source in lines:
+        line = dict(source)
+        source_unit = normalize_unit(line.get("unit"))
+        source_qty = _number(line.get("delivered_qty"))
+        source_description = str(line.get("description") or "").strip()
+        line.update(
+            source_description=source_description,
+            source_unit=source_unit,
+            source_delivered_qty=source_qty,
+        )
+
+        ranked = sorted(
+            (
+                (*_material_match_score(line, material), material)
+                for material in baseline_materials
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not ranked:
+            enriched.append(line)
+            continue
+
+        top_score, top_reasons, top_material = ranked[0]
+        runner_up_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if (
+            top_score < AUTO_MATCH_MIN_CONFIDENCE
+            or top_score - runner_up_score < AUTO_MATCH_MIN_MARGIN
+        ):
+            line.update(
+                match_status="needs_review",
+                match_confidence=top_score,
+                match_method="deterministic_description_and_dimension_match",
+            )
+            enriched.append(line)
+            continue
+
+        target_id = str(top_material.get("material_id") or "")
+        target_unit = normalize_unit(top_material.get("unit"))
+        line.update(
+            suggested_material_id=target_id,
+            suggested_material_description=str(top_material.get("description") or ""),
+            suggested_material_unit=target_unit,
+            suggested_boq_item_number=str(top_material.get("boq_item_number") or ""),
+            linked_material_id=target_id,
+            match_status="suggested",
+            match_confidence=top_score,
+            match_reasons=top_reasons,
+            match_method="deterministic_description_and_dimension_match",
+        )
+
+        if source_unit == target_unit:
+            line["conversion_status"] = "not_required"
+        elif _can_convert_units(source_unit, target_unit, source_description):
+            factor = _piece_length_m(source_description)
+            converted_qty = _rounded(source_qty * factor)
+            line.update(
+                unit=target_unit,
+                delivered_qty=converted_qty,
+                piece_length_m=factor,
+                conversion_factor=factor,
+                conversion_factor_unit="M_PER_PCS",
+                converted_qty=converted_qty,
+                converted_unit=target_unit,
+                conversion_formula=f"{source_qty:g} PCS x {factor:g} m/PCS = {converted_qty:g} {target_unit}",
+                conversion_status="suggested",
+                conversion_confidence=0.95,
+            )
+        else:
+            # Suggest the material but require a human-entered compatible quantity.
+            line["linked_material_id"] = ""
+            line["match_status"] = "needs_review"
+            line["conversion_status"] = "unsupported"
+        enriched.append(line)
+    return enriched
+
+
 def classify_material_document(text: str, filename: str = "") -> str:
     sample = f"{filename}\n{text[:30000]}".lower()
     rules = (
         ("mir_grn", ("material inspection request", "goods received note", " mir ")),
-        ("weekly_report", ("weekly report", "material delivery status", "long lead item")),
+        (
+            "weekly_report",
+            ("weekly report", "material delivery status", "long lead item"),
+        ),
         ("customer_shipment", ("customer shipment", "pack/delivery id")),
         ("delivery_note", ("delivery note", "delivery challan")),
         ("purchase_order", ("purchase order", "p.o. number", "po number")),
-        ("progress_invoice", ("progress invoice", "interim payment", "payment certificate")),
+        (
+            "progress_invoice",
+            ("progress invoice", "interim payment", "payment certificate"),
+        ),
         ("boq", ("bill of quantities", "priced boq", " boq ")),
     )
     padded = f" {sample} "
@@ -149,7 +369,9 @@ def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str,
         try:
             from PyPDF2 import PdfReader
         except ImportError:
-            raise HTTPException(503, "PDF extraction requires the pypdf dependency") from error
+            raise HTTPException(
+                503, "PDF extraction requires the pypdf dependency"
+            ) from error
 
     try:
         reader = PdfReader(io.BytesIO(raw_bytes))
@@ -241,8 +463,14 @@ def extract_structured_lines(
                 if _BOQ_BLOCK_START.match(" ".join(value.split()))
             ]
             for position, start in enumerate(starts):
-                end = starts[position + 1] if position + 1 < len(starts) else len(page_lines)
-                block = " ".join(" ".join(value.split()) for value in page_lines[start:end])
+                end = (
+                    starts[position + 1]
+                    if position + 1 < len(starts)
+                    else len(page_lines)
+                )
+                block = " ".join(
+                    " ".join(value.split()) for value in page_lines[start:end]
+                )
                 row = _BOQ_BLOCK_START.match(block)
                 if not row:
                     continue
@@ -258,7 +486,11 @@ def extract_structured_lines(
                 # quantity candidate, and every value still requires review.
                 quantity = amount / rate
                 description = row.group("description")[: values.start()].strip(" -:")
-                key = (page_number, row.group("item"), normalize_description(description))
+                key = (
+                    page_number,
+                    row.group("item"),
+                    normalize_description(description),
+                )
                 if len(description) < 4 or key in seen:
                     continue
                 seen.add(key)
@@ -282,10 +514,18 @@ def extract_structured_lines(
             compact = " ".join(raw_line.split())
             if len(compact) < 5:
                 continue
-            match = _BOQ_LINE.match(compact) if document_type in {"boq", "progress_invoice"} else None
+            match = (
+                _BOQ_LINE.match(compact)
+                if document_type in {"boq", "progress_invoice"}
+                else None
+            )
             if match:
                 values = match.groupdict()
-                key = (page_number, values["item"], normalize_description(values["description"]))
+                key = (
+                    page_number,
+                    values["item"],
+                    normalize_description(values["description"]),
+                )
                 if key in seen:
                     continue
                 seen.add(key)
@@ -298,7 +538,9 @@ def extract_structured_lines(
                     "description": values["description"].strip(" -:"),
                     "unit": normalize_unit(values["unit"]),
                     "confidence": 0.72,
-                    "warnings": ["Confirm the extracted table row against the source page."],
+                    "warnings": [
+                        "Confirm the extracted table row against the source page."
+                    ],
                 }
                 if document_type == "boq":
                     line.update(
@@ -315,7 +557,11 @@ def extract_structured_lines(
                 lines.append(line)
                 continue
 
-            if document_type in {"delivery_note", "customer_shipment", "purchase_order"}:
+            if document_type in {
+                "delivery_note",
+                "customer_shipment",
+                "purchase_order",
+            }:
                 match = next(
                     (
                         candidate
@@ -330,11 +576,19 @@ def extract_structured_lines(
                 description = values["description"].strip(" -:")
                 if len(normalize_description(description)) < 4:
                     continue
-                key = (page_number, values.get("code"), normalize_description(description))
+                key = (
+                    page_number,
+                    values.get("code"),
+                    normalize_description(description),
+                )
                 if key in seen:
                     continue
                 seen.add(key)
-                field = "ordered_qty" if document_type == "purchase_order" else "delivered_qty"
+                field = (
+                    "ordered_qty"
+                    if document_type == "purchase_order"
+                    else "delivered_qty"
+                )
                 lines.append(
                     {
                         "line_id": f"line_{uuid4().hex}",
@@ -344,7 +598,9 @@ def extract_structured_lines(
                         "unit": normalize_unit(values["unit"]),
                         field: _number(values["quantity"]),
                         "confidence": 0.65,
-                        "warnings": ["Link this row to a confirmed BOQ baseline material."],
+                        "warnings": [
+                            "Link this row to a confirmed BOQ baseline material."
+                        ],
                     }
                 )
 
@@ -386,7 +642,9 @@ def _extract_header(text: str, document_type: str) -> dict[str, Any]:
     return header
 
 
-def _public_document(document: dict[str, Any], *, include_lines: bool = True) -> dict[str, Any]:
+def _public_document(
+    document: dict[str, Any], *, include_lines: bool = True
+) -> dict[str, Any]:
     result = {
         key: value
         for key, value in document.items()
@@ -432,7 +690,9 @@ def upload_material_document(
 ) -> dict[str, Any]:
     requested_type = str(document_type or "auto").strip().lower()
     if requested_type not in DOCUMENT_TYPES:
-        raise HTTPException(400, f"Unsupported material document type: {requested_type}")
+        raise HTTPException(
+            400, f"Unsupported material document type: {requested_type}"
+        )
     safe_filename = Path(filename or "material-document.pdf").name
     if Path(safe_filename).suffix.lower() != ".pdf":
         raise HTTPException(400, "Material documents must be PDF files in Phase 1")
@@ -452,8 +712,13 @@ def upload_material_document(
     reprocess_existing = bool(
         existing
         and existing.get("status") == "needs_review"
-        and not existing.get("extracted_lines")
-        and not existing.get("reviewed_lines")
+        and (
+            int(existing.get("processing_version") or 0) < MATERIAL_PROCESSING_VERSION
+            or (
+                not existing.get("extracted_lines")
+                and not existing.get("reviewed_lines")
+            )
+        )
     )
     if existing and not reprocess_existing:
         return {"status": "already_uploaded", "document": _public_document(existing)}
@@ -463,6 +728,22 @@ def upload_material_document(
     detected_type = classify_material_document(text, safe_filename)
     resolved_type = detected_type if requested_type == "auto" else requested_type
     lines, line_warnings = extract_structured_lines(pages, document_type=resolved_type)
+    if resolved_type in {"delivery_note", "customer_shipment"} and lines:
+        baseline_materials = project_materials_collection.find(
+            {"project_id": project_id}
+        )
+        lines = enrich_delivery_lines_with_baseline(lines, baseline_materials)
+        if any(
+            line.get("match_status") == "suggested"
+            or line.get("conversion_status") == "suggested"
+            for line in lines
+        ):
+            line_warnings.append(
+                {
+                    "code": "auto_match_suggestions_require_review",
+                    "message": "AI-assisted BOQ matches and unit conversions were suggested. Verify them before confirmation.",
+                }
+            )
     now = utc_now()
     document_id = (
         str(existing.get("document_id"))
@@ -508,7 +789,10 @@ def upload_material_document(
         "source_size_bytes": len(raw_bytes),
         "page_count": len(pages),
         "extraction_method": extraction_method,
-        "processing_status": "processed" if extraction_method != "ocr_required" else "review_required",
+        "processing_version": MATERIAL_PROCESSING_VERSION,
+        "processing_status": (
+            "processed" if extraction_method != "ocr_required" else "review_required"
+        ),
         "status": "needs_review",
         "extracted_header": _extract_header(text, resolved_type),
         "extracted_lines": lines,
@@ -530,7 +814,18 @@ def upload_material_document(
     try:
         if reprocess_existing and existing:
             material_documents_collection.update_one(
-                {"document_id": document_id}, {"$set": document}
+                {"document_id": document_id},
+                {
+                    "$set": document,
+                    "$unset": {
+                        "reviewed_header": "",
+                        "reviewed_lines": "",
+                        "review_note": "",
+                        "reviewed_by_user_id": "",
+                        "reviewed_by_email": "",
+                        "reviewed_at": "",
+                    },
+                },
             )
         else:
             material_documents_collection.insert_one(document)
@@ -554,9 +849,9 @@ def upload_material_document(
 
 def list_material_documents(project_ref: str) -> list[dict[str, Any]]:
     project = resolve_project(project_ref)
-    cursor = material_documents_collection.find({"project_id": project["project_id"]}).sort(
-        "uploaded_at", -1
-    )
+    cursor = material_documents_collection.find(
+        {"project_id": project["project_id"]}
+    ).sort("uploaded_at", -1)
     return [_public_document(item, include_lines=False) for item in cursor]
 
 
@@ -587,9 +882,32 @@ def update_material_document_review(
     if not document:
         raise HTTPException(404, "Material document not found")
     if document.get("status") in {"confirmed", "superseded", "voided"}:
-        raise HTTPException(409, "Confirmed, superseded, or voided documents cannot be edited")
-    normalized_lines = _normalize_review_lines(lines)
+        raise HTTPException(
+            409, "Confirmed, superseded, or voided documents cannot be edited"
+        )
     now = utc_now()
+    normalized_lines = _normalize_review_lines(lines)
+    for line in normalized_lines:
+        suggested_material_id = str(line.get("suggested_material_id") or "")
+        linked_material_id = str(line.get("linked_material_id") or "")
+        if suggested_material_id:
+            line["match_status"] = (
+                "reviewed"
+                if linked_material_id == suggested_material_id
+                else "manual_override"
+            )
+            line["match_reviewed_by_user_id"] = user.user_id
+            line["match_reviewed_at"] = now
+        source_unit = normalize_unit(line.get("source_unit"))
+        target_unit = normalize_unit(line.get("unit"))
+        if (
+            source_unit
+            and source_unit != target_unit
+            and _number(line.get("conversion_factor")) > 0
+        ):
+            line["conversion_status"] = "reviewed"
+            line["conversion_reviewed_by_user_id"] = user.user_id
+            line["conversion_reviewed_at"] = now
     material_documents_collection.update_one(
         {"project_id": project_id, "document_id": document_id},
         {
@@ -636,6 +954,12 @@ def _normalize_review_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
             "certified_percent",
             "certified_qty",
             "certified_value",
+            "source_delivered_qty",
+            "piece_length_m",
+            "conversion_factor",
+            "converted_qty",
+            "match_confidence",
+            "conversion_confidence",
         ):
             if field in line:
                 line[field] = _number(line[field])
@@ -653,29 +977,72 @@ def _validated_confirmed_lines(document: dict[str, Any]) -> list[dict[str, Any]]
         else document.get("extracted_lines") or []
     )
     if not lines:
-        raise HTTPException(422, "Add at least one reviewed material line before confirmation")
+        raise HTTPException(
+            422, "Add at least one reviewed material line before confirmation"
+        )
     for index, line in enumerate(lines, start=1):
         description = str(line.get("description") or "").strip()
         unit = normalize_unit(line.get("unit"))
         if document_type == "boq":
             if not description or not unit or _number(line.get("planned_qty")) <= 0:
-                raise HTTPException(422, f"BOQ line {index} requires description, unit, and planned quantity")
-            line["material_id"] = str(line.get("material_id") or f"material_{uuid4().hex}")
+                raise HTTPException(
+                    422,
+                    f"BOQ line {index} requires description, unit, and planned quantity",
+                )
+            line["material_id"] = str(
+                line.get("material_id") or f"material_{uuid4().hex}"
+            )
         elif document_type in TRANSACTION_TYPES:
             if not line.get("linked_material_id"):
-                raise HTTPException(422, f"Line {index} must be linked to a confirmed BOQ baseline material")
-            if document_type in {"delivery_note", "customer_shipment"} and _number(line.get("delivered_qty")) <= 0:
-                raise HTTPException(422, f"Delivery line {index} requires a delivered quantity")
-            if document_type == "purchase_order" and _number(line.get("ordered_qty")) <= 0:
-                raise HTTPException(422, f"PO line {index} requires an ordered quantity")
+                raise HTTPException(
+                    422,
+                    f"Line {index} must be linked to a confirmed BOQ baseline material",
+                )
+            source_unit = normalize_unit(line.get("source_unit"))
+            if source_unit and source_unit != unit:
+                if line.get("conversion_status") != "reviewed":
+                    raise HTTPException(
+                        422,
+                        f"Line {index} unit conversion must be reviewed before confirmation",
+                    )
+                if (
+                    _number(line.get("source_delivered_qty")) <= 0
+                    or _number(line.get("conversion_factor")) <= 0
+                    or _number(line.get("converted_qty")) <= 0
+                ):
+                    raise HTTPException(
+                        422,
+                        f"Line {index} has incomplete unit conversion evidence",
+                    )
+            if (
+                document_type in {"delivery_note", "customer_shipment"}
+                and _number(line.get("delivered_qty")) <= 0
+            ):
+                raise HTTPException(
+                    422, f"Delivery line {index} requires a delivered quantity"
+                )
+            if (
+                document_type == "purchase_order"
+                and _number(line.get("ordered_qty")) <= 0
+            ):
+                raise HTTPException(
+                    422, f"PO line {index} requires an ordered quantity"
+                )
             if document_type == "mir_grn":
                 result = str(line.get("inspection_result") or "pending").strip().lower()
                 if result in {"", "pending", "submitted"}:
-                    raise HTTPException(422, f"MIR/GRN line {index} has no final inspection result")
+                    raise HTTPException(
+                        422, f"MIR/GRN line {index} has no final inspection result"
+                    )
                 inspected = _number(line.get("inspected_qty"))
-                decided = _number(line.get("accepted_qty")) + _number(line.get("rejected_qty"))
+                decided = _number(line.get("accepted_qty")) + _number(
+                    line.get("rejected_qty")
+                )
                 if inspected > 0 and decided > inspected + 0.0001:
-                    raise HTTPException(422, f"MIR/GRN line {index} acceptance exceeds inspected quantity")
+                    raise HTTPException(
+                        422,
+                        f"MIR/GRN line {index} acceptance exceeds inspected quantity",
+                    )
         line["unit"] = unit
     return lines
 
@@ -745,7 +1112,9 @@ def confirm_material_document(
                 material=material,
                 line_number=index,
             )
-    header = dict(document.get("reviewed_header") or document.get("extracted_header") or {})
+    header = dict(
+        document.get("reviewed_header") or document.get("extracted_header") or {}
+    )
     now = utc_now()
     if document.get("document_type") == "boq":
         material_documents_collection.update_many(
@@ -827,7 +1196,9 @@ def void_material_document(
     }
 
 
-def build_material_ledger(documents: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_material_ledger(
+    documents: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     confirmed = [item for item in documents if item.get("status") == "confirmed"]
     materials: dict[str, dict[str, Any]] = {}
     reconciliation_warnings: list[dict[str, Any]] = []
@@ -847,12 +1218,19 @@ def build_material_ledger(documents: Iterable[dict[str, Any]]) -> tuple[list[dic
                 "boq_item_number": str(line.get("item_number") or ""),
                 "material_code": str(line.get("material_code") or ""),
                 "description": str(line.get("description") or ""),
-                "normalized_description": normalize_description(line.get("description")),
+                "normalized_description": normalize_description(
+                    line.get("description")
+                ),
                 "unit": normalize_unit(line.get("unit")),
-                "currency": str(line.get("currency") or document.get("confirmed_header", {}).get("currency") or ""),
+                "currency": str(
+                    line.get("currency")
+                    or document.get("confirmed_header", {}).get("currency")
+                    or ""
+                ),
                 "planned_qty": planned,
                 "contract_unit_rate": contract_rate,
-                "planned_contract_value": _number(line.get("line_amount")) or planned * contract_rate,
+                "planned_contract_value": _number(line.get("line_amount"))
+                or planned * contract_rate,
                 "ordered_qty": 0.0,
                 "purchase_unit_rate": 0.0,
                 "committed_value": 0.0,
@@ -899,17 +1277,29 @@ def build_material_ledger(documents: Iterable[dict[str, Any]]) -> tuple[list[dic
                 continue
             item["source_document_ids"].append(document.get("document_id"))
             if document_type == "weekly_report":
-                item["approval_status"] = str(line.get("approval_status") or item["approval_status"])
-                item["expected_delivery_date"] = str(line.get("expected_delivery_date") or item["expected_delivery_date"])
-                item["actual_delivery_date"] = str(line.get("actual_delivery_date") or item["actual_delivery_date"])
+                item["approval_status"] = str(
+                    line.get("approval_status") or item["approval_status"]
+                )
+                item["expected_delivery_date"] = str(
+                    line.get("expected_delivery_date") or item["expected_delivery_date"]
+                )
+                item["actual_delivery_date"] = str(
+                    line.get("actual_delivery_date") or item["actual_delivery_date"]
+                )
             elif document_type == "purchase_order":
                 item["ordered_qty"] += _number(line.get("ordered_qty"))
                 rate = _number(line.get("purchase_unit_rate"))
                 if rate:
                     item["purchase_unit_rate"] = rate
             elif document_type in {"delivery_note", "customer_shipment"}:
-                item["delivered_qty"] += _number(line.get("delivered_qty")) - _number(line.get("return_qty"))
-                actual_date = str(line.get("actual_delivery_date") or document.get("confirmed_header", {}).get("document_date") or "")
+                item["delivered_qty"] += _number(line.get("delivered_qty")) - _number(
+                    line.get("return_qty")
+                )
+                actual_date = str(
+                    line.get("actual_delivery_date")
+                    or document.get("confirmed_header", {}).get("document_date")
+                    or ""
+                )
                 if actual_date:
                     item["actual_delivery_date"] = actual_date
             elif document_type == "mir_grn":
@@ -917,8 +1307,12 @@ def build_material_ledger(documents: Iterable[dict[str, Any]]) -> tuple[list[dic
                 item["accepted_qty"] += _number(line.get("accepted_qty"))
                 item["rejected_qty"] += _number(line.get("rejected_qty"))
             elif document_type == "progress_invoice":
-                item["certified_percent"] = max(item["certified_percent"], _number(line.get("certified_percent")))
-                item["certified_value"] = max(item["certified_value"], _number(line.get("certified_value")))
+                item["certified_percent"] = max(
+                    item["certified_percent"], _number(line.get("certified_percent"))
+                )
+                item["certified_value"] = max(
+                    item["certified_value"], _number(line.get("certified_value"))
+                )
 
     today = date.today().isoformat()
     for item in materials.values():
@@ -932,7 +1326,9 @@ def build_material_ledger(documents: Iterable[dict[str, Any]]) -> tuple[list[dic
         item["remaining_acceptance_qty"] = max(target - item["accepted_qty"], 0.0)
         item["over_delivery_qty"] = max(item["delivered_qty"] - target, 0.0)
         rate = item["purchase_unit_rate"] or item["contract_unit_rate"]
-        item["value_basis"] = "po_purchase_rate" if item["purchase_unit_rate"] else "boq_contract_rate"
+        item["value_basis"] = (
+            "po_purchase_rate" if item["purchase_unit_rate"] else "boq_contract_rate"
+        )
         item["delivered_reference_value"] = item["delivered_qty"] * rate
         item["accepted_reference_value"] = item["accepted_qty"] * rate
         overdue = bool(
@@ -995,12 +1391,11 @@ def rebuild_material_ledger(project_ref: str) -> list[dict[str, Any]]:
 
 def get_material_ledger(project_ref: str) -> list[dict[str, Any]]:
     project = resolve_project(project_ref)
-    cursor = project_materials_collection.find({"project_id": project["project_id"]}).sort(
-        [("status", 1), ("description", 1)]
-    )
+    cursor = project_materials_collection.find(
+        {"project_id": project["project_id"]}
+    ).sort([("status", 1), ("description", 1)])
     return [
-        {key: value for key, value in item.items() if key != "_id"}
-        for item in cursor
+        {key: value for key, value in item.items() if key != "_id"} for item in cursor
     ]
 
 
@@ -1024,7 +1419,9 @@ def get_material_summary(project_ref: str) -> dict[str, Any]:
     status_counts: dict[str, int] = defaultdict(int)
     for item in ledger:
         for field in totals:
-            source_field = "certified_value" if field == "certified_contract_value" else field
+            source_field = (
+                "certified_value" if field == "certified_contract_value" else field
+            )
             totals[field] += _number(item.get(source_field))
         unit = str(item.get("unit") or "UNSPECIFIED")
         bucket = quantity_totals.setdefault(
@@ -1045,7 +1442,9 @@ def get_material_summary(project_ref: str) -> dict[str, Any]:
     return {
         "project_id": project_id,
         "site_name": project["site_name"],
-        "currency": next((str(item.get("currency")) for item in ledger if item.get("currency")), ""),
+        "currency": next(
+            (str(item.get("currency")) for item in ledger if item.get("currency")), ""
+        ),
         "totals": {key: _rounded(value) for key, value in totals.items()},
         "quantity_totals": {
             unit: {key: _rounded(value) for key, value in values.items()}
@@ -1054,8 +1453,12 @@ def get_material_summary(project_ref: str) -> dict[str, Any]:
         "document_counts": dict(document_counts),
         "status_counts": dict(status_counts),
         "material_count": len(ledger),
-        "needs_review_count": sum(1 for item in active_documents if item.get("status") == "needs_review"),
-        "confirmed_document_count": sum(1 for item in active_documents if item.get("status") == "confirmed"),
+        "needs_review_count": sum(
+            1 for item in active_documents if item.get("status") == "needs_review"
+        ),
+        "confirmed_document_count": sum(
+            1 for item in active_documents if item.get("status") == "confirmed"
+        ),
         "overdue_count": sum(1 for item in ledger if item.get("is_overdue") is True),
         "unit_warning_count": sum(len(item.get("warnings") or []) for item in ledger),
     }
