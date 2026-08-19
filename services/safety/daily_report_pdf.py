@@ -204,6 +204,10 @@ class _SafetyDailyPdf(FPDF):
         self.alias_nb_pages()
 
     def header(self) -> None:
+        if self.page_no() > 1:
+            self.set_y(12)
+            return
+
         self.set_fill_color(*NAVY)
         self.rect(0, 0, self.w, 4, style="F")
         self.image(self.logo_path, x=12, y=9, w=12, h=12)
@@ -744,7 +748,7 @@ def build_daily_report_pdf(*, context: dict[str, Any], report: dict[str, Any]) -
         )
 
         pdf.add_page()
-        pdf.set_xy(12, 32)
+        pdf.set_xy(12, 12)
         pdf.set_text_color(*NAVY)
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 7, "AUDIT DETAIL & COMPLIANCE REGISTER", ln=1)
@@ -757,7 +761,7 @@ def build_daily_report_pdf(*, context: dict[str, Any], report: dict[str, Any]) -
             ln=1,
         )
 
-        table_y = 47.0
+        table_y = 27.0
         table_gap = 5.0
         table_w = (186.0 - table_gap) / 2
         table_h = 62.0

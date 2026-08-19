@@ -403,7 +403,7 @@ def test_daily_report_renderer_returns_a_pdf():
         content, filename = render_daily_report_pdf("project_1", "report_1")
 
     assert content.startswith(b"%PDF")
-    assert len(content) > 10_000
+    assert len(content) > 9_000
     assert content.count(b"/Type /Page") >= 2
     assert filename == "safety-manpower-2026-08-18-r1.pdf"
 
