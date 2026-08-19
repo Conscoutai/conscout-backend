@@ -73,6 +73,87 @@ def test_document_classifier_handles_the_supplied_material_document_types():
     assert classify_material_document("MATERIAL INSPECTION REQUEST", "mir.pdf") == "mir_grn"
 
 
+def test_customer_shipment_parser_accepts_unit_before_quantity_from_client_ocr():
+    lines, _ = extract_structured_lines(
+        ["1 111050310 uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP PC 199.00"],
+        document_type="customer_shipment",
+    )
+
+    assert len(lines) == 1
+    assert lines[0]["material_code"] == "111050310"
+    assert lines[0]["description"] == "uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP"
+    assert lines[0]["unit"] == "PCS"
+    assert lines[0]["delivered_qty"] == 199
+
+
+def test_delivery_parser_preserves_quantity_before_unit_layout():
+    lines, _ = extract_structured_lines(
+        ["MAT-001 Flush curb concrete 378 LM"],
+        document_type="delivery_note",
+    )
+
+    assert len(lines) == 1
+    assert lines[0]["material_code"] == "MAT-001"
+    assert lines[0]["description"] == "Flush curb concrete"
+    assert lines[0]["unit"] == "LM"
+    assert lines[0]["delivered_qty"] == 378
+
+
+def test_mixed_pdf_uses_ocr_on_sparse_pages(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    class FakePage:
+        def __init__(self, text: str):
+            self.text = text
+
+        def extract_text(self) -> str:
+            return self.text
+
+    class FakeReader:
+        pages = [
+            FakePage("MATERIAL INSPECTION REQUEST project metadata " * 5),
+            FakePage("MATERIAL INSPECTION REQUEST Page 2 of 4"),
+        ]
+
+    render_calls: list[tuple[int | None, int | None]] = []
+
+    def fake_convert_from_bytes(
+        raw_bytes: bytes,
+        *,
+        dpi: int,
+        fmt: str,
+        first_page: int | None = None,
+        last_page: int | None = None,
+    ) -> list[str]:
+        assert raw_bytes == b"%PDF-test"
+        assert dpi == 220
+        assert fmt == "png"
+        render_calls.append((first_page, last_page))
+        return [f"image-page-{first_page or 1}"]
+
+    fake_pypdf = ModuleType("pypdf")
+    fake_pypdf.PdfReader = lambda _: FakeReader()
+    fake_pdf2image = ModuleType("pdf2image")
+    fake_pdf2image.convert_from_bytes = fake_convert_from_bytes
+    fake_pytesseract = ModuleType("pytesseract")
+    fake_pytesseract.image_to_string = (
+        lambda _: "1 111050310 uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP PC 199.00"
+    )
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+    monkeypatch.setitem(sys.modules, "pdf2image", fake_pdf2image)
+    monkeypatch.setitem(sys.modules, "pytesseract", fake_pytesseract)
+
+    pages, method, warnings = _extract_pdf_pages(b"%PDF-test")
+    lines, _ = extract_structured_lines(pages, document_type="delivery_note")
+
+    assert method == "hybrid_ocr"
+    assert render_calls == [(2, 2)]
+    assert warnings[0]["code"] == "ocr_requires_review"
+    assert lines[0]["material_code"] == "111050310"
+    assert lines[0]["delivered_qty"] == 199
+
+
 def test_ledger_uses_boq_as_target_and_keeps_contract_value_labelled():
     documents = [
         _document(

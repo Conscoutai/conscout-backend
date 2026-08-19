@@ -44,6 +44,7 @@ TRANSACTION_TYPES = {
 MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
+MIN_NATIVE_TEXT_CHARS = 120
 
 _UNIT_ALIASES = {
     "MTR": "M",
@@ -68,11 +69,22 @@ _BOQ_LINE = re.compile(
     rf"(?P<rate>{_NUMBER})\s+(?P<amount>{_NUMBER})\s*$",
     re.IGNORECASE,
 )
-_DELIVERY_LINE = re.compile(
-    rf"^\s*(?:(?P<code>[A-Z0-9][A-Z0-9./_-]{{3,}})\s+)?"
-    rf"(?P<description>.{{4,}}?)\s+(?P<quantity>{_NUMBER})\s+"
-    rf"(?P<unit>{_UNIT})\s*$",
-    re.IGNORECASE,
+_DELIVERY_LINE_PREFIX = (
+    rf"^\s*(?:\d{{1,4}}(?:\.\d+)*\s+)?"
+    rf"(?:(?P<code>(?=[A-Z0-9./_-]*\d)[A-Z0-9][A-Z0-9./_-]{{3,}})\s+)?"
+    rf"(?P<description>.{{4,}}?)\s+"
+)
+_DELIVERY_LINE_PATTERNS = (
+    re.compile(
+        _DELIVERY_LINE_PREFIX
+        + rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        _DELIVERY_LINE_PREFIX
+        + rf"(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})\s*$",
+        re.IGNORECASE,
+    ),
 )
 _BOQ_BLOCK_START = re.compile(r"^\s*(?P<item>\d+(?:\.\d+)*)\s+(?P<description>.+)$")
 _BOQ_BLOCK_VALUE = re.compile(
@@ -147,40 +159,70 @@ def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str,
         raise HTTPException(413, f"PDFs are limited to {MAX_PDF_PAGES} pages")
 
     pages = [(page.extract_text() or "") for page in reader.pages]
-    if any(page.strip() for page in pages):
+    native_text_available = any(page.strip() for page in pages)
+    sparse_page_indexes = [
+        index
+        for index, page in enumerate(pages)
+        if len(" ".join(page.split())) < MIN_NATIVE_TEXT_CHARS
+    ]
+    if not sparse_page_indexes:
         return pages, "native_text", []
 
     warnings: list[dict[str, Any]] = []
-    if len(pages) > MAX_OCR_PAGES:
+    if len(sparse_page_indexes) > MAX_OCR_PAGES:
         warnings.append(
             {
                 "code": "ocr_page_limit",
-                "message": f"Image-only PDFs over {MAX_OCR_PAGES} pages require a split upload or offline processing.",
+                "message": f"PDFs with over {MAX_OCR_PAGES} sparse pages require a split upload or offline processing.",
             }
         )
-        return pages, "ocr_required", warnings
+        method = "native_text" if native_text_available else "ocr_required"
+        return pages, method, warnings
     try:
         from pdf2image import convert_from_bytes
         import pytesseract
 
-        images = convert_from_bytes(raw_bytes, dpi=220, fmt="png")
-        pages = [pytesseract.image_to_string(image) or "" for image in images]
-        if any(page.strip() for page in pages):
+        images_by_page: dict[int, Any] = {}
+        if len(sparse_page_indexes) == len(pages):
+            images = convert_from_bytes(raw_bytes, dpi=220, fmt="png")
+            images_by_page.update(zip(sparse_page_indexes, images))
+        else:
+            for index in sparse_page_indexes:
+                images = convert_from_bytes(
+                    raw_bytes,
+                    dpi=220,
+                    fmt="png",
+                    first_page=index + 1,
+                    last_page=index + 1,
+                )
+                if images:
+                    images_by_page[index] = images[0]
+
+        ocr_page_count = 0
+        for index, image in images_by_page.items():
+            ocr_text = pytesseract.image_to_string(image) or ""
+            if len(" ".join(ocr_text.split())) > len(" ".join(pages[index].split())):
+                pages[index] = ocr_text
+                ocr_page_count += 1
+
+        if ocr_page_count:
             warnings.append(
                 {
                     "code": "ocr_requires_review",
-                    "message": "The PDF was image-only. OCR values require page-by-page review.",
+                    "message": f"OCR was used on {ocr_page_count} sparse PDF page(s). Values require page-by-page review.",
                 }
             )
-            return pages, "ocr", warnings
+            method = "hybrid_ocr" if native_text_available else "ocr"
+            return pages, method, warnings
     except Exception as error:
         warnings.append(
             {
                 "code": "ocr_unavailable",
-                "message": f"No selectable text was found and OCR could not run: {error}",
+                "message": f"Sparse PDF pages could not be OCRed: {error}",
             }
         )
-    return pages, "ocr_required", warnings
+    method = "native_text" if native_text_available else "ocr_required"
+    return pages, method, warnings
 
 
 def extract_structured_lines(
@@ -274,7 +316,14 @@ def extract_structured_lines(
                 continue
 
             if document_type in {"delivery_note", "customer_shipment", "purchase_order"}:
-                match = _DELIVERY_LINE.match(compact)
+                match = next(
+                    (
+                        candidate
+                        for pattern in _DELIVERY_LINE_PATTERNS
+                        if (candidate := pattern.match(compact))
+                    ),
+                    None,
+                )
                 if not match:
                     continue
                 values = match.groupdict()
@@ -400,7 +449,13 @@ def upload_material_document(
     existing = material_documents_collection.find_one(
         {"project_id": project_id, "source_sha256": digest}
     )
-    if existing:
+    reprocess_existing = bool(
+        existing
+        and existing.get("status") == "needs_review"
+        and not existing.get("extracted_lines")
+        and not existing.get("reviewed_lines")
+    )
+    if existing and not reprocess_existing:
         return {"status": "already_uploaded", "document": _public_document(existing)}
 
     pages, extraction_method, extraction_warnings = _extract_pdf_pages(raw_bytes)
@@ -409,11 +464,23 @@ def upload_material_document(
     resolved_type = detected_type if requested_type == "auto" else requested_type
     lines, line_warnings = extract_structured_lines(pages, document_type=resolved_type)
     now = utc_now()
-    document_id = f"material_doc_{uuid4().hex}"
+    document_id = (
+        str(existing.get("document_id"))
+        if reprocess_existing and existing
+        else f"material_doc_{uuid4().hex}"
+    )
     document_directory = os.path.join(site_materials_dir(project_id), "documents")
     os.makedirs(document_directory, exist_ok=True)
-    stored_filename = f"{document_id}_{safe_filename}"
-    stored_path = os.path.join(document_directory, stored_filename)
+    stored_filename = (
+        str(existing.get("stored_filename"))
+        if reprocess_existing and existing and existing.get("stored_filename")
+        else f"{document_id}_{safe_filename}"
+    )
+    stored_path = (
+        str(existing.get("storage_path"))
+        if reprocess_existing and existing and existing.get("storage_path")
+        else os.path.join(document_directory, stored_filename)
+    )
     with open(stored_path, "wb") as output:
         output.write(raw_bytes)
 
@@ -450,26 +517,39 @@ def upload_material_document(
         "warnings": warnings,
         "uploaded_by_user_id": user.user_id,
         "uploaded_by_email": user.email,
-        "uploaded_at": now,
+        "uploaded_at": existing.get("uploaded_at", now) if existing else now,
         "processed_at": now,
         "updated_at": now,
     }
+    if reprocess_existing:
+        document.update(
+            reprocessed_at=now,
+            reprocessed_by_user_id=user.user_id,
+            reprocessed_by_email=user.email,
+        )
     try:
-        material_documents_collection.insert_one(document)
+        if reprocess_existing and existing:
+            material_documents_collection.update_one(
+                {"document_id": document_id}, {"$set": document}
+            )
+        else:
+            material_documents_collection.insert_one(document)
     except Exception:
-        try:
-            os.remove(stored_path)
-        except OSError:
-            pass
+        if not reprocess_existing:
+            try:
+                os.remove(stored_path)
+            except OSError:
+                pass
         raise
     _audit(
         project_id=project_id,
         document_id=document_id,
-        event_type="uploaded",
+        event_type="reprocessed" if reprocess_existing else "uploaded",
         user=user,
         details={"document_type": resolved_type, "filename": safe_filename},
     )
-    return {"status": "needs_review", "document": _public_document(document)}
+    status = "reprocessed" if reprocess_existing else "needs_review"
+    return {"status": status, "document": _public_document(document)}
 
 
 def list_material_documents(project_ref: str) -> list[dict[str, Any]]:
