@@ -378,11 +378,16 @@ def test_real_delivery_bundle_ocr_variants_are_consolidated_and_reconciled():
 44 SERGSTONE SOX30K 100M GREW WITHOUT CHAMFER La 378
 44 RERGSTONE SUXSERIGCN GREY WITHOUT CHANTER LBA 378""",
         """31/12/2023 DELIVERY 8634582 30-May-24 PO No AGC24108-5
+~ Manuwlantere : Maz Factery For Cement Product Ce. DELIVERY NO. 8634582
+Li
 44 RERBSSTONE GUAGGRIGOM GET SITROUT CHAMFER Lt 378
 44 KRERBSTONE S0KSGR410CM GREY WITROUT CHAMFER Li : 372""",
         """DELIVERY 34864 21564 30-May-24 PO DRIVER AGC24108-5
 4.4 RERSSTONE S0XS0X(0Ch GREY WITHOUT CHAMFER POS : 378
-ai KERSSTONE SOXG0K10CM GREY WITHOUT CHAMFER Pcs 378""",
+ai KERSSTONE SOXG0K10CM GREY WITHOUT CHAMFER Pcs 378
+ie ee
+FCS
+37""",
     ]
     lines, _ = extract_structured_lines(pages, document_type="delivery_note")
     contexts = _delivery_page_contexts(pages, filename="31564-31582-31563-31565.pdf")
@@ -398,6 +403,22 @@ ai KERSSTONE SOXG0K10CM GREY WITHOUT CHAMFER Pcs 378""",
     ]
     assert all(line["source_document_date"] == "30-May-24" for line in lines)
     assert all(line["po_reference"] != "DRIVER" for line in lines)
+    assert not any("FACTERY" in line["description"].upper() for line in lines)
+    assert not any(line["delivered_qty"] in {37, 8634582} for line in lines)
+
+    unmatched = enrich_delivery_lines_with_baseline(
+        lines,
+        [
+            {
+                "material_id": "mat-conduit",
+                "boq_item_number": "11",
+                "description": "50MM Upvc Conduit",
+                "unit": "LM",
+            }
+        ],
+    )
+    assert all(line["match_status"] == "needs_review" for line in unmatched)
+    assert not any(line.get("linked_material_id") for line in unmatched)
 
     enriched = enrich_delivery_lines_with_baseline(
         lines,

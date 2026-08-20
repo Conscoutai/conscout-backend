@@ -46,7 +46,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 8
+MATERIAL_PROCESSING_VERSION = 9
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -683,8 +683,31 @@ def resolve_material_document_type(
 
 def _looks_like_reference_identifier_row(description: str) -> bool:
     """Reject headers such as `Delivery Note NO 374694` as material rows."""
-    return bool(
-        _REFERENCE_IDENTIFIER_LABEL.fullmatch(normalize_description(description))
+    normalized = normalize_description(description)
+    if _REFERENCE_IDENTIFIER_LABEL.fullmatch(normalized):
+        return True
+    return "DELIVERY" in normalized and (
+        normalized.endswith("DELIVERY")
+        or normalized.endswith("DELIVERY NO")
+        or any(
+            marker in normalized
+            for marker in (
+                "MANUFACTUR",
+                "FACTERY",
+                "FACTORY",
+                "CUSTOMER NAME",
+                "TRANSPORT NAME",
+                "DRIVER NAME",
+            )
+        )
+    )
+
+
+def _has_material_description_signal(description: str) -> bool:
+    """Require at least one readable material word, not only OCR fragments."""
+    return any(
+        len(token) >= 3 and bool(re.search(r"[A-Z]", token))
+        for token in normalize_description(description).split()
     )
 
 
@@ -820,13 +843,23 @@ def _delivery_lines_for_page(
     raw_lines = [" ".join(value.split()) for value in page_text.splitlines()]
     compact_lines = [value for value in raw_lines if value]
     candidates = list(compact_lines)
+    standalone_row_indexes = {
+        index
+        for index, value in enumerate(compact_lines)
+        if any(pattern.match(value) for pattern in _DELIVERY_LINE_PATTERNS)
+    }
     # Scanned delivery notes frequently split the description, unit, and
     # quantity across several OCR lines. Always examine short adjacent windows;
-    # containment de-duplication below keeps a clean direct row when available.
+    # never extend beyond an already complete row, and containment
+    # de-duplication below keeps a clean direct row when available.
     for size in (2, 3, 4):
         candidates.extend(
             " ".join(compact_lines[index : index + size])
             for index in range(max(0, len(compact_lines) - size + 1))
+            if not any(
+                row_index in standalone_row_indexes
+                for row_index in range(index, index + size - 1)
+            )
         )
 
     output: list[dict[str, Any]] = []
@@ -850,7 +883,7 @@ def _delivery_lines_for_page(
             reference_ignored = True
             continue
         normalized = normalize_description(description)
-        if len(normalized) < 4 or any(
+        if not _has_material_description_signal(description) or any(
             marker in normalized
             for marker in (
                 "DESCRIPTION QTY",
