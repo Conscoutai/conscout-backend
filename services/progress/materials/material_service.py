@@ -45,7 +45,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 6
+MATERIAL_PROCESSING_VERSION = 7
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -262,6 +262,72 @@ def _nominal_diameter_mm(value: Any) -> float:
     return _number(match.group("diameter")) if match else 0.0
 
 
+_DIMENSION_TRIPLET = re.compile(
+    r"(?<![A-Z0-9])(?P<a>[0-9SOG]{1,4}(?:\.[0-9]+)?)\s*[XK]\s*"
+    r"(?P<b>[0-9SOG]{1,4}(?:\.[0-9]+)?)\s*[XK]\s*"
+    r"(?P<c>[0-9SOG]{1,4}(?:\.[0-9]+)?)(?:\s*(?P<unit>CM|MM))?\b",
+    re.IGNORECASE,
+)
+
+
+def _ocr_dimension_number(value: Any) -> float:
+    corrected = (
+        str(value or "")
+        .upper()
+        .translate(str.maketrans({"S": "5", "O": "0", "G": "3"}))
+    )
+    return _number(corrected)
+
+
+def _is_kerbstone_family(value: Any) -> bool:
+    normalized = normalize_description(value)
+    return any(
+        marker in normalized
+        for marker in ("KERBSTONE", "KERB STONE", "KERSTONE", "CURBSTONE", "CURB")
+    )
+
+
+def _dimension_signature_mm(value: Any) -> tuple[float, ...]:
+    """Return a sorted three-dimension signature, correcting narrow OCR errors."""
+    text = str(value or "").upper().replace("×", "X")
+    match = _DIMENSION_TRIPLET.search(text)
+    if not match:
+        return ()
+    dimensions = [
+        _ocr_dimension_number(match.group(name)) for name in ("a", "b", "c")
+    ]
+    if any(dimension <= 0 for dimension in dimensions):
+        return ()
+    unit = str(match.group("unit") or "").upper()
+    if unit == "CM" or (
+        not unit and max(dimensions) <= 100 and _is_kerbstone_family(value)
+    ):
+        dimensions = [dimension * 10 for dimension in dimensions]
+    return tuple(sorted(round(dimension, 4) for dimension in dimensions))
+
+
+def _clean_delivery_description(value: Any) -> str:
+    """Clean only high-confidence OCR defects without rewriting source meaning."""
+    description = " ".join(str(value or "").split()).strip(" -:")
+    description = re.sub(
+        r"^(?:AI|AL)\s+(?=(?:KERB|KERSTONE|CURB))",
+        "",
+        description,
+        flags=re.IGNORECASE,
+    )
+    description = re.sub(
+        r"\bKERSTONE\b", "KERBSTONE", description, flags=re.IGNORECASE
+    )
+
+    def replace_dimensions(match: re.Match[str]) -> str:
+        values = [
+            f"{_ocr_dimension_number(match.group(name)):g}" for name in ("a", "b", "c")
+        ]
+        return "X".join(values) + str(match.group("unit") or "").upper()
+
+    return _DIMENSION_TRIPLET.sub(replace_dimensions, description)
+
+
 def _piece_length_m(value: Any) -> float:
     """Return an explicit per-piece length such as 6 Mt, 6 MTR, or 6 metres."""
     text = str(value or "").upper()
@@ -271,7 +337,12 @@ def _piece_length_m(value: Any) -> float:
         text,
     )
     sensible = [_number(value) for value in matches if 0 < _number(value) <= 30]
-    return sensible[-1] if sensible else 0.0
+    if sensible:
+        return sensible[-1]
+    dimensions = _dimension_signature_mm(value)
+    if dimensions and _is_kerbstone_family(value):
+        return round(max(dimensions) / 1000, 4)
+    return 0.0
 
 
 def _polymer_family(value: Any) -> str:
@@ -347,6 +418,20 @@ def _material_match_score(
     if _is_pipe_family(source_description) and _is_pipe_family(baseline_description):
         score += 0.16
         reasons.append("same pipe/conduit family")
+
+    source_dimensions = _dimension_signature_mm(source_description)
+    baseline_dimensions = _dimension_signature_mm(baseline_description)
+    if _is_kerbstone_family(source_description) and _is_kerbstone_family(
+        baseline_description
+    ):
+        score += 0.38
+        reasons.append("same kerbstone/curb material family")
+        if source_dimensions and baseline_dimensions:
+            if source_dimensions == baseline_dimensions:
+                score += 0.44
+                reasons.append("same three-dimensional kerbstone size")
+            else:
+                score -= 0.65
 
     source_unit = normalize_unit(source_line.get("unit"))
     baseline_unit = normalize_unit(material.get("unit"))
@@ -642,19 +727,14 @@ def _delivery_lines_for_page(
     raw_lines = [" ".join(value.split()) for value in page_text.splitlines()]
     compact_lines = [value for value in raw_lines if value]
     candidates = list(compact_lines)
-    # OCR frequently puts description, unit, and quantity on adjacent lines.
-    # Only use joined windows when no single OCR line contains a material row.
-    direct_match = any(
-        pattern.match(value)
-        for value in candidates
-        for pattern in _DELIVERY_LINE_PATTERNS
-    )
-    if not direct_match:
-        for size in (2, 3):
-            candidates.extend(
-                " ".join(compact_lines[index : index + size])
-                for index in range(max(0, len(compact_lines) - size + 1))
-            )
+    # Scanned delivery notes frequently split the description, unit, and
+    # quantity across several OCR lines. Always examine short adjacent windows;
+    # containment de-duplication below keeps a clean direct row when available.
+    for size in (2, 3, 4):
+        candidates.extend(
+            " ".join(compact_lines[index : index + size])
+            for index in range(max(0, len(compact_lines) - size + 1))
+        )
 
     output: list[dict[str, Any]] = []
     seen: set[tuple[str, str, float]] = set()
@@ -671,7 +751,7 @@ def _delivery_lines_for_page(
         if not match:
             continue
         values = match.groupdict()
-        description = values["description"].strip(" -:")
+        description = _clean_delivery_description(values["description"])
         if _looks_like_reference_identifier_row(description):
             reference_ignored = True
             continue
@@ -680,6 +760,7 @@ def _delivery_lines_for_page(
             marker in normalized
             for marker in (
                 "DESCRIPTION QTY",
+                "DESCRIPTION OF MATERIAL",
                 "ITEM DESCRIPTION",
                 "QUANTITY UNIT",
                 "DELIVERY NOTE DATE",
@@ -694,21 +775,98 @@ def _delivery_lines_for_page(
         key = (normalized, unit, quantity)
         if key in seen:
             continue
+        contained_index = next(
+            (
+                index
+                for index, existing in enumerate(output)
+                if existing.get("unit") == unit
+                and _number(existing.get("ordered_qty", existing.get("delivered_qty")))
+                == quantity
+                and (
+                    normalize_description(existing.get("description")) in normalized
+                    or normalized in normalize_description(existing.get("description"))
+                )
+            ),
+            None,
+        )
+        if contained_index is not None:
+            existing_description = normalize_description(
+                output[contained_index].get("description")
+            )
+            existing_specificity = sum(
+                (
+                    bool(_dimension_signature_mm(existing_description)),
+                    _is_kerbstone_family(existing_description),
+                    _is_pipe_family(existing_description),
+                )
+            )
+            candidate_specificity = sum(
+                (
+                    bool(_dimension_signature_mm(description)),
+                    _is_kerbstone_family(description),
+                    _is_pipe_family(description),
+                )
+            )
+            if candidate_specificity < existing_specificity or (
+                candidate_specificity == existing_specificity
+                and len(normalized) >= len(existing_description)
+            ):
+                continue
+            output.pop(contained_index)
         seen.add(key)
         field = "ordered_qty" if document_type == "purchase_order" else "delivered_qty"
-        output.append(
-            {
-                "line_id": f"line_{uuid4().hex}",
-                "source_page": page_number,
-                "material_code": values.get("code") or "",
-                "description": description,
-                "unit": unit,
-                field: quantity,
-                "confidence": 0.67,
-                "warnings": ["Link this row to a confirmed BOQ baseline material."],
-            }
-        )
+        line = {
+            "line_id": f"line_{uuid4().hex}",
+            "source_page": page_number,
+            "material_code": values.get("code") or "",
+            "description": description,
+            "unit": unit,
+            field: quantity,
+            "confidence": 0.67,
+            "warnings": ["Link this row to a confirmed BOQ baseline material."],
+        }
+        line.update(_delivery_page_context(page_text, page_number))
+        output.append(line)
     return output, reference_ignored
+
+
+def _delivery_page_context(page_text: str, page_number: int) -> dict[str, Any]:
+    compact = " ".join(str(page_text or "").split())
+    delivery_match = re.search(
+        r"(?:DELIVERY\s*(?:NOTE\s*)?(?:NO|NUMBER|#)|DELIVERY\s+NO)"
+        r"\s*[:.\-]?\s*(?P<number>\d{4,})",
+        compact,
+        re.IGNORECASE,
+    )
+    po_match = re.search(
+        r"(?:PURCHASE\s*ORDER|CUSTOMER\s*ORDER|PO)\s*(?:NO|NUMBER|#)?"
+        r"\s*[:.\-]?\s*(?P<number>[A-Z0-9][A-Z0-9/\-]{3,})",
+        compact,
+        re.IGNORECASE,
+    )
+    dates = _DATE.findall(compact)
+    delivery_number = delivery_match.group("number") if delivery_match else ""
+    return {
+        "source_page": page_number,
+        "delivery_note_number": delivery_number,
+        "source_document_number": delivery_number,
+        "source_document_date": dates[0] if dates else "",
+        "po_reference": po_match.group("number") if po_match else "",
+    }
+
+
+def _delivery_page_contexts(pages: Iterable[str]) -> list[dict[str, Any]]:
+    contexts = [
+        _delivery_page_context(page_text, page_number)
+        for page_number, page_text in enumerate(pages, start=1)
+    ]
+    return [
+        context
+        for context in contexts
+        if context.get("delivery_note_number")
+        or context.get("source_document_date")
+        or context.get("po_reference")
+    ]
 
 
 def _mir_lines(pages: list[str]) -> list[dict[str, Any]]:
@@ -1273,6 +1431,24 @@ def upload_material_document(
         requested_type, detected_type
     )
     lines, line_warnings = extract_structured_lines(pages, document_type=resolved_type)
+    page_contexts: list[dict[str, Any]] = []
+    if resolved_type == "delivery_note":
+        page_contexts = _delivery_page_contexts(pages)
+        page_document_numbers = {
+            str(context.get("delivery_note_number") or "")
+            for context in page_contexts
+            if context.get("delivery_note_number")
+        }
+        if len(page_document_numbers) > 1:
+            line_warnings.append(
+                {
+                    "code": "bundled_delivery_notes_extracted_by_page",
+                    "message": (
+                        f"{len(page_document_numbers)} delivery notes were found in this PDF bundle. "
+                        "Each page was extracted and retained as separate source evidence."
+                    ),
+                }
+            )
     if resolved_type in {"delivery_note", "customer_shipment", "mir_grn"} and lines:
         baseline_materials = list(
             project_materials_collection.find({"project_id": project_id})
@@ -1332,6 +1508,16 @@ def upload_material_document(
                 "message": warning_message,
             },
         )
+    extracted_header = _extract_header(text, resolved_type)
+    if page_contexts:
+        extracted_header["page_documents"] = page_contexts
+        extracted_header["bundled_document_count"] = len(
+            {
+                context.get("delivery_note_number")
+                for context in page_contexts
+                if context.get("delivery_note_number")
+            }
+        )
     document = {
         "document_id": document_id,
         "project_id": project_id,
@@ -1353,7 +1539,7 @@ def upload_material_document(
             "processed" if extraction_method != "ocr_required" else "review_required"
         ),
         "status": "needs_review",
-        "extracted_header": _extract_header(text, resolved_type),
+        "extracted_header": extracted_header,
         "extracted_lines": lines,
         "extracted_text": text,
         "text_preview": " ".join(text.split())[:1500],

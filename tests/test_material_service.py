@@ -311,6 +311,60 @@ def test_delivery_parser_reassembles_ocr_columns_split_across_lines():
     assert lines[0]["delivered_qty"] == 378
 
 
+def test_kerbstone_delivery_bundle_keeps_four_pages_and_converts_only_pieces():
+    pages = [
+        """Delivery No 31565 Date 30-May-24 PO No AGC24108-0
+ai KERSTONE
+SOXGOK10CM GREY
+WITHOUT CHAMFER
+PCS 378""",
+        """Delivery No 31563 Date 30-May-24 PO No AGC24108-0
+KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER LM 378""",
+        """Delivery No 31582 Date 30-May-24 PO No AGC24108-0
+KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER LM 379""",
+        """Delivery No 31564 Date 30-May-24 PO No AGC24108-0
+KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER PCS 378""",
+    ]
+    lines, _ = extract_structured_lines(pages, document_type="delivery_note")
+
+    assert len(lines) == 4
+    assert [line["source_page"] for line in lines] == [1, 2, 3, 4]
+    assert [line["delivery_note_number"] for line in lines] == [
+        "31565",
+        "31563",
+        "31582",
+        "31564",
+    ]
+    assert lines[0]["description"] == "KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER"
+    assert all(line["po_reference"] == "AGC24108-0" for line in lines)
+
+    enriched = enrich_delivery_lines_with_baseline(
+        lines,
+        [
+            {
+                "material_id": "mat-other-curb",
+                "boq_item_number": "14",
+                "description": "Supply and install kerbstone 100x250x500mm",
+                "unit": "LM",
+            },
+            {
+                "material_id": "mat-flush-curb",
+                "boq_item_number": "15",
+                "description": "Supply & Install, Flush curb Concrete 100x300x500mm",
+                "unit": "LM",
+            },
+        ],
+    )
+
+    assert all(line["linked_material_id"] == "mat-flush-curb" for line in enriched)
+    assert [line["source_unit"] for line in enriched] == ["PCS", "LM", "LM", "PCS"]
+    assert [line["delivered_qty"] for line in enriched] == [189, 378, 379, 189]
+    assert enriched[0]["conversion_factor"] == 0.5
+    assert enriched[0]["conversion_status"] == "suggested"
+    assert enriched[1]["conversion_status"] == "not_required"
+    assert sum(line["delivered_qty"] for line in enriched) == 1135
+
+
 def test_real_client_weekly_mir_and_invoice_have_reviewable_rows():
     cases = (
         ("weekly_report", CLIENT_MATERIALS / "Weekly Report #38 (18-11-2024).pdf", 20),
