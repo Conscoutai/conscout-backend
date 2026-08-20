@@ -45,7 +45,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 3
+MATERIAL_PROCESSING_VERSION = 4
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -74,7 +74,7 @@ _UNIT_ALIASES = {
     "TONNE": "TON",
 }
 _NUMBER = r"[+-]?[\d,]+(?:\.\d+)?"
-_UNIT = r"LM|L\.M\.?|M2|M3|M|MTR|PCS?|PCE|EA|NO|NOS|KG|TON|TONNE|BAG"
+_UNIT = r"LM|L\.M\.?|M2|M3|M|MTR|PCS?|PCE|EA|NO|NOS|KG|TON|TONNE|BAG|" r"ITEM|LOT|SET"
 _BOQ_LINE = re.compile(
     rf"^\s*(?P<item>\d+(?:\.\d+)*)\s+(?P<description>.{{3,}}?)\s+"
     rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s+"
@@ -104,6 +104,37 @@ _BOQ_BLOCK_VALUE = re.compile(
 )
 _DATE = re.compile(
     r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b"
+)
+_REPORT_DATE = re.compile(
+    r"\b(?:"
+    r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|"
+    r"\d{1,2}\s+[A-Za-z]{3,9}\.?,?\s+\d{4}|"
+    r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|"
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r")\b",
+    re.IGNORECASE,
+)
+_WEEKLY_ROW_START = re.compile(r"^\s*(?P<item>\d+(?:\.\d+)*)\s*(?P<body>.*)$")
+_WEEKLY_REFERENCE = re.compile(
+    r"(?P<reference>HARDSCAPE|ELECTRICAL|IRRIGATION|SOFTSCAPE)\s*WORK\b",
+    re.IGNORECASE,
+)
+_INVOICE_ROW_START = re.compile(
+    r"^\s*(?P<item>[A-Z](?:\.)?|\d+(?:[-.]\d+)*)\s+(?P<body>.+)$",
+    re.IGNORECASE,
+)
+_INVOICE_PROGRESS_PAIR = re.compile(
+    rf"(?P<percent>[\d,]+(?:\.\d+)?)\s*%\s*(?P<amount>{_NUMBER}|-)"
+)
+_INVOICE_PREFIX_QTY_UNIT = re.compile(
+    rf"^(?P<description>.+?)\s+(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s+"
+    rf"(?P<rate>{_NUMBER})\s+(?P<amount>{_NUMBER})\s*$",
+    re.IGNORECASE,
+)
+_INVOICE_PREFIX_UNIT_QTY = re.compile(
+    rf"^(?P<description>.+?)\s+(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})\s+"
+    rf"(?P<rate>{_NUMBER})\s+(?P<amount>{_NUMBER})\s*$",
+    re.IGNORECASE,
 )
 _REFERENCE_IDENTIFIER_LABEL = re.compile(
     r"^(?:DELIVERY NOTE|DELIVERY ID|PACK ID|PACK DELIVERY ID|"
@@ -146,7 +177,9 @@ def preserve_matching_boq_material_ids(
 ) -> tuple[list[dict[str, Any]], int]:
     """Reuse stable IDs for unchanged BOQ rows during a baseline replacement."""
     active_by_item: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    active_by_description: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    active_by_description: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(
+        list
+    )
     for raw_line in active_lines:
         line = dict(raw_line)
         material_id = str(line.get("material_id") or "").strip()
@@ -405,6 +438,30 @@ def enrich_delivery_lines_with_baseline(
     return enriched
 
 
+def enrich_mir_lines_with_baseline(
+    lines: list[dict[str, Any]], materials: Iterable[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Reuse the auditable delivery matcher for MIR quantities and descriptions."""
+    delivery_shaped: list[dict[str, Any]] = []
+    for source in lines:
+        line = dict(source)
+        line["delivered_qty"] = _number(line.get("inspected_qty"))
+        delivery_shaped.append(line)
+    enriched = enrich_delivery_lines_with_baseline(delivery_shaped, materials)
+    output: list[dict[str, Any]] = []
+    for enriched_line in enriched:
+        line = dict(enriched_line)
+        inspected_qty = _number(line.pop("delivered_qty", 0))
+        source_qty = _number(line.get("source_delivered_qty"))
+        line["source_inspected_qty"] = source_qty
+        line["inspected_qty"] = inspected_qty
+        result = str(line.get("inspection_result") or "pending").lower()
+        line["accepted_qty"] = inspected_qty if result.startswith("accepted") else 0.0
+        line["rejected_qty"] = inspected_qty if result == "rejected" else 0.0
+        output.append(line)
+    return output
+
+
 def classify_material_document(text: str, filename: str = "") -> str:
     sample = f"{filename}\n{text[:30000]}".lower()
     rules = (
@@ -446,6 +503,380 @@ def _looks_like_reference_identifier_row(description: str) -> bool:
     return bool(
         _REFERENCE_IDENTIFIER_LABEL.fullmatch(normalize_description(description))
     )
+
+
+def _source_date(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip().replace("Sept", "Sep"))
+    cleaned = re.sub(r"(?<=[A-Za-z])\.(?=,?\s+\d{4})", "", cleaned)
+    for pattern in (
+        "%b %d, %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%B %d %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+        "%d-%b-%Y",
+    ):
+        try:
+            return datetime.strptime(cleaned, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return cleaned
+
+
+def _extraction_footer(
+    lines: list[dict[str, Any]], warnings: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not lines:
+        warnings.append(
+            {
+                "code": "manual_line_review_required",
+                "message": "No reliable material rows were detected. Add or correct rows during review.",
+            }
+        )
+    warnings.append(
+        {
+            "code": "best_effort_extraction",
+            "message": "Document extraction is best effort; confirmation is required before ledger posting.",
+        }
+    )
+    return lines, warnings
+
+
+def _weekly_report_lines(page_text: str, page_number: int) -> list[dict[str, Any]]:
+    upper = normalize_description(page_text)
+    is_long_lead = "LONG LEAD ITEM" in upper
+    if "LIST OF MATERIAL" not in upper and not is_long_lead:
+        return []
+
+    blocks: list[tuple[str, str]] = []
+    current_item = ""
+    current_parts: list[str] = []
+    for raw_line in page_text.splitlines():
+        compact = " ".join(raw_line.split())
+        if not compact:
+            continue
+        start = _WEEKLY_ROW_START.match(compact)
+        if start and start.group("body").strip():
+            if current_item:
+                blocks.append((current_item, " ".join(current_parts)))
+            current_item = start.group("item")
+            current_parts = [start.group("body").strip()]
+        elif current_item:
+            current_parts.append(compact)
+    if current_item:
+        blocks.append((current_item, " ".join(current_parts)))
+
+    output: list[dict[str, Any]] = []
+    for item_number, body in blocks:
+        reference_match = _WEEKLY_REFERENCE.search(body)
+        if not reference_match:
+            continue
+        description = body[: reference_match.start()].strip(" -:.")
+        if len(normalize_description(description)) < 4:
+            continue
+        dates = [_source_date(match.group(0)) for match in _REPORT_DATE.finditer(body)]
+        normalized_body = normalize_description(body)
+        if "NOT DELIVERED" in normalized_body:
+            approval_status = "not_delivered"
+        elif "DELIVERED" in normalized_body:
+            approval_status = "delivered"
+        elif "PO ISSUED" in normalized_body:
+            approval_status = "po_issued"
+        elif "APPROVED" in normalized_body:
+            approval_status = "approved"
+        elif "SUBMITTED" in normalized_body:
+            approval_status = "submitted"
+        else:
+            approval_status = "reported"
+        if not dates and approval_status == "reported":
+            continue
+
+        line: dict[str, Any] = {
+            "line_id": f"line_{uuid4().hex}",
+            "source_page": page_number,
+            "item_number": item_number,
+            "description": description,
+            "unit": "",
+            "reference_category": reference_match.group("reference").title(),
+            "approval_status": approval_status,
+            "source_dates": dates,
+            "confidence": 0.72,
+            "warnings": [
+                "Weekly reports provide delivery dates/status, not measured material quantities. Link the row to the BOQ material."
+            ],
+        }
+        if is_long_lead:
+            if dates:
+                line["expected_delivery_date"] = dates[0]
+            if len(dates) > 1:
+                line["actual_delivery_date"] = dates[1]
+        else:
+            if dates:
+                line["submittal_date"] = dates[0]
+            if len(dates) > 1:
+                line["approval_date"] = dates[1]
+            if len(dates) > 2:
+                line["expected_delivery_date"] = dates[2]
+            if len(dates) > 3:
+                line["actual_delivery_date"] = dates[3]
+            elif approval_status == "delivered" and len(dates) == 3:
+                line["actual_delivery_date"] = dates[2]
+        output.append(line)
+    return output
+
+
+def _delivery_lines_for_page(
+    page_text: str, page_number: int, *, document_type: str
+) -> tuple[list[dict[str, Any]], bool]:
+    raw_lines = [" ".join(value.split()) for value in page_text.splitlines()]
+    compact_lines = [value for value in raw_lines if value]
+    candidates = list(compact_lines)
+    # OCR frequently puts description, unit, and quantity on adjacent lines.
+    # Only use joined windows when no single OCR line contains a material row.
+    direct_match = any(
+        pattern.match(value)
+        for value in candidates
+        for pattern in _DELIVERY_LINE_PATTERNS
+    )
+    if not direct_match:
+        for size in (2, 3):
+            candidates.extend(
+                " ".join(compact_lines[index : index + size])
+                for index in range(max(0, len(compact_lines) - size + 1))
+            )
+
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, float]] = set()
+    reference_ignored = False
+    for compact in candidates:
+        match = next(
+            (
+                candidate
+                for pattern in _DELIVERY_LINE_PATTERNS
+                if (candidate := pattern.match(compact))
+            ),
+            None,
+        )
+        if not match:
+            continue
+        values = match.groupdict()
+        description = values["description"].strip(" -:")
+        if _looks_like_reference_identifier_row(description):
+            reference_ignored = True
+            continue
+        normalized = normalize_description(description)
+        if len(normalized) < 4 or any(
+            marker in normalized
+            for marker in (
+                "DESCRIPTION QTY",
+                "ITEM DESCRIPTION",
+                "QUANTITY UNIT",
+                "DELIVERY NOTE DATE",
+                "CUSTOMER SHIPMENT DATE",
+            )
+        ):
+            continue
+        quantity = abs(_number(values["quantity"]))
+        if quantity <= 0:
+            continue
+        unit = normalize_unit(values["unit"])
+        key = (normalized, unit, quantity)
+        if key in seen:
+            continue
+        seen.add(key)
+        field = "ordered_qty" if document_type == "purchase_order" else "delivered_qty"
+        output.append(
+            {
+                "line_id": f"line_{uuid4().hex}",
+                "source_page": page_number,
+                "material_code": values.get("code") or "",
+                "description": description,
+                "unit": unit,
+                field: quantity,
+                "confidence": 0.67,
+                "warnings": ["Link this row to a confirmed BOQ baseline material."],
+            }
+        )
+    return output, reference_ignored
+
+
+def _mir_lines(pages: list[str]) -> list[dict[str, Any]]:
+    combined = " ".join(" ".join(page.split()) for page in pages)
+    description_match = re.search(
+        r"Description\s+of\s+material\s+(.+?)(?=\s+Technical\s+submittal|\s+Delivery\s+Note|\s+Supplier\s+name|$)",
+        combined,
+        re.IGNORECASE,
+    )
+    description = description_match.group(1).strip(" -:") if description_match else ""
+    delivery_match = re.search(
+        r"Delivery\s+Note\s*(?:NO|NUMBER|#)?\s*[:.-]?\s*([A-Z0-9/-]+)",
+        combined,
+        re.IGNORECASE,
+    )
+    supplier_match = re.search(
+        r"Supplier\s+name\s+(.+?)(?=\s+MIR\s+Attachments|\s+INSPECTION\s+RESULTS|$)",
+        combined,
+        re.IGNORECASE,
+    )
+
+    shipment_rows: list[dict[str, Any]] = []
+    for page_number, page_text in enumerate(pages, start=1):
+        page_rows, _ = _delivery_lines_for_page(
+            page_text, page_number, document_type="customer_shipment"
+        )
+        shipment_rows.extend(page_rows)
+    selected = shipment_rows[0] if shipment_rows else {}
+    inspected_qty = _number(selected.get("delivered_qty"))
+    unit = normalize_unit(selected.get("unit"))
+    if selected.get("description"):
+        description = str(selected["description"])
+    if not description:
+        return []
+
+    result = "pending"
+    checked = re.compile(r"(?:\[\s*[Xx]\s*\]|☒|☑|■)")
+    decision_segments = {
+        "accepted": re.search(
+            r"A\.\s*Accepted(.+?)(?=B\.\s*Accepted|C\.\s*Rejected|$)",
+            combined,
+            re.IGNORECASE,
+        ),
+        "accepted_with_notes": re.search(
+            r"B\.\s*Accepted(.+?)(?=C\.\s*Rejected|$)", combined, re.IGNORECASE
+        ),
+        "rejected": re.search(
+            r"C\.\s*Rejected(.+?)(?=INSPECTED\s+BY|CONTRACTOR|$)",
+            combined,
+            re.IGNORECASE,
+        ),
+    }
+    for candidate_result, segment in decision_segments.items():
+        if segment and checked.search(segment.group(1)):
+            result = candidate_result
+            break
+
+    line: dict[str, Any] = {
+        "line_id": f"line_{uuid4().hex}",
+        "source_page": int(selected.get("source_page") or 1),
+        "material_code": str(selected.get("material_code") or ""),
+        "description": description,
+        "unit": unit,
+        "inspected_qty": inspected_qty,
+        "accepted_qty": inspected_qty if result.startswith("accepted") else 0.0,
+        "rejected_qty": inspected_qty if result == "rejected" else 0.0,
+        "inspection_result": result,
+        "delivery_note_number": delivery_match.group(1) if delivery_match else "",
+        "supplier_name": supplier_match.group(1).strip(" -:") if supplier_match else "",
+        "confidence": 0.68 if inspected_qty > 0 else 0.58,
+        "warnings": [
+            "The inspection decision must be explicitly reviewed; blank MIR decision boxes remain pending."
+        ],
+    }
+    return [line]
+
+
+def _progress_invoice_lines(page_text: str, page_number: int) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    buffer: list[str] = []
+    for raw_line in page_text.splitlines():
+        compact = " ".join(raw_line.split())
+        if not compact:
+            continue
+        if not buffer:
+            if _INVOICE_ROW_START.match(compact):
+                buffer = [compact]
+            else:
+                continue
+        else:
+            buffer.append(compact)
+        joined = " ".join(buffer)
+        if len(_INVOICE_PROGRESS_PAIR.findall(joined)) < 3:
+            continue
+
+        start = _INVOICE_ROW_START.match(joined)
+        if not start:
+            buffer = []
+            continue
+        body = start.group("body")
+        first_percent = re.search(r"[\d,]+(?:\.\d+)?\s*%", body)
+        pairs = list(_INVOICE_PROGRESS_PAIR.finditer(body))
+        if not first_percent or len(pairs) < 3:
+            buffer = []
+            continue
+        prefix = body[: first_percent.start()].strip()
+        values = _INVOICE_PREFIX_QTY_UNIT.match(
+            prefix
+        ) or _INVOICE_PREFIX_UNIT_QTY.match(prefix)
+        if not values:
+            buffer = []
+            continue
+        progress = pairs[-3:]
+        total_percent = _number(progress[-1].group("percent"))
+        total_value = _number(progress[-1].group("amount"))
+        if total_percent <= 0 and total_value <= 0:
+            buffer = []
+            continue
+        quantity = _number(values.group("quantity"))
+        description = values.group("description").strip(" -:")
+        if len(normalize_description(description)) >= 4:
+            output.append(
+                {
+                    "line_id": f"line_{uuid4().hex}",
+                    "source_page": page_number,
+                    "item_number": start.group("item").rstrip("."),
+                    "description": description,
+                    "unit": normalize_unit(values.group("unit")),
+                    "contract_qty": quantity,
+                    "certified_qty": _rounded(quantity * total_percent / 100),
+                    "certified_unit_rate": _number(values.group("rate")),
+                    "certified_percent": total_percent,
+                    "certified_value": total_value,
+                    "confidence": 0.7,
+                    "warnings": [
+                        "Certified values use the invoice total-to-date percentage and amount; confirm against the source row."
+                    ],
+                }
+            )
+        buffer = []
+    return output
+
+
+def _ocr_page_text(image: Any, pytesseract: Any, *, enhanced: bool) -> str:
+    default_text = pytesseract.image_to_string(image) or ""
+    if not enhanced:
+        return default_text
+    try:
+        from PIL import ImageEnhance, ImageOps
+
+        grayscale = ImageOps.autocontrast(ImageOps.grayscale(image), cutoff=1)
+        sharpened = ImageEnhance.Sharpness(
+            ImageEnhance.Contrast(grayscale).enhance(1.8)
+        ).enhance(1.6)
+        width, height = sharpened.size
+        central_table = sharpened.crop(
+            (0, int(height * 0.18), width, int(height * 0.76))
+        )
+        variants = [
+            pytesseract.image_to_string(sharpened, config="--psm 6") or "",
+            pytesseract.image_to_string(central_table, config="--psm 6") or "",
+            pytesseract.image_to_string(central_table, config="--psm 11") or "",
+        ]
+        distinct = [default_text]
+        for value in variants:
+            normalized = " ".join(value.split())
+            if normalized and all(
+                normalized != " ".join(item.split()) for item in distinct
+            ):
+                distinct.append(value)
+        return "\n".join(distinct)
+    except Exception:
+        return default_text
 
 
 def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str, Any]]]:
@@ -508,7 +939,11 @@ def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str,
 
         ocr_page_count = 0
         for index, image in images_by_page.items():
-            ocr_text = pytesseract.image_to_string(image) or ""
+            ocr_text = _ocr_page_text(
+                image,
+                pytesseract,
+                enhanced=len(sparse_page_indexes) <= 20,
+            )
             if len(" ".join(ocr_text.split())) > len(" ".join(pages[index].split())):
                 pages[index] = ocr_text
                 ocr_page_count += 1
@@ -539,8 +974,52 @@ def extract_structured_lines(
     lines: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
+    page_values = list(pages)
 
-    for page_number, page_text in enumerate(pages, start=1):
+    if document_type == "weekly_report":
+        for page_number, page_text in enumerate(page_values, start=1):
+            lines.extend(_weekly_report_lines(page_text, page_number))
+        return _extraction_footer(lines, warnings)
+
+    if document_type == "mir_grn":
+        lines.extend(_mir_lines(page_values))
+        return _extraction_footer(lines, warnings)
+
+    if document_type == "progress_invoice":
+        for page_number, page_text in enumerate(page_values, start=1):
+            lines.extend(_progress_invoice_lines(page_text, page_number))
+        return _extraction_footer(lines, warnings)
+
+    for page_number, page_text in enumerate(page_values, start=1):
+        if document_type in {
+            "delivery_note",
+            "customer_shipment",
+            "purchase_order",
+        }:
+            page_lines, reference_ignored = _delivery_lines_for_page(
+                page_text, page_number, document_type=document_type
+            )
+            for line in page_lines:
+                key = (
+                    page_number,
+                    line.get("material_code"),
+                    normalize_description(line.get("description")),
+                    line.get("unit"),
+                    line.get("ordered_qty", line.get("delivered_qty")),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    lines.append(line)
+            if reference_ignored and not any(
+                item.get("code") == "reference_identifier_ignored" for item in warnings
+            ):
+                warnings.append(
+                    {
+                        "code": "reference_identifier_ignored",
+                        "message": "Document, order, pack, and delivery identifiers were excluded from material quantities.",
+                    }
+                )
+            continue
         if document_type == "boq":
             page_lines = page_text.splitlines()
             starts = [
@@ -600,11 +1079,7 @@ def extract_structured_lines(
             compact = " ".join(raw_line.split())
             if len(compact) < 5:
                 continue
-            match = (
-                _BOQ_LINE.match(compact)
-                if document_type in {"boq", "progress_invoice"}
-                else None
-            )
+            match = _BOQ_LINE.match(compact) if document_type == "boq" else None
             if match:
                 values = match.groupdict()
                 key = (
@@ -628,94 +1103,15 @@ def extract_structured_lines(
                         "Confirm the extracted table row against the source page."
                     ],
                 }
-                if document_type == "boq":
-                    line.update(
-                        planned_qty=quantity,
-                        contract_unit_rate=rate,
-                        line_amount=_number(values["amount"]),
-                    )
-                else:
-                    line.update(
-                        certified_qty=quantity,
-                        certified_unit_rate=rate,
-                        certified_value=_number(values["amount"]),
-                    )
+                line.update(
+                    planned_qty=quantity,
+                    contract_unit_rate=rate,
+                    line_amount=_number(values["amount"]),
+                )
                 lines.append(line)
                 continue
 
-            if document_type in {
-                "delivery_note",
-                "customer_shipment",
-                "purchase_order",
-            }:
-                match = next(
-                    (
-                        candidate
-                        for pattern in _DELIVERY_LINE_PATTERNS
-                        if (candidate := pattern.match(compact))
-                    ),
-                    None,
-                )
-                if not match:
-                    continue
-                values = match.groupdict()
-                description = values["description"].strip(" -:")
-                if _looks_like_reference_identifier_row(description):
-                    if not any(
-                        item.get("code") == "reference_identifier_ignored"
-                        for item in warnings
-                    ):
-                        warnings.append(
-                            {
-                                "code": "reference_identifier_ignored",
-                                "message": "Document, order, pack, and delivery identifiers were excluded from material quantities.",
-                            }
-                        )
-                    continue
-                if len(normalize_description(description)) < 4:
-                    continue
-                key = (
-                    page_number,
-                    values.get("code"),
-                    normalize_description(description),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                field = (
-                    "ordered_qty"
-                    if document_type == "purchase_order"
-                    else "delivered_qty"
-                )
-                lines.append(
-                    {
-                        "line_id": f"line_{uuid4().hex}",
-                        "source_page": page_number,
-                        "material_code": values.get("code") or "",
-                        "description": description,
-                        "unit": normalize_unit(values["unit"]),
-                        field: _number(values["quantity"]),
-                        "confidence": 0.65,
-                        "warnings": [
-                            "Link this row to a confirmed BOQ baseline material."
-                        ],
-                    }
-                )
-
-    if not lines:
-        warnings.append(
-            {
-                "code": "manual_line_review_required",
-                "message": "No reliable material rows were detected. Add or correct rows during review.",
-            }
-        )
-    warnings.append(
-        {
-            "code": "best_effort_extraction",
-            "message": "Phase 1 extraction is best effort; confirmation is required before ledger posting.",
-        }
-    )
-    return lines, warnings
+    return _extraction_footer(lines, warnings)
 
 
 def _extract_header(text: str, document_type: str) -> dict[str, Any]:
@@ -835,11 +1231,14 @@ def upload_material_document(
         requested_type, detected_type
     )
     lines, line_warnings = extract_structured_lines(pages, document_type=resolved_type)
-    if resolved_type in {"delivery_note", "customer_shipment"} and lines:
-        baseline_materials = project_materials_collection.find(
-            {"project_id": project_id}
+    if resolved_type in {"delivery_note", "customer_shipment", "mir_grn"} and lines:
+        baseline_materials = list(
+            project_materials_collection.find({"project_id": project_id})
         )
-        lines = enrich_delivery_lines_with_baseline(lines, baseline_materials)
+        if resolved_type == "mir_grn":
+            lines = enrich_mir_lines_with_baseline(lines, baseline_materials)
+        else:
+            lines = enrich_delivery_lines_with_baseline(lines, baseline_materials)
         if any(
             line.get("match_status") == "suggested"
             or line.get("conversion_status") == "suggested"
@@ -1084,6 +1483,7 @@ def _normalize_review_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
             "certified_qty",
             "certified_value",
             "source_delivered_qty",
+            "source_inspected_qty",
             "piece_length_m",
             "conversion_factor",
             "converted_qty",
@@ -1384,7 +1784,9 @@ def _remove_material_source_file(document: dict[str, Any]) -> bool:
     except FileNotFoundError:
         return False
     except OSError as error:
-        raise HTTPException(500, "The stored material document could not be removed") from error
+        raise HTTPException(
+            500, "The stored material document could not be removed"
+        ) from error
 
 
 def discard_material_document(
@@ -1470,7 +1872,9 @@ def restore_material_document(
         raise HTTPException(409, "Only voided or superseded documents can be restored")
     confirmed_lines = document.get("confirmed_lines") or []
     if not confirmed_lines:
-        raise HTTPException(422, "This document has no confirmed data to restore; reprocess it instead")
+        raise HTTPException(
+            422, "This document has no confirmed data to restore; reprocess it instead"
+        )
 
     validation_document = {**document, "reviewed_lines": confirmed_lines}
     lines = _validated_confirmed_lines(validation_document)
@@ -1550,15 +1954,24 @@ def restore_material_document(
 
 
 def reset_material_documents(
-    *, project_ref: str, scope: str, reason: str, confirmation: str, user: AuthenticatedUser
+    *,
+    project_ref: str,
+    scope: str,
+    reason: str,
+    confirmation: str,
+    user: AuthenticatedUser,
 ) -> dict[str, Any]:
     project = resolve_project(project_ref)
     project_id = project["project_id"]
     normalized_scope = str(scope or "").strip().lower()
     if normalized_scope not in MATERIAL_RESET_SCOPES:
-        raise HTTPException(400, f"Unsupported material reset scope: {normalized_scope}")
+        raise HTTPException(
+            400, f"Unsupported material reset scope: {normalized_scope}"
+        )
     if str(confirmation or "").strip() != "RESET MATERIALS":
-        raise HTTPException(422, "Type RESET MATERIALS to confirm this destructive action")
+        raise HTTPException(
+            422, "Type RESET MATERIALS to confirm this destructive action"
+        )
 
     documents = list(material_documents_collection.find({"project_id": project_id}))
     selected = [

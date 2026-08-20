@@ -24,6 +24,7 @@ from services.progress.materials.material_service import (
 CLIENT_BOQ = Path(
     r"C:\Users\safwa\Downloads\safwan-20260819T062840Z-1-001\safwan\BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
 )
+CLIENT_MATERIALS = Path(r"D:\Cosysta\conscout\Sites\fozan Street\materials")
 
 
 def _document(document_id: str, document_type: str, lines: list[dict]) -> dict:
@@ -113,7 +114,7 @@ def test_delivery_reference_identifier_is_not_a_material_quantity():
     assert any(item["code"] == "reference_identifier_ignored" for item in warnings)
 
 
-def test_pending_mir_reference_does_not_create_delivered_or_inspected_quantity():
+def test_pending_mir_creates_reviewable_row_without_fabricating_inspection_result():
     text = """
     MATERIAL INSPECTION REQUEST (MIR)
     Description of material UPVC 50mm
@@ -130,8 +131,83 @@ def test_pending_mir_reference_does_not_create_delivered_or_inspected_quantity()
     assert detected == "mir_grn"
     assert resolved == "mir_grn"
     assert corrected is True
-    assert lines == []
-    assert any(item["code"] == "manual_line_review_required" for item in warnings)
+    assert len(lines) == 1
+    assert lines[0]["description"] == "UPVC 50mm"
+    assert lines[0]["delivery_note_number"] == "374694"
+    assert lines[0]["inspected_qty"] == 0
+    assert lines[0]["accepted_qty"] == 0
+    assert lines[0]["rejected_qty"] == 0
+    assert lines[0]["inspection_result"] == "pending"
+    assert not any(item["code"] == "manual_line_review_required" for item in warnings)
+
+
+def test_weekly_report_extracts_status_and_dates_without_fake_quantities():
+    text = """
+    12 – List of material
+    LIST OF MATERIAL SUBMITTAL & DELIVERY. STATUS
+    1 Aggregate based Subbase Hardscape Work Mar 14, 2024 Mar 20, 2024 Apr 02, 2024 Apr 06, 2024 Delivered
+    6 UPVC Pipes ELECTRICAL WORK Feb 07, 2024 Feb 27, 2024 Mar 20, 2024 Mar 19, 2024 Delivered
+    15Adjustable Head LED Flood
+    LightELECTRICAL WORK Mar 19, 2024 Mar 31, 2024 PO issued
+    """
+    lines, _ = extract_structured_lines([text], document_type="weekly_report")
+
+    assert len(lines) == 3
+    assert lines[0]["description"] == "Aggregate based Subbase"
+    assert lines[0]["approval_status"] == "delivered"
+    assert lines[0]["expected_delivery_date"] == "2024-04-02"
+    assert lines[0]["actual_delivery_date"] == "2024-04-06"
+    assert lines[1]["actual_delivery_date"] == "2024-03-19"
+    assert lines[2]["description"] == "Adjustable Head LED Flood Light"
+    assert lines[2]["approval_status"] == "po_issued"
+    assert "delivered_qty" not in lines[0]
+
+
+def test_progress_invoice_extracts_total_to_date_values_from_wrapped_row():
+    text = """
+    14 Supply & Install, Raised curb Concrete 200x300x500mm Sandblasted
+    finish colour: grey as per specification and drawings ref:LS-20 D-23
+    11467 Lm 75.00 860025.00 0% - 16% 137604 16% 137604
+    15 Supply & Install, Flush curb Concrete 100x300x500mm
+    14538 Lm 75.00 1090350 0% - 5% 54517.50 5% 54517.50
+    """
+    lines, _ = extract_structured_lines([text], document_type="progress_invoice")
+
+    assert len(lines) == 2
+    assert lines[0]["item_number"] == "14"
+    assert lines[0]["unit"] == "LM"
+    assert lines[0]["certified_percent"] == 16
+    assert lines[0]["certified_qty"] == 1834.72
+    assert lines[0]["certified_value"] == 137604
+    assert lines[1]["certified_percent"] == 5
+
+
+def test_delivery_parser_reassembles_ocr_columns_split_across_lines():
+    lines, _ = extract_structured_lines(
+        ["1.1 KERBSTONE 50X30X100CM GREY WITHOUT CHAMFER\nLM\n378"],
+        document_type="delivery_note",
+    )
+
+    assert len(lines) == 1
+    assert lines[0]["description"] == "KERBSTONE 50X30X100CM GREY WITHOUT CHAMFER"
+    assert lines[0]["unit"] == "LM"
+    assert lines[0]["delivered_qty"] == 378
+
+
+def test_real_client_weekly_mir_and_invoice_have_reviewable_rows():
+    cases = (
+        ("weekly_report", CLIENT_MATERIALS / "Weekly Report #38 (18-11-2024).pdf", 20),
+        ("mir_grn", CLIENT_MATERIALS / "MIR - 04 .pdf", 1),
+        ("progress_invoice", CLIENT_MATERIALS / "APPROVED INVOICE#1.pdf", 4),
+    )
+    if not all(path.exists() for _, path, _ in cases):
+        import pytest
+
+        pytest.skip("Real client material PDFs are not available on this machine")
+    for document_type, path, minimum_rows in cases:
+        pages, _, _ = _extract_pdf_pages(path.read_bytes())
+        lines, _ = extract_structured_lines(pages, document_type=document_type)
+        assert len(lines) >= minimum_rows, f"{document_type} did not extract rows"
 
 
 def test_customer_shipment_parser_accepts_unit_before_quantity_from_client_ocr():
@@ -499,5 +575,8 @@ def test_material_reset_scopes_are_explicit_and_predictable():
     assert document_matches_material_reset_scope(pending_boq, "pending") is True
     assert document_matches_material_reset_scope(confirmed_boq, "pending") is False
     assert document_matches_material_reset_scope(confirmed_boq, "transactions") is False
-    assert document_matches_material_reset_scope(confirmed_delivery, "transactions") is True
+    assert (
+        document_matches_material_reset_scope(confirmed_delivery, "transactions")
+        is True
+    )
     assert document_matches_material_reset_scope(confirmed_boq, "all") is True
