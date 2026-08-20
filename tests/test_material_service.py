@@ -9,6 +9,8 @@ from fastapi import HTTPException
 os.environ.setdefault("MONGO_URI", "mongodb://127.0.0.1:27017")
 
 from services.progress.materials.material_service import (
+    _apply_delivery_page_contexts,
+    _delivery_page_contexts,
     _extract_pdf_pages,
     _validated_confirmed_lines,
     build_material_ledger,
@@ -242,7 +244,9 @@ def test_weekly_report_native_rows_skip_irrelevant_sparse_page_ocr(monkeypatch):
     fake_pdf2image = ModuleType("pdf2image")
 
     def unexpected_ocr(*args, **kwargs):
-        raise AssertionError("Weekly report OCR should be skipped when native rows exist")
+        raise AssertionError(
+            "Weekly report OCR should be skipped when native rows exist"
+        )
 
     fake_pdf2image.convert_from_bytes = unexpected_ocr
     monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
@@ -321,7 +325,7 @@ PCS 378""",
         """Delivery No 31563 Date 30-May-24 PO No AGC24108-0
 KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER LM 378""",
         """Delivery No 31582 Date 30-May-24 PO No AGC24108-0
-KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER LM 379""",
+KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER LM 378""",
         """Delivery No 31564 Date 30-May-24 PO No AGC24108-0
 KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER PCS 378""",
     ]
@@ -358,11 +362,65 @@ KERBSTONE 50X30X10CM GREY WITHOUT CHAMFER PCS 378""",
 
     assert all(line["linked_material_id"] == "mat-flush-curb" for line in enriched)
     assert [line["source_unit"] for line in enriched] == ["PCS", "LM", "LM", "PCS"]
-    assert [line["delivered_qty"] for line in enriched] == [189, 378, 379, 189]
+    assert [line["delivered_qty"] for line in enriched] == [189, 378, 378, 189]
     assert enriched[0]["conversion_factor"] == 0.5
     assert enriched[0]["conversion_status"] == "suggested"
     assert enriched[1]["conversion_status"] == "not_required"
-    assert sum(line["delivered_qty"] for line in enriched) == 1135
+    assert sum(line["delivered_qty"] for line in enriched) == 1134
+
+
+def test_real_delivery_bundle_ocr_variants_are_consolidated_and_reconciled():
+    pages = [
+        """INVOICE 24805 DELIVERY NOTE 34568 30-May-24 PO No AGC24108-5
+44 HERESTONE SOMSGK10CR GREY WITHOUT CHAMPER PSs . . 378
+444 RERSSTONE SOMS0M(000 GREY WITHOUT CHAMEER POS 378""",
+        """DELIVERY 34863 30-May-24 PO No AGC24108-5
+44 SERGSTONE SOX30K 100M GREW WITHOUT CHAMFER La 378
+44 RERGSTONE SUXSERIGCN GREY WITHOUT CHANTER LBA 378""",
+        """31/12/2023 DELIVERY 8634582 30-May-24 PO No AGC24108-5
+44 RERBSSTONE GUAGGRIGOM GET SITROUT CHAMFER Lt 378
+44 KRERBSTONE S0KSGR410CM GREY WITROUT CHAMFER Li : 372""",
+        """DELIVERY 34864 21564 30-May-24 PO DRIVER AGC24108-5
+4.4 RERSSTONE S0XS0X(0Ch GREY WITHOUT CHAMFER POS : 378
+ai KERSSTONE SOXG0K10CM GREY WITHOUT CHAMFER Pcs 378""",
+    ]
+    lines, _ = extract_structured_lines(pages, document_type="delivery_note")
+    contexts = _delivery_page_contexts(pages, filename="31564-31582-31563-31565.pdf")
+    lines = _apply_delivery_page_contexts(lines, contexts)
+
+    assert len(lines) == 4
+    assert [line["source_page"] for line in lines] == [1, 2, 3, 4]
+    assert [line["delivery_note_number"] for line in lines] == [
+        "31565",
+        "31563",
+        "31582",
+        "31564",
+    ]
+    assert all(line["source_document_date"] == "30-May-24" for line in lines)
+    assert all(line["po_reference"] != "DRIVER" for line in lines)
+
+    enriched = enrich_delivery_lines_with_baseline(
+        lines,
+        [
+            {
+                "material_id": "mat-other-curb",
+                "boq_item_number": "14",
+                "description": "Supply and install kerbstone 100x250x500mm",
+                "unit": "LM",
+            },
+            {
+                "material_id": "mat-flush-curb",
+                "boq_item_number": "15",
+                "description": "Supply and install kerbstone 100x300x500mm",
+                "unit": "LM",
+            },
+        ],
+    )
+
+    assert all(line["linked_material_id"] == "mat-flush-curb" for line in enriched)
+    assert [line["source_unit"] for line in enriched] == ["PCS", "LM", "LM", "PCS"]
+    assert [line["delivered_qty"] for line in enriched] == [189, 378, 378, 189]
+    assert sum(line["delivered_qty"] for line in enriched) == 1134
 
 
 def test_real_client_weekly_mir_and_invoice_have_reviewable_rows():
