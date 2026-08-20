@@ -12,8 +12,10 @@ from services.progress.materials.material_service import (
     _validated_confirmed_lines,
     build_material_ledger,
     classify_material_document,
+    document_matches_material_reset_scope,
     enrich_delivery_lines_with_baseline,
     extract_structured_lines,
+    preserve_matching_boq_material_ids,
     resolve_material_document_type,
     validate_linked_material_line,
 )
@@ -455,3 +457,47 @@ def test_linked_documents_block_unit_mismatch_and_excess_inspection():
         assert "only 199 delivered quantity" in str(error.detail)
     else:
         raise AssertionError("Inspection decisions cannot exceed delivery")
+
+
+def test_boq_replacement_reuses_stable_material_ids_for_unchanged_rows():
+    lines, reused = preserve_matching_boq_material_ids(
+        [
+            {
+                "item_number": "11",
+                "description": "50MM UPVC Conduit",
+                "unit": "Lm",
+                "planned_qty": 8000,
+            },
+            {
+                "item_number": "12",
+                "description": "New control panel",
+                "unit": "PCS",
+                "planned_qty": 2,
+            },
+        ],
+        [
+            {
+                "material_id": "material-existing-50mm",
+                "item_number": "11",
+                "description": "50mm uPVC conduit",
+                "unit": "LM",
+                "planned_qty": 7250,
+            }
+        ],
+    )
+
+    assert reused == 1
+    assert lines[0]["material_id"] == "material-existing-50mm"
+    assert "material_id" not in lines[1]
+
+
+def test_material_reset_scopes_are_explicit_and_predictable():
+    pending_boq = {"status": "needs_review", "document_type": "boq"}
+    confirmed_boq = {"status": "confirmed", "document_type": "boq"}
+    confirmed_delivery = {"status": "confirmed", "document_type": "delivery_note"}
+
+    assert document_matches_material_reset_scope(pending_boq, "pending") is True
+    assert document_matches_material_reset_scope(confirmed_boq, "pending") is False
+    assert document_matches_material_reset_scope(confirmed_boq, "transactions") is False
+    assert document_matches_material_reset_scope(confirmed_delivery, "transactions") is True
+    assert document_matches_material_reset_scope(confirmed_boq, "all") is True

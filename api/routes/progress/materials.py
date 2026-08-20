@@ -9,10 +9,14 @@ from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
 from services.progress.materials.material_service import (
     confirm_material_document,
+    discard_material_document,
     get_material_document,
     get_material_ledger,
     get_material_summary,
     list_material_documents,
+    reprocess_material_document,
+    reset_material_documents,
+    restore_material_document,
     update_material_document_review,
     upload_material_document,
     void_material_document,
@@ -43,6 +47,16 @@ class MaterialDocumentVoidRequest(BaseModel):
     reason: str = Field(..., min_length=3, max_length=1000)
 
 
+class MaterialDocumentControlRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+
+class MaterialResetRequest(BaseModel):
+    scope: Literal["pending", "transactions", "all"]
+    reason: str = Field(..., min_length=3, max_length=1000)
+    confirmation: str = Field(..., min_length=3, max_length=100)
+
+
 @router.post("/projects/{project_id}/material-documents")
 async def upload_project_material_document(
     project_id: str,
@@ -67,6 +81,22 @@ def project_material_documents(
 ):
     del current_user
     return list_material_documents(project_id)
+
+
+@router.post("/projects/{project_id}/material-documents/reset")
+def reset_project_material_documents(
+    project_id: str,
+    payload: MaterialResetRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return reset_material_documents(
+        project_ref=project_id,
+        scope=payload.scope,
+        reason=payload.reason,
+        confirmation=payload.confirmation,
+        user=current_user,
+    )
 
 
 @router.get("/projects/{project_id}/material-documents/{document_id}")
@@ -97,6 +127,22 @@ def review_project_material_document(
     )
 
 
+@router.delete("/projects/{project_id}/material-documents/{document_id}")
+def discard_project_material_document(
+    project_id: str,
+    document_id: str,
+    payload: MaterialDocumentControlRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return discard_material_document(
+        project_ref=project_id,
+        document_id=document_id,
+        reason=payload.reason,
+        user=current_user,
+    )
+
+
 @router.post("/projects/{project_id}/material-documents/{document_id}/confirm")
 def confirm_project_material_document(
     project_id: str,
@@ -120,6 +166,36 @@ def void_project_material_document(
 ):
     ensure_admin_user(current_user)
     return void_material_document(
+        project_ref=project_id,
+        document_id=document_id,
+        reason=payload.reason,
+        user=current_user,
+    )
+
+
+@router.post("/projects/{project_id}/material-documents/{document_id}/reprocess")
+def reprocess_project_material_document(
+    project_id: str,
+    document_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return reprocess_material_document(
+        project_ref=project_id,
+        document_id=document_id,
+        user=current_user,
+    )
+
+
+@router.post("/projects/{project_id}/material-documents/{document_id}/restore")
+def restore_project_material_document(
+    project_id: str,
+    document_id: str,
+    payload: MaterialDocumentControlRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return restore_material_document(
         project_ref=project_id,
         document_id=document_id,
         reason=payload.reason,

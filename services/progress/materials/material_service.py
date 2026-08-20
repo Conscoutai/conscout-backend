@@ -46,6 +46,7 @@ MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
 MATERIAL_PROCESSING_VERSION = 3
+MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
 AUTO_CORRECT_DETECTED_TYPES = {
@@ -137,6 +138,58 @@ def normalize_unit(value: Any) -> str:
 def normalize_description(value: Any) -> str:
     description = re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper())
     return " ".join(description.split())
+
+
+def preserve_matching_boq_material_ids(
+    new_lines: Iterable[dict[str, Any]],
+    active_lines: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Reuse stable IDs for unchanged BOQ rows during a baseline replacement."""
+    active_by_item: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    active_by_description: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for raw_line in active_lines:
+        line = dict(raw_line)
+        material_id = str(line.get("material_id") or "").strip()
+        unit = normalize_unit(line.get("unit"))
+        description = normalize_description(line.get("description"))
+        item_number = str(line.get("item_number") or "").strip()
+        if not material_id or not unit or not description:
+            continue
+        if item_number:
+            active_by_item[(item_number, unit)].append(line)
+        active_by_description[(description, unit)].append(line)
+
+    output: list[dict[str, Any]] = []
+    reused = 0
+    for raw_line in new_lines:
+        line = dict(raw_line)
+        if str(line.get("material_id") or "").strip():
+            output.append(line)
+            continue
+        unit = normalize_unit(line.get("unit"))
+        description = normalize_description(line.get("description"))
+        item_number = str(line.get("item_number") or "").strip()
+        candidates = active_by_item.get((item_number, unit), []) if item_number else []
+        if len(candidates) != 1 or (
+            description
+            and normalize_description(candidates[0].get("description")) != description
+        ):
+            candidates = active_by_description.get((description, unit), [])
+        if len(candidates) == 1:
+            line["material_id"] = candidates[0]["material_id"]
+            reused += 1
+        output.append(line)
+    return output, reused
+
+
+def document_matches_material_reset_scope(document: dict[str, Any], scope: str) -> bool:
+    if scope == "pending":
+        return document.get("status") == "needs_review"
+    if scope == "transactions":
+        return document.get("document_type") != "boq"
+    if scope == "all":
+        return True
+    raise HTTPException(400, f"Unsupported material reset scope: {scope}")
 
 
 def _description_tokens(value: Any) -> set[str]:
@@ -732,6 +785,7 @@ def upload_material_document(
     raw_bytes: bytes,
     document_type: str,
     user: AuthenticatedUser,
+    force_reprocess: bool = False,
 ) -> dict[str, Any]:
     requested_type = str(document_type or "auto").strip().lower()
     if requested_type not in DOCUMENT_TYPES:
@@ -756,12 +810,18 @@ def upload_material_document(
     )
     reprocess_existing = bool(
         existing
-        and existing.get("status") == "needs_review"
         and (
-            int(existing.get("processing_version") or 0) < MATERIAL_PROCESSING_VERSION
+            force_reprocess
             or (
-                not existing.get("extracted_lines")
-                and not existing.get("reviewed_lines")
+                existing.get("status") == "needs_review"
+                and (
+                    int(existing.get("processing_version") or 0)
+                    < MATERIAL_PROCESSING_VERSION
+                    or (
+                        not existing.get("extracted_lines")
+                        and not existing.get("reviewed_lines")
+                    )
+                )
             )
         )
     )
@@ -872,7 +932,7 @@ def upload_material_document(
     try:
         if reprocess_existing and existing:
             material_documents_collection.update_one(
-                {"document_id": document_id},
+                {"project_id": project_id, "document_id": document_id},
                 {
                     "$set": document,
                     "$unset": {
@@ -882,6 +942,17 @@ def upload_material_document(
                         "reviewed_by_user_id": "",
                         "reviewed_by_email": "",
                         "reviewed_at": "",
+                        "confirmed_header": "",
+                        "confirmed_lines": "",
+                        "confirmed_by_user_id": "",
+                        "confirmed_by_email": "",
+                        "confirmed_at": "",
+                        "void_reason": "",
+                        "voided_by_user_id": "",
+                        "voided_by_email": "",
+                        "voided_at": "",
+                        "superseded_by_document_id": "",
+                        "superseded_at": "",
                     },
                 },
             )
@@ -1150,7 +1221,32 @@ def confirm_material_document(
     if document.get("status") in {"superseded", "voided"}:
         raise HTTPException(409, "Superseded or voided documents cannot be confirmed")
 
-    lines = _validated_confirmed_lines(document)
+    reused_material_ids = 0
+    replaced_boq_document_id = ""
+    document_for_validation = document
+    if document.get("document_type") == "boq":
+        active_boq = material_documents_collection.find_one(
+            {
+                "project_id": project_id,
+                "document_type": "boq",
+                "status": "confirmed",
+                "document_id": {"$ne": document_id},
+            }
+        )
+        if active_boq:
+            candidate_lines = (
+                document.get("reviewed_lines")
+                if document.get("reviewed_lines") is not None
+                else document.get("extracted_lines") or []
+            )
+            stable_lines, reused_material_ids = preserve_matching_boq_material_ids(
+                candidate_lines,
+                active_boq.get("confirmed_lines") or [],
+            )
+            document_for_validation = {**document, "reviewed_lines": stable_lines}
+            replaced_boq_document_id = str(active_boq.get("document_id") or "")
+
+    lines = _validated_confirmed_lines(document_for_validation)
     if document.get("document_type") in TRANSACTION_TYPES:
         for index, line in enumerate(lines, start=1):
             material = project_materials_collection.find_one(
@@ -1182,7 +1278,14 @@ def confirm_material_document(
                 "status": "confirmed",
                 "document_id": {"$ne": document_id},
             },
-            {"$set": {"status": "superseded", "superseded_at": now, "updated_at": now}},
+            {
+                "$set": {
+                    "status": "superseded",
+                    "superseded_by_document_id": document_id,
+                    "superseded_at": now,
+                    "updated_at": now,
+                }
+            },
         )
     material_documents_collection.update_one(
         {"project_id": project_id, "document_id": document_id},
@@ -1203,7 +1306,11 @@ def confirm_material_document(
         document_id=document_id,
         event_type="confirmed",
         user=user,
-        details={"line_count": len(lines)},
+        details={
+            "line_count": len(lines),
+            "replaced_boq_document_id": replaced_boq_document_id,
+            "reused_material_id_count": reused_material_ids,
+        },
     )
     rebuild_material_ledger(project_id)
     return {
@@ -1225,6 +1332,19 @@ def void_material_document(
         raise HTTPException(404, "Material document not found")
     if document.get("status") == "voided":
         return {"status": "already_voided", "document": _public_document(document)}
+    if document.get("document_type") == "boq" and document.get("status") == "confirmed":
+        confirmed_transaction = material_documents_collection.find_one(
+            {
+                "project_id": project_id,
+                "document_type": {"$ne": "boq"},
+                "status": "confirmed",
+            }
+        )
+        if confirmed_transaction:
+            raise HTTPException(
+                409,
+                "The active BOQ cannot be voided while confirmed material transactions exist. Replace the BOQ or reset transactions first.",
+            )
     now = utc_now()
     material_documents_collection.update_one(
         {"project_id": project_id, "document_id": document_id},
@@ -1250,6 +1370,230 @@ def void_material_document(
     return {
         "status": "voided",
         "document": get_material_document(project_id, document_id),
+        "summary": get_material_summary(project_id),
+    }
+
+
+def _remove_material_source_file(document: dict[str, Any]) -> bool:
+    storage_path = str(document.get("storage_path") or "").strip()
+    if not storage_path:
+        return False
+    try:
+        os.remove(storage_path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise HTTPException(500, "The stored material document could not be removed") from error
+
+
+def discard_material_document(
+    *, project_ref: str, document_id: str, reason: str, user: AuthenticatedUser
+) -> dict[str, Any]:
+    """Permanently discard an unconfirmed upload so the same PDF can be retested."""
+    project = resolve_project(project_ref)
+    project_id = project["project_id"]
+    document = material_documents_collection.find_one(
+        {"project_id": project_id, "document_id": document_id}
+    )
+    if not document:
+        raise HTTPException(404, "Material document not found")
+    if document.get("status") != "needs_review":
+        raise HTTPException(
+            409, "Only documents waiting for review can be permanently discarded"
+        )
+    source_removed = _remove_material_source_file(document)
+    material_documents_collection.delete_one(
+        {"project_id": project_id, "document_id": document_id}
+    )
+    _audit(
+        project_id=project_id,
+        document_id=document_id,
+        event_type="discarded",
+        user=user,
+        details={
+            "reason": str(reason or "").strip(),
+            "filename": document.get("original_filename"),
+            "source_removed": source_removed,
+        },
+    )
+    rebuild_material_ledger(project_id)
+    return {
+        "status": "discarded",
+        "document_id": document_id,
+        "summary": get_material_summary(project_id),
+    }
+
+
+def reprocess_material_document(
+    *, project_ref: str, document_id: str, user: AuthenticatedUser
+) -> dict[str, Any]:
+    project = resolve_project(project_ref)
+    project_id = project["project_id"]
+    document = material_documents_collection.find_one(
+        {"project_id": project_id, "document_id": document_id}
+    )
+    if not document:
+        raise HTTPException(404, "Material document not found")
+    if document.get("status") in {"confirmed", "superseded"}:
+        raise HTTPException(409, "Void the document before reprocessing it")
+    storage_path = str(document.get("storage_path") or "").strip()
+    if not storage_path or not os.path.isfile(storage_path):
+        raise HTTPException(404, "The stored source PDF is unavailable")
+    with open(storage_path, "rb") as source:
+        raw_bytes = source.read()
+    return upload_material_document(
+        project_ref=project_id,
+        filename=str(document.get("original_filename") or "material-document.pdf"),
+        raw_bytes=raw_bytes,
+        document_type=str(
+            document.get("requested_document_type")
+            or document.get("document_type")
+            or "auto"
+        ),
+        user=user,
+        force_reprocess=True,
+    )
+
+
+def restore_material_document(
+    *, project_ref: str, document_id: str, reason: str, user: AuthenticatedUser
+) -> dict[str, Any]:
+    project = resolve_project(project_ref)
+    project_id = project["project_id"]
+    document = material_documents_collection.find_one(
+        {"project_id": project_id, "document_id": document_id}
+    )
+    if not document:
+        raise HTTPException(404, "Material document not found")
+    if document.get("status") not in {"voided", "superseded"}:
+        raise HTTPException(409, "Only voided or superseded documents can be restored")
+    confirmed_lines = document.get("confirmed_lines") or []
+    if not confirmed_lines:
+        raise HTTPException(422, "This document has no confirmed data to restore; reprocess it instead")
+
+    validation_document = {**document, "reviewed_lines": confirmed_lines}
+    lines = _validated_confirmed_lines(validation_document)
+    if document.get("document_type") in TRANSACTION_TYPES:
+        for index, line in enumerate(lines, start=1):
+            material = project_materials_collection.find_one(
+                {
+                    "project_id": project_id,
+                    "material_id": line.get("linked_material_id"),
+                }
+            )
+            if not material:
+                raise HTTPException(
+                    422,
+                    f"Line {index} is linked to a BOQ material that is not active",
+                )
+            validate_linked_material_line(
+                document_type=str(document.get("document_type") or ""),
+                line=line,
+                material=material,
+                line_number=index,
+            )
+
+    now = utc_now()
+    if document.get("document_type") == "boq":
+        material_documents_collection.update_many(
+            {
+                "project_id": project_id,
+                "document_type": "boq",
+                "status": "confirmed",
+                "document_id": {"$ne": document_id},
+            },
+            {
+                "$set": {
+                    "status": "superseded",
+                    "superseded_by_document_id": document_id,
+                    "superseded_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+    material_documents_collection.update_one(
+        {"project_id": project_id, "document_id": document_id},
+        {
+            "$set": {
+                "status": "confirmed",
+                "confirmed_lines": lines,
+                "restored_at": now,
+                "restored_by_user_id": user.user_id,
+                "restored_by_email": user.email,
+                "restore_reason": str(reason or "").strip(),
+                "updated_at": now,
+            },
+            "$unset": {
+                "void_reason": "",
+                "voided_by_user_id": "",
+                "voided_by_email": "",
+                "voided_at": "",
+                "superseded_by_document_id": "",
+                "superseded_at": "",
+            },
+        },
+    )
+    _audit(
+        project_id=project_id,
+        document_id=document_id,
+        event_type="restored",
+        user=user,
+        details={"reason": reason, "line_count": len(lines)},
+    )
+    rebuild_material_ledger(project_id)
+    return {
+        "status": "restored",
+        "document": get_material_document(project_id, document_id),
+        "summary": get_material_summary(project_id),
+    }
+
+
+def reset_material_documents(
+    *, project_ref: str, scope: str, reason: str, confirmation: str, user: AuthenticatedUser
+) -> dict[str, Any]:
+    project = resolve_project(project_ref)
+    project_id = project["project_id"]
+    normalized_scope = str(scope or "").strip().lower()
+    if normalized_scope not in MATERIAL_RESET_SCOPES:
+        raise HTTPException(400, f"Unsupported material reset scope: {normalized_scope}")
+    if str(confirmation or "").strip() != "RESET MATERIALS":
+        raise HTTPException(422, "Type RESET MATERIALS to confirm this destructive action")
+
+    documents = list(material_documents_collection.find({"project_id": project_id}))
+    selected = [
+        document
+        for document in documents
+        if document_matches_material_reset_scope(document, normalized_scope)
+    ]
+    removed_files = 0
+    for document in selected:
+        if _remove_material_source_file(document):
+            removed_files += 1
+    document_ids = [str(document.get("document_id") or "") for document in selected]
+    document_ids = [document_id for document_id in document_ids if document_id]
+    if document_ids:
+        material_documents_collection.delete_many(
+            {"project_id": project_id, "document_id": {"$in": document_ids}}
+        )
+    rebuild_material_ledger(project_id)
+    _audit(
+        project_id=project_id,
+        document_id="project_materials",
+        event_type="reset",
+        user=user,
+        details={
+            "scope": normalized_scope,
+            "reason": str(reason or "").strip(),
+            "removed_document_count": len(document_ids),
+            "removed_file_count": removed_files,
+        },
+    )
+    return {
+        "status": "reset",
+        "scope": normalized_scope,
+        "removed_document_count": len(document_ids),
+        "removed_file_count": removed_files,
         "summary": get_material_summary(project_id),
     }
 
