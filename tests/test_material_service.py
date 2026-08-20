@@ -14,6 +14,7 @@ from services.progress.materials.material_service import (
     classify_material_document,
     document_matches_material_reset_scope,
     enrich_delivery_lines_with_baseline,
+    enrich_mir_lines_with_baseline,
     extract_structured_lines,
     preserve_matching_boq_material_ids,
     resolve_material_document_type,
@@ -139,6 +140,50 @@ def test_pending_mir_creates_reviewable_row_without_fabricating_inspection_resul
     assert lines[0]["rejected_qty"] == 0
     assert lines[0]["inspection_result"] == "pending"
     assert not any(item["code"] == "manual_line_review_required" for item in warnings)
+
+
+def test_mir_prefers_real_shipment_quantity_over_ocr_row_number():
+    pages = [
+        """
+        MATERIAL INSPECTION REQUEST (MIR)
+        Description of material UPVC 50mm
+        Delivery Note NO 374694
+        Supplier name ALMUNIF PIPES
+        INSPECTION RESULTS
+        A. Accepted without objection [ ]
+        B. Accepted subject to notes [ ]
+        C. Rejected [ ]
+        """,
+        """
+        CUSTOMER SHIPMENT
+        OrderLine ItemCode Item Description Unit of Measure Qty
+        1 111050310 uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP PC 199.00 + {
+        1 uPVC Pipe 50x1.8 mm Cl-3 PN6 S/C G 6 Mt MMP PC 1
+        """,
+    ]
+    lines, _ = extract_structured_lines(pages, document_type="mir_grn")
+
+    assert len(lines) == 1
+    assert lines[0]["material_code"] == "111050310"
+    assert lines[0]["unit"] == "PCS"
+    assert lines[0]["inspected_qty"] == 199
+    assert lines[0]["inspection_result"] == "pending"
+    assert lines[0]["supplier_name"] == "ALMUNIF PIPES"
+
+    enriched = enrich_mir_lines_with_baseline(
+        lines,
+        [
+            {
+                "material_id": "mat-50mm",
+                "boq_item_number": "11",
+                "description": "50MM Upvc Conduit",
+                "unit": "LM",
+            }
+        ],
+    )
+    assert enriched[0]["source_inspected_qty"] == 199
+    assert enriched[0]["inspected_qty"] == 1194
+    assert enriched[0]["unit"] == "LM"
 
 
 def test_weekly_report_extracts_status_and_dates_without_fake_quantities():

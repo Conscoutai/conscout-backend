@@ -45,7 +45,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 4
+MATERIAL_PROCESSING_VERSION = 5
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -86,13 +86,18 @@ _DELIVERY_LINE_PREFIX = (
     rf"(?:(?P<code>(?=[A-Z0-9./_-]*\d)[A-Z0-9][A-Z0-9./_-]{{3,}})\s+)?"
     rf"(?P<description>.{{4,}}?)\s+"
 )
+_OCR_ROW_TRAILING = r"(?:\s*[+|{}\[\]<>~`'\"]+\s*)*$"
 _DELIVERY_LINE_PATTERNS = (
     re.compile(
-        _DELIVERY_LINE_PREFIX + rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})\s*$",
+        _DELIVERY_LINE_PREFIX
+        + rf"(?P<quantity>{_NUMBER})\s+(?P<unit>{_UNIT})"
+        + _OCR_ROW_TRAILING,
         re.IGNORECASE,
     ),
     re.compile(
-        _DELIVERY_LINE_PREFIX + rf"(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})\s*$",
+        _DELIVERY_LINE_PREFIX
+        + rf"(?P<unit>{_UNIT})\s+(?P<quantity>{_NUMBER})"
+        + _OCR_ROW_TRAILING,
         re.IGNORECASE,
     ),
 )
@@ -720,7 +725,7 @@ def _mir_lines(pages: list[str]) -> list[dict[str, Any]]:
         re.IGNORECASE,
     )
     supplier_match = re.search(
-        r"Supplier\s+name\s+(.+?)(?=\s+MIR\s+Attachments|\s+INSPECTION\s+RESULTS|$)",
+        r"Supplier\s+name\s+(.+?)(?=\s+Received\s+By|\s+MIR\s+Attachments|\s+INSPECTION\s+RESULTS|$)",
         combined,
         re.IGNORECASE,
     )
@@ -731,7 +736,18 @@ def _mir_lines(pages: list[str]) -> list[dict[str, Any]]:
             page_text, page_number, document_type="customer_shipment"
         )
         shipment_rows.extend(page_rows)
-    selected = shipment_rows[0] if shipment_rows else {}
+    selected = (
+        max(
+            shipment_rows,
+            key=lambda row: (
+                bool(str(row.get("material_code") or "").strip()),
+                _number(row.get("delivered_qty")) > 1,
+                _number(row.get("delivered_qty")),
+            ),
+        )
+        if shipment_rows
+        else {}
+    )
     inspected_qty = _number(selected.get("delivered_qty"))
     unit = normalize_unit(selected.get("unit"))
     if selected.get("description"):
