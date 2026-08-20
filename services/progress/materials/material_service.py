@@ -45,7 +45,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 5
+MATERIAL_PROCESSING_VERSION = 6
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -895,7 +895,12 @@ def _ocr_page_text(image: Any, pytesseract: Any, *, enhanced: bool) -> str:
         return default_text
 
 
-def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str, Any]]]:
+def _extract_pdf_pages(
+    raw_bytes: bytes,
+    *,
+    document_type_hint: str = "auto",
+    filename_hint: str = "",
+) -> tuple[list[str], str, list[dict[str, Any]]]:
     try:
         from pypdf import PdfReader
     except ImportError as error:
@@ -921,6 +926,23 @@ def _extract_pdf_pages(raw_bytes: bytes) -> tuple[list[str], str, list[dict[str,
         if len(" ".join(page.split())) < MIN_NATIVE_TEXT_CHARS
     ]
     if not sparse_page_indexes:
+        return pages, "native_text", []
+
+    # Weekly reports commonly contain image-only schedule and site-photo pages
+    # alongside native-text material tables. OCRing every sparse page blocks the
+    # upload request for minutes even when all material rows are already
+    # available. Prefer the native material tables and keep OCR as a fallback
+    # only when no reliable weekly material row can be parsed.
+    native_text = "\n\f\n".join(pages)
+    hinted_type = str(document_type_hint or "auto").strip().lower()
+    detected_native_type = classify_material_document(native_text, filename_hint)
+    is_weekly_report = (
+        hinted_type == "weekly_report" or detected_native_type == "weekly_report"
+    )
+    if is_weekly_report and any(
+        _weekly_report_lines(page_text, page_number)
+        for page_number, page_text in enumerate(pages, start=1)
+    ):
         return pages, "native_text", []
 
     warnings: list[dict[str, Any]] = []
@@ -1240,7 +1262,11 @@ def upload_material_document(
     if existing and not reprocess_existing:
         return {"status": "already_uploaded", "document": _public_document(existing)}
 
-    pages, extraction_method, extraction_warnings = _extract_pdf_pages(raw_bytes)
+    pages, extraction_method, extraction_warnings = _extract_pdf_pages(
+        raw_bytes,
+        document_type_hint=requested_type,
+        filename_hint=safe_filename,
+    )
     text = "\n\f\n".join(pages)
     detected_type = classify_material_document(text, safe_filename)
     resolved_type, classification_auto_corrected = resolve_material_document_type(

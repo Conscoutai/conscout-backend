@@ -28,6 +28,9 @@ CLIENT_BOQ = Path(
     r"C:\Users\safwa\Downloads\safwan-20260819T062840Z-1-001\safwan\BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
 )
 CLIENT_MATERIALS = Path(r"D:\Cosysta\conscout\Sites\fozan Street\materials")
+CLIENT_WEEKLY_REPORT = Path(
+    r"D:\Cosysta\conscout\Sites\fozan Street\PROJECT SETUP\material steup\02 - Weekly Report\Weekly Report #38 (18-11-2024).pdf"
+)
 
 
 def _document(document_id: str, document_type: str, lines: list[dict]) -> dict:
@@ -208,6 +211,73 @@ def test_weekly_report_extracts_status_and_dates_without_fake_quantities():
     assert lines[2]["description"] == "Adjustable Head LED Flood Light"
     assert lines[2]["approval_status"] == "po_issued"
     assert "delivered_qty" not in lines[0]
+
+
+def test_weekly_report_native_rows_skip_irrelevant_sparse_page_ocr(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    class FakePage:
+        def __init__(self, text: str):
+            self.text = text
+
+        def extract_text(self) -> str:
+            return self.text
+
+    class FakeReader:
+        pages = [
+            FakePage(
+                """
+                WEEKLY REPORT #38
+                12 - List of material
+                LIST OF MATERIAL SUBMITTAL & DELIVERY. STATUS
+                1 Aggregate based Subbase Hardscape Work Mar 14, 2024 Mar 20, 2024 Apr 02, 2024 Apr 06, 2024 Delivered
+                """
+            ),
+            FakePage("15 - Site Photos"),
+        ]
+
+    fake_pypdf = ModuleType("pypdf")
+    fake_pypdf.PdfReader = lambda _: FakeReader()
+    fake_pdf2image = ModuleType("pdf2image")
+
+    def unexpected_ocr(*args, **kwargs):
+        raise AssertionError("Weekly report OCR should be skipped when native rows exist")
+
+    fake_pdf2image.convert_from_bytes = unexpected_ocr
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+    monkeypatch.setitem(sys.modules, "pdf2image", fake_pdf2image)
+
+    pages, method, warnings = _extract_pdf_pages(
+        b"%PDF-test",
+        document_type_hint="weekly_report",
+        filename_hint="Weekly Report #38.pdf",
+    )
+    lines, _ = extract_structured_lines(pages, document_type="weekly_report")
+
+    assert method == "native_text"
+    assert warnings == []
+    assert len(lines) == 1
+    assert lines[0]["description"] == "Aggregate based Subbase"
+
+
+def test_real_client_weekly_report_uses_native_material_pages_without_ocr():
+    if not CLIENT_WEEKLY_REPORT.exists():
+        import pytest
+
+        pytest.skip("Real client weekly report is not available on this machine")
+
+    pages, method, warnings = _extract_pdf_pages(
+        CLIENT_WEEKLY_REPORT.read_bytes(),
+        document_type_hint="weekly_report",
+        filename_hint=CLIENT_WEEKLY_REPORT.name,
+    )
+    lines, _ = extract_structured_lines(pages, document_type="weekly_report")
+
+    assert method == "native_text"
+    assert warnings == []
+    assert len(lines) >= 20
+    assert {line["source_page"] for line in lines}.issubset({28, 29, 30})
 
 
 def test_progress_invoice_extracts_total_to_date_values_from_wrapped_row():
