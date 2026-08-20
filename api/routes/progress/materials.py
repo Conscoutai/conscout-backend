@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from core.auth import ensure_admin_user, require_authenticated_user
@@ -131,14 +131,16 @@ def review_project_material_document(
 def discard_project_material_document(
     project_id: str,
     document_id: str,
-    payload: MaterialDocumentControlRequest,
+    payload: MaterialDocumentControlRequest | None = Body(default=None),
+    reason: str | None = Query(default=None, min_length=3, max_length=1000),
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)
     return discard_material_document(
         project_ref=project_id,
         document_id=document_id,
-        reason=payload.reason,
+        reason=(payload.reason if payload else reason)
+        or "Discarded pending material upload",
         user=current_user,
     )
 

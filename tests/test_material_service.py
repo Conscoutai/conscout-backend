@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 
@@ -13,6 +14,7 @@ from services.progress.materials.material_service import (
     build_material_ledger,
     classify_material_document,
     document_matches_material_reset_scope,
+    discard_material_document,
     enrich_delivery_lines_with_baseline,
     enrich_mir_lines_with_baseline,
     extract_structured_lines,
@@ -625,3 +627,118 @@ def test_material_reset_scopes_are_explicit_and_predictable():
         is True
     )
     assert document_matches_material_reset_scope(confirmed_boq, "all") is True
+
+
+class _DeleteResult:
+    def __init__(self, deleted_count: int):
+        self.deleted_count = deleted_count
+
+
+class _PendingDocumentCollection:
+    def __init__(self, document: dict | None):
+        self.document = dict(document) if document else None
+
+    def find_one(self, query: dict):
+        if not self.document:
+            return None
+        if self.document.get("project_id") != query.get("project_id"):
+            return None
+        if self.document.get("document_id") != query.get("document_id"):
+            return None
+        return dict(self.document)
+
+    def delete_one(self, query: dict):
+        document = self.find_one(query)
+        if not document or document.get("status") != query.get("status"):
+            return _DeleteResult(0)
+        self.document = None
+        return _DeleteResult(1)
+
+
+def test_discard_pending_upload_is_database_first_and_idempotent(monkeypatch, tmp_path):
+    import services.progress.materials.material_service as material_service
+
+    source = tmp_path / "pending.pdf"
+    source.write_bytes(b"%PDF-test")
+    collection = _PendingDocumentCollection(
+        {
+            "project_id": "project-1",
+            "document_id": "doc-1",
+            "status": "needs_review",
+            "storage_path": str(source),
+            "original_filename": "pending.pdf",
+        }
+    )
+    monkeypatch.setattr(
+        material_service,
+        "resolve_project",
+        lambda _: {"project_id": "project-1"},
+    )
+    monkeypatch.setattr(material_service, "material_documents_collection", collection)
+    monkeypatch.setattr(material_service, "_audit", lambda **_: None)
+    monkeypatch.setattr(material_service, "get_material_summary", lambda _: {})
+
+    response = discard_material_document(
+        project_ref="project-1",
+        document_id="doc-1",
+        reason="Wrong upload",
+        user=SimpleNamespace(),
+    )
+    repeated = discard_material_document(
+        project_ref="project-1",
+        document_id="doc-1",
+        reason="Retry after timeout",
+        user=SimpleNamespace(),
+    )
+
+    assert response["status"] == "discarded"
+    assert response["source_removed"] is True
+    assert source.exists() is False
+    assert repeated["status"] == "already_discarded"
+
+
+def test_discard_still_succeeds_when_file_cleanup_or_summary_refresh_fails(
+    monkeypatch, tmp_path
+):
+    import services.progress.materials.material_service as material_service
+
+    source = tmp_path / "locked.pdf"
+    source.write_bytes(b"%PDF-test")
+    collection = _PendingDocumentCollection(
+        {
+            "project_id": "project-1",
+            "document_id": "doc-locked",
+            "status": "needs_review",
+            "storage_path": str(source),
+            "original_filename": "locked.pdf",
+        }
+    )
+    monkeypatch.setattr(
+        material_service,
+        "resolve_project",
+        lambda _: {"project_id": "project-1"},
+    )
+    monkeypatch.setattr(material_service, "material_documents_collection", collection)
+    monkeypatch.setattr(
+        material_service.os,
+        "remove",
+        lambda _: (_ for _ in ()).throw(PermissionError()),
+    )
+    monkeypatch.setattr(material_service, "_audit", lambda **_: None)
+    monkeypatch.setattr(
+        material_service,
+        "get_material_summary",
+        lambda _: (_ for _ in ()).throw(RuntimeError("temporary refresh error")),
+    )
+
+    response = discard_material_document(
+        project_ref="project-1",
+        document_id="doc-locked",
+        reason="Wrong upload",
+        user=SimpleNamespace(),
+    )
+
+    assert response["status"] == "discarded"
+    assert response["source_removed"] is False
+    assert response["summary_refresh_required"] is True
+    assert collection.document is None

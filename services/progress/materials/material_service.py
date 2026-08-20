@@ -1790,7 +1790,9 @@ def void_material_document(
     }
 
 
-def _remove_material_source_file(document: dict[str, Any]) -> bool:
+def _remove_material_source_file(
+    document: dict[str, Any], *, strict: bool = True
+) -> bool:
     storage_path = str(document.get("storage_path") or "").strip()
     if not storage_path:
         return False
@@ -1800,6 +1802,8 @@ def _remove_material_source_file(document: dict[str, Any]) -> bool:
     except FileNotFoundError:
         return False
     except OSError as error:
+        if not strict:
+            return False
         raise HTTPException(
             500, "The stored material document could not be removed"
         ) from error
@@ -1815,32 +1819,68 @@ def discard_material_document(
         {"project_id": project_id, "document_id": document_id}
     )
     if not document:
-        raise HTTPException(404, "Material document not found")
+        return {
+            "status": "already_discarded",
+            "document_id": document_id,
+            "source_removed": False,
+        }
     if document.get("status") != "needs_review":
         raise HTTPException(
             409, "Only documents waiting for review can be permanently discarded"
         )
-    source_removed = _remove_material_source_file(document)
-    material_documents_collection.delete_one(
-        {"project_id": project_id, "document_id": document_id}
+    delete_result = material_documents_collection.delete_one(
+        {
+            "project_id": project_id,
+            "document_id": document_id,
+            "status": "needs_review",
+        }
     )
-    _audit(
-        project_id=project_id,
-        document_id=document_id,
-        event_type="discarded",
-        user=user,
-        details={
-            "reason": str(reason or "").strip(),
-            "filename": document.get("original_filename"),
-            "source_removed": source_removed,
-        },
-    )
-    rebuild_material_ledger(project_id)
-    return {
+    if int(getattr(delete_result, "deleted_count", 0)) != 1:
+        current = material_documents_collection.find_one(
+            {"project_id": project_id, "document_id": document_id}
+        )
+        if current:
+            raise HTTPException(
+                409,
+                "The document changed while it was being discarded; refresh and try again",
+            )
+        return {
+            "status": "already_discarded",
+            "document_id": document_id,
+            "source_removed": False,
+        }
+
+    # The database record is authoritative. A missing or temporarily locked
+    # source file must not leave a deleted upload visible in Manage Uploads.
+    source_removed = _remove_material_source_file(document, strict=False)
+    audit_recorded = True
+    try:
+        _audit(
+            project_id=project_id,
+            document_id=document_id,
+            event_type="discarded",
+            user=user,
+            details={
+                "reason": str(reason or "").strip(),
+                "filename": document.get("original_filename"),
+                "source_removed": source_removed,
+            },
+        )
+    except Exception:
+        # Do not report a failed delete after the requested record is gone.
+        audit_recorded = False
+
+    response: dict[str, Any] = {
         "status": "discarded",
         "document_id": document_id,
-        "summary": get_material_summary(project_id),
+        "source_removed": source_removed,
+        "audit_recorded": audit_recorded,
     }
+    try:
+        response["summary"] = get_material_summary(project_id)
+    except Exception:
+        response["summary_refresh_required"] = True
+    return response
 
 
 def reprocess_material_document(
