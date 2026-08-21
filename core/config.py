@@ -89,6 +89,7 @@ SITE_DXF_DIRNAME = _env("SITE_DXF_DIRNAME", "dxf")
 SITE_BASELINE_DIRNAME = _env("SITE_BASELINE_DIRNAME", "baseline")
 SITE_ZONE_PLAN_DIRNAME = _env("SITE_ZONE_PLAN_DIRNAME", "zone-plans")
 SITE_MATERIALS_DIRNAME = _env("SITE_MATERIALS_DIRNAME", "materials")
+SITE_BUDGET_DIRNAME = _env("SITE_BUDGET_DIRNAME", "budget")
 DEFAULT_SITE_NAME = _env("DEFAULT_SITE_NAME", "site_unknown")
 
 TOUR_RAW_DIRNAME = _env("TOUR_RAW_DIRNAME", "raw")
@@ -222,6 +223,12 @@ def site_materials_dir(site_name: str, *, owner_email: Optional[str] = None, own
     return os.path.join(
         site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
         SITE_MATERIALS_DIRNAME,
+    )
+
+def site_budget_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:
+    return os.path.join(
+        site_dir(site_name, owner_email=owner_email, owner_user_id=owner_user_id),
+        SITE_BUDGET_DIRNAME,
     )
 
 def site_zone_plan_dir(site_name: str, *, owner_email: Optional[str] = None, owner_user_id: Optional[str] = None) -> str:

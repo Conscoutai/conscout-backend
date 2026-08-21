@@ -4,6 +4,12 @@ import shutil
 from fastapi import HTTPException
 
 from core.database import (
+    budget_audit_events_collection,
+    budget_boq_items_collection,
+    budget_boqs_collection,
+    budget_invoices_collection,
+    budget_variations_collection,
+    budget_verification_runs_collection,
     floorplans_collection,
     inspections_collection,
     material_audit_events_collection,
@@ -155,6 +161,15 @@ def delete_project(site_name: str) -> None:
     material_documents_collection.delete_many(material_filter)
     project_materials_collection.delete_many(material_filter)
     material_audit_events_collection.delete_many(material_filter)
+    for collection in (
+        budget_boqs_collection,
+        budget_boq_items_collection,
+        budget_variations_collection,
+        budget_invoices_collection,
+        budget_verification_runs_collection,
+        budget_audit_events_collection,
+    ):
+        collection.delete_many(material_filter)
 
     for project_dir in site_dirs_to_remove:
         if os.path.isdir(project_dir):
@@ -208,6 +223,17 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         project_materials_collection.update_many(
             {"project_id": project_id}, {"$set": {"site_name": new_site}}
         )
+        for collection in (
+            budget_boqs_collection,
+            budget_boq_items_collection,
+            budget_variations_collection,
+            budget_invoices_collection,
+            budget_verification_runs_collection,
+            budget_audit_events_collection,
+        ):
+            collection.update_many(
+                {"project_id": project_id}, {"$set": {"site_name": new_site}}
+            )
         return
 
     existing = floorplans_collection.find_one(
@@ -256,6 +282,12 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         material_documents_collection,
         project_materials_collection,
         material_audit_events_collection,
+        budget_boqs_collection,
+        budget_boq_items_collection,
+        budget_variations_collection,
+        budget_invoices_collection,
+        budget_verification_runs_collection,
+        budget_audit_events_collection,
     ):
         collection.update_many(
             {"$or": [{"project_id": old_site}, {"site_name": old_site}]},

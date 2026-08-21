@@ -6,6 +6,12 @@ from typing import Any
 
 from core.config import DATA_DIR, user_data_dir
 from core.database import (
+    raw_budget_audit_events_collection,
+    raw_budget_boq_items_collection,
+    raw_budget_boqs_collection,
+    raw_budget_invoices_collection,
+    raw_budget_variations_collection,
+    raw_budget_verification_runs_collection,
     raw_floorplans_collection,
     raw_inspections_collection,
     raw_material_audit_events_collection,
@@ -121,6 +127,24 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
     material_audit_events_deleted = raw_material_audit_events_collection.delete_many(
         owned_filter
     ).deleted_count
+    budget_boqs_deleted = raw_budget_boqs_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    budget_boq_items_deleted = raw_budget_boq_items_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    budget_variations_deleted = raw_budget_variations_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    budget_invoices_deleted = raw_budget_invoices_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    budget_verification_runs_deleted = raw_budget_verification_runs_collection.delete_many(
+        owned_filter
+    ).deleted_count
+    budget_audit_events_deleted = raw_budget_audit_events_collection.delete_many(
+        owned_filter
+    ).deleted_count
 
     stakeholder_refs_removed = 0
     if normalized_email:
@@ -148,6 +172,12 @@ def delete_user_account(user: dict[str, Any]) -> dict[str, Any]:
         "material_documents_deleted": material_documents_deleted,
         "project_materials_deleted": project_materials_deleted,
         "material_audit_events_deleted": material_audit_events_deleted,
+        "budget_boqs_deleted": budget_boqs_deleted,
+        "budget_boq_items_deleted": budget_boq_items_deleted,
+        "budget_variations_deleted": budget_variations_deleted,
+        "budget_invoices_deleted": budget_invoices_deleted,
+        "budget_verification_runs_deleted": budget_verification_runs_deleted,
+        "budget_audit_events_deleted": budget_audit_events_deleted,
         "notifications_deleted": notifications_deleted,
         "stakeholder_refs_removed": stakeholder_refs_removed,
         "users_deleted": users_deleted,

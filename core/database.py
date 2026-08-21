@@ -94,6 +94,12 @@ raw_schedule_progress_snapshots_collection = db["schedule_progress_snapshots"]
 raw_material_documents_collection = db["material_documents"]
 raw_project_materials_collection = db["project_materials"]
 raw_material_audit_events_collection = db["material_audit_events"]
+raw_budget_boqs_collection = db["budget_boqs"]
+raw_budget_boq_items_collection = db["budget_boq_items"]
+raw_budget_variations_collection = db["budget_variations"]
+raw_budget_invoices_collection = db["budget_invoices"]
+raw_budget_verification_runs_collection = db["budget_verification_runs"]
+raw_budget_audit_events_collection = db["budget_audit_events"]
 raw_users_collection = db["users"]
 raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
@@ -183,6 +189,68 @@ def ensure_material_indexes() -> None:
     )
 
 
+def ensure_budget_indexes() -> None:
+    """Create project-isolated BOQ, invoice, verification, and audit indexes."""
+    raw_budget_boqs_collection.create_index(
+        "boq_id", unique=True, name="unique_budget_boq_id"
+    )
+    raw_budget_boqs_collection.create_index(
+        [("project_id", 1), ("version", -1)], name="budget_project_boq_versions"
+    )
+    raw_budget_boqs_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("source_sha256", 1)],
+        unique=True,
+        name="unique_project_budget_boq_hash",
+    )
+    raw_budget_boqs_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("is_active", 1)],
+        unique=True,
+        partialFilterExpression={"is_active": True},
+        name="unique_active_project_budget_boq",
+    )
+    raw_budget_boq_items_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("boq_id", 1), ("boq_item_id", 1)],
+        unique=True,
+        name="unique_budget_boq_item",
+    )
+    raw_budget_boq_items_collection.create_index(
+        [("project_id", 1), ("item_number", 1), ("normalized_description", 1)],
+        name="budget_boq_item_lookup",
+    )
+    raw_budget_variations_collection.create_index(
+        "variation_id", unique=True, name="unique_budget_variation_id"
+    )
+    raw_budget_variations_collection.create_index(
+        [("project_id", 1), ("status", 1), ("effective_date", 1)],
+        name="budget_variation_effective",
+    )
+    raw_budget_invoices_collection.create_index(
+        "invoice_id", unique=True, name="unique_budget_invoice_id"
+    )
+    raw_budget_invoices_collection.create_index(
+        [("project_id", 1), ("billing_cutoff_date", 1), ("sequence", 1)],
+        name="budget_invoice_history",
+    )
+    raw_budget_invoices_collection.create_index(
+        [("owner_user_id", 1), ("project_id", 1), ("source_sha256", 1)],
+        unique=True,
+        name="unique_project_budget_invoice_hash",
+    )
+    raw_budget_verification_runs_collection.create_index(
+        "verification_run_id",
+        unique=True,
+        name="unique_budget_verification_run_id",
+    )
+    raw_budget_verification_runs_collection.create_index(
+        [("project_id", 1), ("invoice_id", 1), ("version", -1)],
+        name="budget_invoice_verification_versions",
+    )
+    raw_budget_audit_events_collection.create_index(
+        [("project_id", 1), ("created_at", -1)],
+        name="budget_audit_project_created",
+    )
+
+
 def ensure_safety_indexes() -> None:
     """Create the Phase 1 safety/manpower query and idempotency indexes."""
     raw_safety_records_collection.create_index(
@@ -237,6 +305,14 @@ schedule_progress_snapshots_collection = ScopedCollection(
 material_documents_collection = ScopedCollection(raw_material_documents_collection)
 project_materials_collection = ScopedCollection(raw_project_materials_collection)
 material_audit_events_collection = ScopedCollection(raw_material_audit_events_collection)
+budget_boqs_collection = ScopedCollection(raw_budget_boqs_collection)
+budget_boq_items_collection = ScopedCollection(raw_budget_boq_items_collection)
+budget_variations_collection = ScopedCollection(raw_budget_variations_collection)
+budget_invoices_collection = ScopedCollection(raw_budget_invoices_collection)
+budget_verification_runs_collection = ScopedCollection(
+    raw_budget_verification_runs_collection
+)
+budget_audit_events_collection = ScopedCollection(raw_budget_audit_events_collection)
 users_collection = raw_users_collection
 inspections_collection = ScopedCollection(raw_inspections_collection)
 notifications_collection = raw_notifications_collection

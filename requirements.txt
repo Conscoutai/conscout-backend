@@ -11,6 +11,7 @@ ezdxf
 exif
 pdf2image
 pypdf
+openpyxl
 pypdfium2
 pytesseract
 pyproj
