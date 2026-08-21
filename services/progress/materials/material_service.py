@@ -20,7 +20,10 @@ from core.database import (
     project_materials_collection,
 )
 from core.auth_context import AuthenticatedUser
-from services.progress.work_schedule.baseline_service import resolve_project
+from services.progress.work_schedule.baseline_service import (
+    project_currency_code,
+    resolve_project,
+)
 
 
 DOCUMENT_TYPES = {
@@ -46,7 +49,7 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 MAX_PDF_PAGES = 250
 MAX_OCR_PAGES = 75
 MIN_NATIVE_TEXT_CHARS = 120
-MATERIAL_PROCESSING_VERSION = 9
+MATERIAL_PROCESSING_VERSION = 10
 MATERIAL_RESET_SCOPES = {"pending", "transactions", "all"}
 AUTO_MATCH_MIN_CONFIDENCE = 0.78
 AUTO_MATCH_MIN_MARGIN = 0.15
@@ -115,7 +118,8 @@ _DELIVERY_LINE_PATTERNS = (
 _BOQ_BLOCK_START = re.compile(r"^\s*(?P<item>\d+(?:\.\d+)*)\s+(?P<description>.+)$")
 _BOQ_BLOCK_VALUE = re.compile(
     rf"(?P<raw_quantity>[\d,]+)\s*(?P<unit>{_UNIT})\s+"
-    rf"(?P<rate>{_NUMBER})\s+(?P<amount>{_NUMBER})",
+    rf"(?P<first_after_unit>{_NUMBER})\s+(?P<second_after_unit>{_NUMBER})"
+    rf"(?:\s+(?P<third_after_unit>{_NUMBER}))?",
     re.IGNORECASE,
 )
 _DATE = re.compile(
@@ -1614,14 +1618,32 @@ def extract_structured_lines(
                 values = _BOQ_BLOCK_VALUE.search(row.group("description"))
                 if not values:
                     continue
-                rate = _number(values.group("rate"))
-                amount = _number(values.group("amount"))
+                third_after_unit = _number(values.group("third_after_unit"))
+                if third_after_unit > 0:
+                    # Some PDFs place the unit before the financial columns,
+                    # especially when a drawing reference ends with a number:
+                    # ``LS 20 Nos 1 52,087 52,087``. In that layout the three
+                    # values after the unit are quantity, rate, and amount.
+                    quantity = _number(values.group("first_after_unit"))
+                    rate = _number(values.group("second_after_unit"))
+                    amount = third_after_unit
+                    quantity_warning = (
+                        "Quantity, rate, and amount were read from the three columns "
+                        "after the unit; confirm against the source page."
+                    )
+                else:
+                    rate = _number(values.group("first_after_unit"))
+                    amount = _number(values.group("second_after_unit"))
+                    quantity = amount / rate if rate > 0 else 0.0
+                    quantity_warning = (
+                        "Quantity was cross-checked from line amount / contract rate; "
+                        "confirm against the source page."
+                    )
                 if rate <= 0 or amount <= 0:
                     continue
-                # PDF table extraction sometimes joins a drawing reference such
-                # as ``D-22`` to quantity ``14538``. Amount / rate is the safer
-                # quantity candidate, and every value still requires review.
-                quantity = amount / rate
+                # With only rate and amount after the unit, PDF extraction may
+                # have joined a drawing reference such as ``D-22`` to the raw
+                # quantity. In that layout amount / rate is the safer value.
                 description = row.group("description")[: values.start()].strip(" -:")
                 key = (
                     page_number,
@@ -1642,9 +1664,7 @@ def extract_structured_lines(
                         "contract_unit_rate": rate,
                         "line_amount": amount,
                         "confidence": 0.62,
-                        "warnings": [
-                            "Quantity was cross-checked from line amount / contract rate; confirm against the source page."
-                        ],
+                        "warnings": [quantity_warning],
                     }
                 )
         for raw_line in page_text.splitlines():
@@ -1772,6 +1792,7 @@ def upload_material_document(
 
     project = resolve_project(project_ref)
     project_id = project["project_id"]
+    project_currency = project_currency_code(project)
     digest = hashlib.sha256(raw_bytes).hexdigest()
     existing = material_documents_collection.find_one(
         {"project_id": project_id, "source_sha256": digest}
@@ -1886,6 +1907,8 @@ def upload_material_document(
             },
         )
     extracted_header = _extract_header(text, resolved_type)
+    if project_currency:
+        extracted_header["currency"] = project_currency
     if page_contexts:
         extracted_header["page_documents"] = page_contexts
         extracted_header["bundled_document_count"] = len(
@@ -2274,6 +2297,9 @@ def confirm_material_document(
     header = dict(
         document.get("reviewed_header") or document.get("extracted_header") or {}
     )
+    project_currency = project_currency_code(project)
+    if project_currency:
+        header["currency"] = project_currency
     now = utc_now()
     if document.get("document_type") == "boq":
         material_documents_collection.update_many(
@@ -2902,8 +2928,10 @@ def get_material_summary(project_ref: str) -> dict[str, Any]:
     return {
         "project_id": project_id,
         "site_name": project["site_name"],
-        "currency": next(
-            (str(item.get("currency")) for item in ledger if item.get("currency")), ""
+        "currency": project_currency_code(project)
+        or next(
+            (str(item.get("currency")) for item in ledger if item.get("currency")),
+            "",
         ),
         "totals": {key: _rounded(value) for key, value in totals.items()},
         "quantity_totals": {

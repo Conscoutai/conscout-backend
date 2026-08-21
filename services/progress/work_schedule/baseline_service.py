@@ -71,6 +71,32 @@ def resolve_project(project_ref: str) -> dict[str, Any]:
     }
 
 
+def project_currency_code(project_context: dict[str, Any]) -> str:
+    """Return the canonical currency selected in Project Setup."""
+    document = project_context.get("document") or project_context
+    if not isinstance(document, dict):
+        return ""
+    nested = document.get("floorPlan") or document.get("floorplan") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+    for value in (
+        document.get("currency_code"),
+        document.get("currency"),
+        document.get("project_currency"),
+        document.get("cash_type"),
+        document.get("cashType"),
+        nested.get("currency_code"),
+        nested.get("currency"),
+        nested.get("project_currency"),
+        nested.get("cash_type"),
+        nested.get("cashType"),
+    ):
+        normalized = str(value or "").strip().upper()
+        if normalized:
+            return normalized
+    return ""
+
+
 def _public_baseline(document: dict[str, Any]) -> dict[str, Any]:
     return {
         "baseline_id": str(document.get("baseline_id") or ""),

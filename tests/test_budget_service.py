@@ -17,7 +17,9 @@ from services.progress.budget.budget_service import (
     material_documents_as_of,
     normalize_boq_lines,
     normalize_invoice_lines,
+    revision_from_filename,
 )
+from services.progress.work_schedule.baseline_service import project_currency_code
 
 
 def _boq_item() -> dict:
@@ -218,6 +220,53 @@ def test_materials_boq_import_warns_about_unpriced_lines():
 
     assert lines[0]["contract_amount"] == 0
     assert any(item["code"] == "missing_priced_lines" for item in warnings)
+
+
+def test_legacy_material_boq_financial_columns_are_reparsed_for_budget_review():
+    _, lines, warnings = material_boq_to_budget_payload(
+        {
+            "processing_version": 9,
+            "extracted_text": (
+                "17 Site Furnitures A Name Board Ref: LS 20Nos 1 52,087.00 52,087.00"
+            ),
+            "confirmed_lines": [
+                {
+                    "source_page": 1,
+                    "item_number": "17",
+                    "description": "Site Furnitures A Name Board Ref: LS",
+                    "unit": "PCS",
+                    "planned_qty": 52087,
+                    "contract_unit_rate": 1,
+                    "line_amount": 52087,
+                    "material_id": "material-name-board",
+                }
+            ],
+        }
+    )
+
+    assert lines[0]["contract_qty"] == 1
+    assert lines[0]["contract_unit_rate"] == 52087
+    assert lines[0]["contract_amount"] == 52087
+    assert lines[0]["material_id"] == "material-name-board"
+    assert any(item["code"] == "financial_columns_reparsed" for item in warnings)
+
+
+def test_project_currency_and_filename_revision_supply_budget_defaults():
+    project = {
+        "document": {
+            "currency_code": "sar",
+            "currency": "USD",
+            "cashType": "AED",
+        }
+    }
+
+    assert project_currency_code(project) == "SAR"
+    assert (
+        revision_from_filename(
+            "BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
+        )
+        == "REV-07"
+    )
 
 
 def test_payment_state_supports_partial_and_full_payment_without_overpayment():

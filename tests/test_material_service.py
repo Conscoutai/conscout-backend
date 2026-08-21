@@ -26,8 +26,17 @@ from services.progress.materials.material_service import (
 )
 
 
-CLIENT_BOQ = Path(
-    r"C:\Users\safwa\Downloads\safwan-20260819T062840Z-1-001\safwan\BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
+CLIENT_BOQ_CANDIDATES = (
+    Path(
+        r"C:\Users\safwa\Downloads\safwan-20260819T062840Z-1-001\safwan\BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
+    ),
+    Path(
+        r"D:\Cosysta\conscout\Sites\fozan Street\PROJECT SETUP\material steup\01 - BOQ\BOQ - Abdullatif Alfozan Street Rev.B 10-01-2024 REV-07.pdf"
+    ),
+)
+CLIENT_BOQ = next(
+    (candidate for candidate in CLIENT_BOQ_CANDIDATES if candidate.exists()),
+    CLIENT_BOQ_CANDIDATES[0],
 )
 CLIENT_MATERIALS = Path(r"D:\Cosysta\conscout\Sites\fozan Street\materials")
 CLIENT_WEEKLY_REPORT = Path(
@@ -59,6 +68,22 @@ def test_boq_text_creates_reviewable_project_material_baseline_line():
     assert any(item["code"] == "best_effort_extraction" for item in warnings)
 
 
+def test_boq_block_handles_unit_before_quantity_rate_and_amount_columns():
+    lines, _ = extract_structured_lines(
+        [
+            "17 Site Furnitures A Name Board Ref: LS 20Nos 1 52,087.00 52,087.00"
+        ],
+        document_type="boq",
+    )
+
+    assert len(lines) == 1
+    assert lines[0]["item_number"] == "17"
+    assert lines[0]["unit"] == "PCS"
+    assert lines[0]["planned_qty"] == 1
+    assert lines[0]["contract_unit_rate"] == 52087
+    assert lines[0]["line_amount"] == 52087
+
+
 def test_real_client_boq_extracts_the_two_curb_baseline_candidates():
     if not CLIENT_BOQ.exists():
         import pytest
@@ -77,6 +102,14 @@ def test_real_client_boq_extracts_the_two_curb_baseline_candidates():
     assert curbs["15"]["planned_qty"] == 14538
     assert curbs["15"]["unit"] == "LM"
     assert curbs["15"]["contract_unit_rate"] == 75
+    name_board = next(
+        line
+        for line in lines
+        if line["source_page"] == 8 and line["item_number"] == "17"
+    )
+    assert name_board["planned_qty"] == 1
+    assert name_board["contract_unit_rate"] == 52087
+    assert name_board["line_amount"] == 52087
 
 
 def test_document_classifier_handles_the_supplied_material_document_types():

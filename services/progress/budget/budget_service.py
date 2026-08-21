@@ -37,7 +37,10 @@ from services.progress.materials.material_service import (
 from services.progress.work_schedule.analytics_service import (
     build_baseline_comparison,
 )
-from services.progress.work_schedule.baseline_service import resolve_project
+from services.progress.work_schedule.baseline_service import (
+    project_currency_code,
+    resolve_project,
+)
 
 
 MAX_FILE_BYTES = 35 * 1024 * 1024
@@ -76,6 +79,17 @@ def number(value: Any) -> float:
 
 def rounded(value: Any, digits: int = 4) -> float:
     return round(number(value), digits)
+
+
+def revision_from_filename(filename: Any) -> str:
+    matches = re.findall(
+        r"\bREV(?:ISION)?[._ -]*[A-Z0-9]+",
+        Path(str(filename or "")).stem,
+        re.IGNORECASE,
+    )
+    if not matches:
+        return ""
+    return matches[-1].strip().upper().replace(".", "-")
 
 
 def parse_iso_date(value: Any, *, field: str = "date", required: bool = False) -> str:
@@ -523,10 +537,29 @@ def upload_boq(
         {"project_id": project_id, "source_sha256": digest}
     )
     if existing:
-        return {"status": "duplicate", "boq": _public(existing)}
+        return {
+            "status": "duplicate",
+            "boq": get_boq(project_id, existing["boq_id"]),
+        }
     extracted_lines, extracted_header, warnings, method = extract_budget_document(
         raw_bytes, filename=safe_name, document_type="boq"
     )
+    resolved_revision = str(
+        revision
+        or extracted_header.get("revision")
+        or revision_from_filename(safe_name)
+    ).strip()
+    resolved_currency = str(
+        project_currency_code(project)
+        or currency
+        or extracted_header.get("currency")
+        or ""
+    ).strip().upper()
+    extracted_header = {
+        **dict(extracted_header or {}),
+        "revision": resolved_revision,
+        "currency": resolved_currency,
+    }
     boq_id = f"boq_{uuid4().hex}"
     now = utc_now()
     document = {
@@ -535,8 +568,8 @@ def upload_boq(
         "site_name": project["site_name"],
         "floorplan_id": project["floorplan_id"],
         "version": _next_boq_version(project_id),
-        "revision": str(revision or extracted_header.get("revision") or "").strip(),
-        "currency": str(currency or extracted_header.get("currency") or "").strip().upper(),
+        "revision": resolved_revision,
+        "currency": resolved_currency,
         "status": "needs_review",
         "is_active": False,
         "original_filename": safe_name,
@@ -578,7 +611,64 @@ def material_boq_to_budget_payload(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert a confirmed Materials BOQ into a reviewable Budget BOQ payload."""
     source_header = dict(document.get("confirmed_header") or {})
-    source_lines = list(document.get("confirmed_lines") or [])
+    source_lines = [dict(line) for line in document.get("confirmed_lines") or []]
+    refreshed_count = 0
+    extracted_text = str(document.get("extracted_text") or "")
+    if int(document.get("processing_version") or 0) < 10 and extracted_text:
+        fresh_lines, _ = extract_structured_lines(
+            extracted_text.split("\n\f\n"), document_type="boq"
+        )
+        fresh_by_key: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+        for candidate in fresh_lines:
+            key = (
+                int(number(candidate.get("source_page"))),
+                str(candidate.get("item_number") or "").strip(),
+            )
+            fresh_by_key[key].append(candidate)
+        for line in source_lines:
+            key = (
+                int(number(line.get("source_page"))),
+                str(line.get("item_number") or "").strip(),
+            )
+            candidates = fresh_by_key.get(key) or []
+            if not candidates:
+                continue
+            candidate = max(
+                candidates,
+                key=lambda item: _match_score(
+                    str(line.get("description") or ""),
+                    str(item.get("description") or ""),
+                ),
+            )
+            if (
+                _match_score(
+                    str(line.get("description") or ""),
+                    str(candidate.get("description") or ""),
+                )
+                < 0.75
+            ):
+                continue
+            previous = (
+                rounded(line.get("planned_qty")),
+                rounded(line.get("contract_unit_rate")),
+                rounded(line.get("line_amount")),
+            )
+            replacement = (
+                rounded(candidate.get("planned_qty")),
+                rounded(candidate.get("contract_unit_rate")),
+                rounded(candidate.get("line_amount")),
+            )
+            if min(replacement) <= 0 or replacement == previous:
+                continue
+            line.update(
+                planned_qty=replacement[0],
+                contract_unit_rate=replacement[1],
+                line_amount=replacement[2],
+                unit=candidate.get("unit") or line.get("unit"),
+                warnings=list(candidate.get("warnings") or line.get("warnings") or []),
+                confidence=candidate.get("confidence", line.get("confidence")),
+            )
+            refreshed_count += 1
     converted = normalize_boq_lines(
         [
             {
@@ -615,6 +705,16 @@ def material_boq_to_budget_payload(
                 ),
             }
         )
+    if refreshed_count:
+        warnings.append(
+            {
+                "code": "financial_columns_reparsed",
+                "message": (
+                    f"{refreshed_count} line(s) used the corrected PDF quantity, rate, "
+                    "and amount column layout. Confirm them before activation."
+                ),
+            }
+        )
     return source_header, converted, warnings
 
 
@@ -640,6 +740,30 @@ def import_material_boq(
             409, "Only the current confirmed Materials BOQ can be used in Budget"
         )
 
+    extracted_header, extracted_lines, warnings = material_boq_to_budget_payload(
+        source
+    )
+    if not extracted_lines:
+        raise HTTPException(
+            422, "The confirmed Materials BOQ has no line items available to import"
+        )
+    revision = str(
+        source.get("revision")
+        or extracted_header.get("revision")
+        or revision_from_filename(source.get("original_filename"))
+    ).strip()
+    currency = str(
+        project_currency_code(project)
+        or source.get("currency")
+        or extracted_header.get("currency")
+        or ""
+    ).strip().upper()
+    extracted_header = {
+        **extracted_header,
+        "revision": revision,
+        "currency": currency,
+    }
+
     existing = budget_boqs_collection.find_one(
         {
             "project_id": project_id,
@@ -651,38 +775,33 @@ def import_material_boq(
             {"project_id": project_id, "source_sha256": source["source_sha256"]}
         )
     if existing:
+        update = {
+            "source_type": "materials_boq",
+            "source_material_document_id": source["document_id"],
+            "source_material_confirmed_at": source.get("confirmed_at"),
+            "updated_at": utc_now(),
+        }
+        if existing.get("status") == "needs_review" and not existing.get("is_active"):
+            update.update(
+                revision=revision,
+                currency=currency,
+                extraction_method="materials_confirmed_boq",
+                extraction_warnings=warnings,
+                extracted_header=extracted_header,
+                extracted_lines=extracted_lines,
+                summary=_boq_summary(extracted_lines),
+            )
         budget_boqs_collection.update_one(
             {"project_id": project_id, "boq_id": existing["boq_id"]},
-            {
-                "$set": {
-                    "source_type": "materials_boq",
-                    "source_material_document_id": source["document_id"],
-                    "source_material_confirmed_at": source.get("confirmed_at"),
-                    "updated_at": utc_now(),
-                }
-            },
+            {"$set": update},
         )
         return {
             "status": "already_imported",
             "boq": get_boq(project_id, existing["boq_id"]),
         }
 
-    extracted_header, extracted_lines, warnings = material_boq_to_budget_payload(
-        source
-    )
-    if not extracted_lines:
-        raise HTTPException(
-            422, "The confirmed Materials BOQ has no line items available to import"
-        )
-
     boq_id = f"boq_{uuid4().hex}"
     now = utc_now()
-    revision = str(
-        source.get("revision") or extracted_header.get("revision") or ""
-    ).strip()
-    currency = str(
-        source.get("currency") or extracted_header.get("currency") or ""
-    ).strip().upper()
     document = {
         "boq_id": boq_id,
         "project_id": project_id,
@@ -727,7 +846,9 @@ def import_material_boq(
     return {"status": "needs_review", "boq": _public(document)}
 
 
-def _materials_boq_sources(project_id: str) -> list[dict[str, Any]]:
+def _materials_boq_sources(project: dict[str, Any]) -> list[dict[str, Any]]:
+    project_id = project["project_id"]
+    project_currency = project_currency_code(project)
     sources = material_documents_collection.find(
         {"project_id": project_id, "document_type": "boq", "status": "confirmed"}
     ).sort([("confirmed_at", -1), ("uploaded_at", -1)])
@@ -758,8 +879,13 @@ def _materials_boq_sources(project_id: str) -> list[dict[str, Any]]:
             {
                 "document_id": source.get("document_id"),
                 "original_filename": source.get("original_filename") or "Materials BOQ",
-                "revision": source.get("revision") or header.get("revision") or "",
-                "currency": source.get("currency") or header.get("currency") or "",
+                "revision": source.get("revision")
+                or header.get("revision")
+                or revision_from_filename(source.get("original_filename")),
+                "currency": project_currency
+                or source.get("currency")
+                or header.get("currency")
+                or "",
                 "line_count": len(lines),
                 "contract_amount": rounded(contract_amount),
                 "confirmed_at": source.get("confirmed_at"),
@@ -790,7 +916,18 @@ def get_boq(project_ref: str, boq_id: str) -> dict[str, Any]:
     )
     if not document:
         raise HTTPException(404, "BOQ revision not found")
-    return _public(document)
+    result = _public(document)
+    configured_currency = project_currency_code(project)
+    if configured_currency:
+        result["currency"] = configured_currency
+    if not str(result.get("revision") or "").strip():
+        result["revision"] = revision_from_filename(result.get("original_filename"))
+    result["extracted_header"] = {
+        **dict(result.get("extracted_header") or {}),
+        "revision": result.get("revision") or "",
+        "currency": result.get("currency") or "",
+    }
+    return result
 
 
 def review_boq(
@@ -819,12 +956,25 @@ def review_boq(
         **dict(document.get("extracted_header") or {}),
         **dict(header or {}),
     }
+    resolved_revision = str(
+        reviewed_header.get("revision")
+        or document.get("revision")
+        or revision_from_filename(document.get("original_filename"))
+    ).strip()
+    resolved_currency = str(
+        project_currency_code(project)
+        or reviewed_header.get("currency")
+        or document.get("currency")
+        or ""
+    ).strip().upper()
+    reviewed_header["revision"] = resolved_revision
+    reviewed_header["currency"] = resolved_currency
     update = {
         "reviewed_header": reviewed_header,
         "reviewed_lines": normalized,
         "review_note": str(note or "").strip(),
-        "revision": str(reviewed_header.get("revision") or document.get("revision") or "").strip(),
-        "currency": str(reviewed_header.get("currency") or document.get("currency") or "").strip().upper(),
+        "revision": resolved_revision,
+        "currency": resolved_currency,
         "status": "reviewed",
         "summary": _boq_summary(normalized),
         "reviewed_at": now,
@@ -1039,7 +1189,10 @@ def upload_invoice(
         {"project_id": project_id, "source_sha256": digest}
     )
     if existing:
-        return {"status": "duplicate", "invoice": _public(existing)}
+        return {
+            "status": "duplicate",
+            "invoice": get_invoice(project_id, existing["invoice_id"]),
+        }
     extracted_lines, extracted_header, warnings, method = extract_budget_document(
         raw_bytes, filename=safe_name, document_type="invoice"
     )
@@ -1068,7 +1221,12 @@ def upload_invoice(
         "billing_start_date": resolved_start,
         "billing_end_date": resolved_end,
         "billing_cutoff_date": resolved_cutoff,
-        "currency": str(currency or extracted_header.get("currency") or "").strip().upper(),
+        "currency": str(
+            project_currency_code(project)
+            or currency
+            or extracted_header.get("currency")
+            or ""
+        ).strip().upper(),
         "retention_percent": rounded(retention_percent),
         "advance_recovery_percent": rounded(advance_recovery_percent),
         "vat_percent": rounded(vat_percent),
@@ -1141,7 +1299,15 @@ def get_invoice(project_ref: str, invoice_id: str) -> dict[str, Any]:
     )
     if not document:
         raise HTTPException(404, "Invoice/payment application not found")
-    return _public(document)
+    result = _public(document)
+    configured_currency = project_currency_code(project)
+    if configured_currency:
+        result["currency"] = configured_currency
+    result["extracted_header"] = {
+        **dict(result.get("extracted_header") or {}),
+        "currency": result.get("currency") or "",
+    }
+    return result
 
 
 def review_invoice(
@@ -1169,6 +1335,13 @@ def review_invoice(
         **dict(document.get("extracted_header") or {}),
         **dict(header or {}),
     }
+    resolved_currency = str(
+        project_currency_code(project)
+        or reviewed_header.get("currency")
+        or document.get("currency")
+        or ""
+    ).strip().upper()
+    reviewed_header["currency"] = resolved_currency
     cutoff = parse_iso_date(
         reviewed_header.get("billing_cutoff_date") or document.get("billing_cutoff_date"),
         field="billing_cutoff_date",
@@ -1194,7 +1367,7 @@ def review_invoice(
         "billing_start_date": start,
         "billing_end_date": end,
         "billing_cutoff_date": cutoff,
-        "currency": str(reviewed_header.get("currency") or document.get("currency") or "").strip().upper(),
+        "currency": resolved_currency,
         "status": "reviewed",
         "reviewed_at": now,
         "reviewed_by_user_id": user.user_id,
@@ -2061,7 +2234,7 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
     project_id = project["project_id"]
     boq = _active_boq(project_id)
     boq_items = _active_boq_items(project_id)
-    materials_boq_sources = _materials_boq_sources(project_id)
+    materials_boq_sources = _materials_boq_sources(project)
     invoices = sorted(
         list(budget_invoices_collection.find({"project_id": project_id})),
         key=_invoice_sort_key,
@@ -2137,6 +2310,15 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
         )
     active_boq_public = _public(boq)
     if active_boq_public:
+        active_boq_public["currency"] = (
+            project_currency_code(project)
+            or active_boq_public.get("currency")
+            or ""
+        )
+        active_boq_public["revision"] = (
+            active_boq_public.get("revision")
+            or revision_from_filename(active_boq_public.get("original_filename"))
+        )
         active_boq_public["summary"] = {
             **dict(active_boq_public.get("summary") or {}),
             "original_contract_amount": rounded(original_contract),
@@ -2148,7 +2330,12 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
     return {
         "project_id": project_id,
         "site_name": project["site_name"],
-        "currency": str((boq or {}).get("currency") or latest.get("currency") or ""),
+        "currency": str(
+            project_currency_code(project)
+            or (boq or {}).get("currency")
+            or latest.get("currency")
+            or ""
+        ),
         "summary": {
             "original_contract_amount": rounded(original_contract),
             "approved_variation_amount": rounded(variation_amount),
