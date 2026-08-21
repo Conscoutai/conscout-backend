@@ -13,6 +13,7 @@ from services.progress.budget.budget_service import (
     _excel_rows,
     calculate_invoice_line,
     calculate_payment_state,
+    material_boq_to_budget_payload,
     material_documents_as_of,
     normalize_boq_lines,
     normalize_invoice_lines,
@@ -171,6 +172,52 @@ def test_normalizers_recalculate_missing_amounts_and_preserve_manual_progress():
     assert boq["contract_amount"] == 60
     assert invoice["current_claimed_amount"] == 40
     assert invoice["manual_verified_percent"] == 35
+
+
+def test_confirmed_materials_boq_converts_to_linked_budget_lines():
+    header, lines, warnings = material_boq_to_budget_payload(
+        {
+            "confirmed_header": {"currency": "SAR", "revision": "Rev 2"},
+            "confirmed_lines": [
+                {
+                    "line_id": "material-line-1",
+                    "material_id": "material-1",
+                    "item_number": "L-01",
+                    "description": "Landscape kerbstone",
+                    "category": "Hardscape",
+                    "unit": "LM",
+                    "planned_qty": 100,
+                    "contract_unit_rate": 12.5,
+                    "line_amount": 1250,
+                }
+            ],
+        }
+    )
+
+    assert header == {"currency": "SAR", "revision": "Rev 2"}
+    assert lines[0]["line_id"] == "material-line-1"
+    assert lines[0]["material_id"] == "material-1"
+    assert lines[0]["contract_qty"] == 100
+    assert lines[0]["contract_unit_rate"] == 12.5
+    assert lines[0]["contract_amount"] == 1250
+    assert warnings[0]["code"] == "imported_from_materials"
+
+
+def test_materials_boq_import_warns_about_unpriced_lines():
+    _, lines, warnings = material_boq_to_budget_payload(
+        {
+            "confirmed_lines": [
+                {
+                    "description": "Unpriced planting allowance",
+                    "unit": "EA",
+                    "planned_qty": 10,
+                }
+            ]
+        }
+    )
+
+    assert lines[0]["contract_amount"] == 0
+    assert any(item["code"] == "missing_priced_lines" for item in warnings)
 
 
 def test_payment_state_supports_partial_and_full_payment_without_overpayment():

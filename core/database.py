@@ -203,6 +203,15 @@ def ensure_budget_indexes() -> None:
         name="unique_project_budget_boq_hash",
     )
     raw_budget_boqs_collection.create_index(
+        [
+            ("owner_user_id", 1),
+            ("project_id", 1),
+            ("source_material_document_id", 1),
+        ],
+        sparse=True,
+        name="budget_material_boq_source",
+    )
+    raw_budget_boqs_collection.create_index(
         [("owner_user_id", 1), ("project_id", 1), ("is_active", 1)],
         unique=True,
         partialFilterExpression={"is_active": True},

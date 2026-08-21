@@ -14,6 +14,7 @@ from services.progress.budget.budget_service import (
     get_boq,
     get_budget_workspace,
     get_invoice,
+    import_material_boq,
     list_boqs,
     list_invoices,
     list_variations,
@@ -94,6 +95,22 @@ async def upload_project_budget_boq(
         raw_bytes=await file.read(),
         revision=revision,
         currency=currency,
+        user=current_user,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/budget/boqs/import-materials/{material_document_id}"
+)
+def import_project_materials_boq(
+    project_id: str,
+    material_document_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return import_material_boq(
+        project_ref=project_id,
+        material_document_id=material_document_id,
         user=current_user,
     )
 

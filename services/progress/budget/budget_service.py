@@ -573,6 +573,206 @@ def upload_boq(
     return {"status": "needs_review", "boq": _public(document)}
 
 
+def material_boq_to_budget_payload(
+    document: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convert a confirmed Materials BOQ into a reviewable Budget BOQ payload."""
+    source_header = dict(document.get("confirmed_header") or {})
+    source_lines = list(document.get("confirmed_lines") or [])
+    converted = normalize_boq_lines(
+        [
+            {
+                **dict(line),
+                "line_id": str(line.get("line_id") or f"line_{uuid4().hex}"),
+                "contract_qty": number(line.get("planned_qty")),
+                "contract_unit_rate": number(line.get("contract_unit_rate")),
+                "contract_amount": number(line.get("line_amount"))
+                or number(line.get("planned_qty"))
+                * number(line.get("contract_unit_rate")),
+                "material_id": str(line.get("material_id") or "").strip(),
+            }
+            for line in source_lines
+        ]
+    )
+    zero_value_count = sum(
+        1 for line in converted if number(line.get("contract_amount")) <= 0
+    )
+    warnings: list[dict[str, Any]] = [
+        {
+            "code": "imported_from_materials",
+            "message": (
+                "Imported from the confirmed Materials BOQ. Review quantities, rates, "
+                "amounts, and activity mappings before activation."
+            ),
+        }
+    ]
+    if zero_value_count:
+        warnings.append(
+            {
+                "code": "missing_priced_lines",
+                "message": (
+                    f"{zero_value_count} imported line(s) have no priced amount and require review."
+                ),
+            }
+        )
+    return source_header, converted, warnings
+
+
+def import_material_boq(
+    *,
+    project_ref: str,
+    material_document_id: str,
+    user: AuthenticatedUser,
+) -> dict[str, Any]:
+    project = resolve_project(project_ref)
+    project_id = project["project_id"]
+    source = material_documents_collection.find_one(
+        {
+            "project_id": project_id,
+            "document_id": str(material_document_id or "").strip(),
+            "document_type": "boq",
+        }
+    )
+    if not source:
+        raise HTTPException(404, "Materials BOQ not found")
+    if source.get("status") != "confirmed":
+        raise HTTPException(
+            409, "Only the current confirmed Materials BOQ can be used in Budget"
+        )
+
+    existing = budget_boqs_collection.find_one(
+        {
+            "project_id": project_id,
+            "source_material_document_id": source["document_id"],
+        }
+    )
+    if not existing and source.get("source_sha256"):
+        existing = budget_boqs_collection.find_one(
+            {"project_id": project_id, "source_sha256": source["source_sha256"]}
+        )
+    if existing:
+        budget_boqs_collection.update_one(
+            {"project_id": project_id, "boq_id": existing["boq_id"]},
+            {
+                "$set": {
+                    "source_type": "materials_boq",
+                    "source_material_document_id": source["document_id"],
+                    "source_material_confirmed_at": source.get("confirmed_at"),
+                    "updated_at": utc_now(),
+                }
+            },
+        )
+        return {
+            "status": "already_imported",
+            "boq": get_boq(project_id, existing["boq_id"]),
+        }
+
+    extracted_header, extracted_lines, warnings = material_boq_to_budget_payload(
+        source
+    )
+    if not extracted_lines:
+        raise HTTPException(
+            422, "The confirmed Materials BOQ has no line items available to import"
+        )
+
+    boq_id = f"boq_{uuid4().hex}"
+    now = utc_now()
+    revision = str(
+        source.get("revision") or extracted_header.get("revision") or ""
+    ).strip()
+    currency = str(
+        source.get("currency") or extracted_header.get("currency") or ""
+    ).strip().upper()
+    document = {
+        "boq_id": boq_id,
+        "project_id": project_id,
+        "site_name": project["site_name"],
+        "floorplan_id": project["floorplan_id"],
+        "version": _next_boq_version(project_id),
+        "revision": revision,
+        "currency": currency,
+        "status": "needs_review",
+        "is_active": False,
+        "original_filename": str(source.get("original_filename") or "Materials BOQ"),
+        "source_sha256": str(source.get("source_sha256") or ""),
+        "source_type": "materials_boq",
+        "source_material_document_id": source["document_id"],
+        "source_material_confirmed_at": source.get("confirmed_at"),
+        "extraction_method": "materials_confirmed_boq",
+        "extraction_warnings": warnings,
+        "extracted_header": extracted_header,
+        "extracted_lines": extracted_lines,
+        "reviewed_header": {},
+        "reviewed_lines": [],
+        "summary": _boq_summary(extracted_lines),
+        "uploaded_at": now,
+        "uploaded_by_user_id": user.user_id,
+        "uploaded_by_email": user.email,
+        "created_at": now,
+        "updated_at": now,
+    }
+    budget_boqs_collection.insert_one(document)
+    _audit(
+        project_id=project_id,
+        entity_type="boq",
+        entity_id=boq_id,
+        event_type="imported_from_materials",
+        user=user,
+        details={
+            "material_document_id": source["document_id"],
+            "filename": document["original_filename"],
+            "line_count": len(extracted_lines),
+        },
+    )
+    return {"status": "needs_review", "boq": _public(document)}
+
+
+def _materials_boq_sources(project_id: str) -> list[dict[str, Any]]:
+    sources = material_documents_collection.find(
+        {"project_id": project_id, "document_type": "boq", "status": "confirmed"}
+    ).sort([("confirmed_at", -1), ("uploaded_at", -1)])
+    values: list[dict[str, Any]] = []
+    for source in sources:
+        existing = budget_boqs_collection.find_one(
+            {
+                "project_id": project_id,
+                "source_material_document_id": source.get("document_id"),
+            }
+        )
+        if not existing and source.get("source_sha256"):
+            existing = budget_boqs_collection.find_one(
+                {
+                    "project_id": project_id,
+                    "source_sha256": source.get("source_sha256"),
+                }
+            )
+        lines = list(source.get("confirmed_lines") or [])
+        contract_amount = sum(
+            number(line.get("line_amount"))
+            or number(line.get("planned_qty"))
+            * number(line.get("contract_unit_rate"))
+            for line in lines
+        )
+        header = dict(source.get("confirmed_header") or {})
+        values.append(
+            {
+                "document_id": source.get("document_id"),
+                "original_filename": source.get("original_filename") or "Materials BOQ",
+                "revision": source.get("revision") or header.get("revision") or "",
+                "currency": source.get("currency") or header.get("currency") or "",
+                "line_count": len(lines),
+                "contract_amount": rounded(contract_amount),
+                "confirmed_at": source.get("confirmed_at"),
+                "source_sha256": source.get("source_sha256") or "",
+                "is_imported": bool(existing),
+                "budget_boq_id": (existing or {}).get("boq_id") or "",
+                "budget_status": (existing or {}).get("status") or "",
+                "is_active_in_budget": bool((existing or {}).get("is_active")),
+            }
+        )
+    return public_value(values)
+
+
 def list_boqs(project_ref: str) -> list[dict[str, Any]]:
     project = resolve_project(project_ref)
     return [
@@ -1861,6 +2061,7 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
     project_id = project["project_id"]
     boq = _active_boq(project_id)
     boq_items = _active_boq_items(project_id)
+    materials_boq_sources = _materials_boq_sources(project_id)
     invoices = sorted(
         list(budget_invoices_collection.find({"project_id": project_id})),
         key=_invoice_sort_key,
@@ -1974,6 +2175,7 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
             "exception_count": len(exceptions),
         },
         "active_boq": active_boq_public,
+        "materials_boq_sources": materials_boq_sources,
         "boq_items": [_public(item) for item in boq_items],
         "variations": [_public(item) for item in variations],
         "invoices": [_public(item) for item in reversed(invoices)],
@@ -1981,4 +2183,3 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
         "financial_curve": financial_curve,
         "material_summary": public_value(material_summary),
     }
-    build_material_ledger,
