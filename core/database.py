@@ -197,10 +197,17 @@ def ensure_budget_indexes() -> None:
     raw_budget_boqs_collection.create_index(
         [("project_id", 1), ("version", -1)], name="budget_project_boq_versions"
     )
+    # A signed source file may intentionally be uploaded again to create a new
+    # BOQ revision after the previous extraction has been activated. Keep the
+    # hash searchable for duplicate detection, but do not make it unique across
+    # revision records.
+    hash_index_name = "unique_project_budget_boq_hash"
+    hash_index = raw_budget_boqs_collection.index_information().get(hash_index_name)
+    if hash_index and hash_index.get("unique"):
+        raw_budget_boqs_collection.drop_index(hash_index_name)
     raw_budget_boqs_collection.create_index(
         [("owner_user_id", 1), ("project_id", 1), ("source_sha256", 1)],
-        unique=True,
-        name="unique_project_budget_boq_hash",
+        name="budget_project_boq_hash",
     )
     raw_budget_boqs_collection.create_index(
         [

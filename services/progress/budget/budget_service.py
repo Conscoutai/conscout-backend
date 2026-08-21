@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 import re
 from collections import defaultdict
@@ -57,6 +58,8 @@ INVOICE_ACTIVE_STATUSES = {
 INVOICE_HISTORY_STATUSES = {"certified", "paid"}
 DECISION_ACTIONS = {"certify", "hold", "request_correction", "reject"}
 VERIFICATION_TOLERANCE = 0.01
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -390,8 +393,18 @@ def normalize_boq_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
         quantity = max(0.0, number(line.get("contract_qty", line.get("planned_qty"))))
         rate = max(0.0, number(line.get("contract_unit_rate")))
         amount = number(line.get("contract_amount", line.get("line_amount")))
-        if amount <= 0 and quantity > 0 and rate > 0:
-            amount = quantity * rate
+        calculated_amount = quantity * rate
+        amount_was_recalculated = calculated_amount > 0 and (
+            amount <= 0
+            or abs(amount - calculated_amount) > max(1.0, calculated_amount * 0.05)
+        )
+        if amount_was_recalculated:
+            amount = calculated_amount
+        line_warnings = [str(value) for value in (line.get("warnings") or [])]
+        if amount_was_recalculated:
+            line_warnings.append(
+                "Amount was recalculated from quantity x unit rate during review."
+            )
         output.append(
             {
                 "line_id": str(line.get("line_id") or f"line_{uuid4().hex}"),
@@ -417,7 +430,7 @@ def normalize_boq_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
                 "source_sheet": str(line.get("source_sheet") or ""),
                 "source_row": int(number(line.get("source_row"))) or None,
                 "confidence": min(1.0, max(0.0, number(line.get("confidence")))),
-                "warnings": [str(value) for value in (line.get("warnings") or [])],
+                "warnings": line_warnings,
             }
         )
     return output
@@ -520,6 +533,16 @@ def _next_boq_version(project_id: str) -> int:
     return int((latest or {}).get("version") or 0) + 1
 
 
+def should_reuse_uploaded_boq(existing: Optional[dict[str, Any]]) -> bool:
+    """Reuse a draft duplicate, but let an active source start a new revision."""
+    if not existing:
+        return False
+    return not existing.get("is_active") and str(existing.get("status") or "") in {
+        "needs_review",
+        "reviewed",
+    }
+
+
 def upload_boq(
     *,
     project_ref: str,
@@ -534,9 +557,18 @@ def upload_boq(
     project_id = project["project_id"]
     digest = hashlib.sha256(raw_bytes).hexdigest()
     existing = budget_boqs_collection.find_one(
-        {"project_id": project_id, "source_sha256": digest}
+        {"project_id": project_id, "source_sha256": digest},
+        sort=[("version", -1)],
     )
-    if existing:
+    if should_reuse_uploaded_boq(existing):
+        logger.info(
+            "Budget BOQ duplicate upload reused",
+            extra={
+                "project_id": project_id,
+                "boq_id": existing.get("boq_id"),
+                "status": existing.get("status"),
+            },
+        )
         return {
             "status": "duplicate",
             "boq": get_boq(project_id, existing["boq_id"]),
@@ -595,6 +627,16 @@ def upload_boq(
         raw_bytes=raw_bytes,
     )
     budget_boqs_collection.insert_one(document)
+    logger.info(
+        "Budget BOQ uploaded for review",
+        extra={
+            "project_id": project_id,
+            "boq_id": boq_id,
+            "version": document["version"],
+            "line_count": len(document["extracted_lines"]),
+            "repeated_source": bool(existing),
+        },
+    )
     _audit(
         project_id=project_id,
         entity_type="boq",
@@ -947,6 +989,10 @@ def review_boq(
     if not document:
         raise HTTPException(404, "BOQ revision not found")
     if document.get("is_active") is True:
+        logger.warning(
+            "Active Budget BOQ edit rejected",
+            extra={"project_id": project_id, "boq_id": boq_id},
+        )
         raise HTTPException(409, "Upload a new BOQ revision instead of editing the active revision")
     normalized = normalize_boq_lines(lines)
     if not normalized:
@@ -984,6 +1030,14 @@ def review_boq(
     }
     budget_boqs_collection.update_one(
         {"project_id": project_id, "boq_id": boq_id}, {"$set": update}
+    )
+    logger.info(
+        "Budget BOQ review saved",
+        extra={
+            "project_id": project_id,
+            "boq_id": boq_id,
+            "line_count": len(normalized),
+        },
     )
     _audit(
         project_id=project_id,
@@ -1078,6 +1132,15 @@ def activate_boq(
                 "activated_by_email": user.email,
                 "updated_at": now,
             }
+        },
+    )
+    logger.info(
+        "Budget BOQ activated",
+        extra={
+            "project_id": project_id,
+            "boq_id": boq_id,
+            "line_count": len(lines),
+            "contract_amount": summary.get("original_contract_amount"),
         },
     )
     _audit(

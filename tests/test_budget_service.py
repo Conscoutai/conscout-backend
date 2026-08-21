@@ -18,6 +18,7 @@ from services.progress.budget.budget_service import (
     normalize_boq_lines,
     normalize_invoice_lines,
     revision_from_filename,
+    should_reuse_uploaded_boq,
 )
 from services.progress.work_schedule.baseline_service import project_currency_code
 
@@ -176,6 +177,22 @@ def test_normalizers_recalculate_missing_amounts_and_preserve_manual_progress():
     assert invoice["manual_verified_percent"] == 35
 
 
+def test_boq_normalizer_repairs_an_obviously_shifted_amount_column():
+    line = normalize_boq_lines(
+        [
+            {
+                "description": "PVC sleeves",
+                "contract_qty": 240,
+                "contract_unit_rate": 8640,
+                "contract_amount": 2,
+            }
+        ]
+    )[0]
+
+    assert line["contract_amount"] == 2073600
+    assert any("recalculated" in warning.lower() for warning in line["warnings"])
+
+
 def test_confirmed_materials_boq_converts_to_linked_budget_lines():
     header, lines, warnings = material_boq_to_budget_payload(
         {
@@ -267,6 +284,14 @@ def test_project_currency_and_filename_revision_supply_budget_defaults():
         )
         == "REV-07"
     )
+
+
+def test_same_active_boq_can_start_an_editable_revision():
+    active = {"status": "active", "is_active": True}
+    draft = {"status": "needs_review", "is_active": False}
+
+    assert not should_reuse_uploaded_boq(active)
+    assert should_reuse_uploaded_boq(draft)
 
 
 def test_payment_state_supports_partial_and_full_payment_without_overpayment():
