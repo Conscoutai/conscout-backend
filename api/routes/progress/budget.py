@@ -45,7 +45,7 @@ class BudgetVariationRequest(BaseModel):
     rate_override: float = 0
     effective_date: str = ""
     approval_date: str = ""
-    status: Literal["pending", "approved", "rejected", "voided"] = "approved"
+    status: Literal["pending", "approved", "rejected", "voided"] = "pending"
     note: str = Field("", max_length=2000)
 
 
@@ -58,7 +58,7 @@ class InvoiceDecisionRequest(BaseModel):
 class InvoicePaymentRequest(BaseModel):
     amount: float = Field(..., gt=0)
     payment_date: str
-    reference: str = Field("", max_length=300)
+    reference: str = Field(..., min_length=2, max_length=300)
     note: str = Field("", max_length=2000)
 
 
@@ -195,9 +195,9 @@ async def upload_project_budget_invoice(
     billing_end_date: str = Form(""),
     billing_cutoff_date: str = Form(""),
     currency: str = Form(""),
-    retention_percent: float = Form(0),
-    advance_recovery_percent: float = Form(0),
-    vat_percent: float = Form(0),
+    retention_percent: Optional[float] = Form(None),
+    advance_recovery_percent: Optional[float] = Form(None),
+    vat_percent: Optional[float] = Form(None),
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ensure_admin_user(current_user)

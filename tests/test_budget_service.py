@@ -10,7 +10,9 @@ from fastapi import HTTPException
 from openpyxl import Workbook
 
 from services.progress.budget.budget_service import (
+    _boq_validation,
     _excel_rows,
+    _extract_financial_header,
     calculate_invoice_line,
     calculate_payment_state,
     material_boq_to_budget_payload,
@@ -77,7 +79,7 @@ def test_verified_line_uses_previous_current_and_supported_cumulative_values():
     assert result["recommended_current_amount"] == 250
 
 
-def test_overbilling_is_flagged_and_recommendation_is_capped():
+def test_overbilling_is_flagged_and_has_no_certifiable_recommendation():
     result = _calculate(
         _invoice_line(current_claimed_qty=90, current_claimed_amount=900),
         activity_percent=100,
@@ -85,7 +87,8 @@ def test_overbilling_is_flagged_and_recommendation_is_capped():
 
     assert result["verification_status"] == "overbilled"
     assert result["cumulative_claimed_amount"] == 1100
-    assert result["recommended_current_amount"] == 800
+    assert result["recommended_current_amount"] == 0
+    assert result["recommended_current_qty"] == 0
 
 
 def test_previously_certified_supported_progress_is_detected_as_duplicate():
@@ -119,6 +122,41 @@ def test_pending_material_inspection_forces_review_without_proving_installation(
 
     assert result["verification_status"] == "needs_review"
     assert any("pending inspection" in reason.lower() for reason in result["verification_reasons"])
+    assert result["recommended_current_amount"] == 0
+
+
+def test_schedule_percentage_without_approved_evidence_cannot_support_payment():
+    result = calculate_invoice_line(
+        invoice_line=_invoice_line(),
+        boq_item=_boq_item(),
+        variations=[],
+        previous={"quantity": 0, "amount": 0},
+        activity={"physical_progress_percent": 100, "approved_evidence_count": 0},
+        material=None,
+        match_confidence=1,
+        match_method="item_number",
+    )
+
+    assert result["verification_status"] == "unverified"
+    assert result["verified_progress_percent"] == 0
+    assert result["recommended_current_amount"] == 0
+
+
+def test_manual_verified_percent_is_not_accepted_as_payment_evidence():
+    result = calculate_invoice_line(
+        invoice_line=_invoice_line(manual_verified_percent=100),
+        boq_item=_boq_item(),
+        variations=[],
+        previous={"quantity": 0, "amount": 0},
+        activity={"physical_progress_percent": 100, "approved_evidence_count": 1},
+        material=None,
+        match_confidence=1,
+        match_method="item_number",
+    )
+
+    assert result["verification_status"] == "needs_review"
+    assert result["recommended_current_amount"] == 0
+    assert any("not payment evidence" in reason.lower() for reason in result["verification_reasons"])
 
 
 def test_source_cumulative_invoice_value_derives_current_claim_after_previous():
@@ -143,6 +181,9 @@ def test_excel_boq_parser_extracts_priced_lines():
     sheet.append(["S.No", "Description", "Quantity", "Unit", "Rate", "Amount"])
     sheet.append(["1.1", "Supply kerbstone", 100, "LM", 12.5, 1250])
     sheet.append(["1.2", "Install pavers", 200, "M2", 20, 4000])
+    sheet.append(["", "SUBTOTAL", "", "", "", 5250])
+    sheet.append(["", "VAT AMOUNT", "", "", "", 787.5])
+    sheet.append(["", "GRAND TOTAL", "", "", "", 6037.5])
     buffer = io.BytesIO()
     workbook.save(buffer)
 
@@ -155,6 +196,9 @@ def test_excel_boq_parser_extracts_priced_lines():
     assert lines[0]["contract_qty"] == 100
     assert lines[0]["contract_unit_rate"] == 12.5
     assert lines[0]["contract_amount"] == 1250
+    assert header["source_subtotal_amount"] == 5250
+    assert header["source_vat_amount"] == 787.5
+    assert header["source_total_amount"] == 6037.5
 
 
 def test_normalizers_recalculate_missing_amounts_and_preserve_manual_progress():
@@ -177,7 +221,7 @@ def test_normalizers_recalculate_missing_amounts_and_preserve_manual_progress():
     assert invoice["manual_verified_percent"] == 35
 
 
-def test_boq_normalizer_repairs_an_obviously_shifted_amount_column():
+def test_boq_normalizer_does_not_silently_overwrite_a_source_amount_mismatch():
     line = normalize_boq_lines(
         [
             {
@@ -189,8 +233,43 @@ def test_boq_normalizer_repairs_an_obviously_shifted_amount_column():
         ]
     )[0]
 
-    assert line["contract_amount"] == 2073600
-    assert any("recalculated" in warning.lower() for warning in line["warnings"])
+    assert line["contract_amount"] == 2
+    assert any("does not equal" in warning.lower() for warning in line["warnings"])
+
+
+def test_boq_validation_requires_approved_subtotal_and_reconciled_lines():
+    lines = normalize_boq_lines(
+        [
+            {
+                "description": "Concrete",
+                "contract_qty": 3,
+                "contract_unit_rate": 20,
+                "contract_amount": 60,
+            }
+        ]
+    )
+    valid = _boq_validation({"source_subtotal_amount": 60}, lines)
+    invalid = _boq_validation({"source_subtotal_amount": 100}, lines)
+
+    assert valid["is_ready"] is True
+    assert valid["amount_variance"] == 0
+    assert invalid["is_ready"] is False
+    assert invalid["amount_variance"] == -40
+
+
+def test_signed_boq_summary_amounts_are_detected_by_arithmetic_reconciliation():
+    header = _extract_financial_header(
+        "Hardscape 12,778,995.00 Softscape 2,614,618.20 "
+        "Lighting 5,214,668.00 Irrigation 1,393,071.32 "
+        "22,001,352.52 3,300,202.88 25,301,555.40 TOTAL AMOUNT SUBTOTAL TAX%",
+        "boq",
+    )
+
+    assert header == {
+        "source_subtotal_amount": 22001352.52,
+        "source_vat_amount": 3300202.88,
+        "source_total_amount": 25301555.4,
+    }
 
 
 def test_confirmed_materials_boq_converts_to_linked_budget_lines():
@@ -286,11 +365,11 @@ def test_project_currency_and_filename_revision_supply_budget_defaults():
     )
 
 
-def test_same_active_boq_can_start_an_editable_revision():
+def test_same_boq_source_is_reused_regardless_of_revision_state():
     active = {"status": "active", "is_active": True}
     draft = {"status": "needs_review", "is_active": False}
 
-    assert not should_reuse_uploaded_boq(active)
+    assert should_reuse_uploaded_boq(active)
     assert should_reuse_uploaded_boq(draft)
 
 

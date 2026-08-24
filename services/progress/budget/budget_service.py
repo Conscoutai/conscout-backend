@@ -58,6 +58,7 @@ INVOICE_ACTIVE_STATUSES = {
 INVOICE_HISTORY_STATUSES = {"certified", "paid"}
 DECISION_ACTIONS = {"certify", "hold", "request_correction", "reject"}
 VERIFICATION_TOLERANCE = 0.01
+BOQ_TOTAL_RELATIVE_TOLERANCE = 0.000001
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,101 @@ def _header_key(value: Any) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
 
 
+_AMOUNT_TOKEN = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
+
+
+def _first_amount_after(text: str, patterns: Iterable[str]) -> float:
+    compact = " ".join(str(text or "").replace("\u00a0", " ").split())
+    for pattern in patterns:
+        match = re.search(
+            rf"(?:{pattern})\s*.{{0,140}}?{_AMOUNT_TOKEN}",
+            compact,
+            re.IGNORECASE,
+        )
+        if match:
+            return number(match.group(1))
+    return 0.0
+
+
+def _first_percent_after(text: str, patterns: Iterable[str]) -> float:
+    compact = " ".join(str(text or "").replace("\u00a0", " ").split())
+    for pattern in patterns:
+        match = re.search(
+            rf"(?:{pattern})\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*\)",
+            compact,
+            re.IGNORECASE,
+        )
+        if match:
+            return number(match.group(1))
+    return 0.0
+
+
+def _normalized_document_date(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except ValueError:
+        pass
+    for pattern in (
+        "%d-%b-%y",
+        "%d-%b-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d.%m.%Y",
+    ):
+        try:
+            return datetime.strptime(raw, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+def _extract_financial_header(text: str, document_type: str) -> dict[str, Any]:
+    if document_type == "boq":
+        amounts = sorted(
+            {
+                number(value)
+                for value in re.findall(
+                    r"(?<![0-9])(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\.[0-9]{2}",
+                    str(text or ""),
+                )
+                if number(value) > 0
+            }
+        )
+        subtotal = vat_amount = total = 0.0
+        for candidate_total in reversed(amounts):
+            matches = [
+                (left, right)
+                for left in amounts
+                for right in amounts
+                if left >= right > 0
+                and abs((left + right) - candidate_total) <= max(1.0, candidate_total * 0.000001)
+                and 0.01 <= right / left <= 0.30
+            ]
+            if matches:
+                subtotal, vat_amount = max(matches, key=lambda pair: pair[0])
+                total = candidate_total
+                break
+        return {
+            "source_subtotal_amount": rounded(subtotal),
+            "source_vat_amount": rounded(vat_amount),
+            "source_total_amount": rounded(total),
+        }
+
+    return {
+        "gross_cumulative_amount": 0.0,
+        "retention_percent": rounded(_first_percent_after(text, [r"retention"])),
+        "advance_recovery_percent": rounded(
+            _first_percent_after(text, [r"less\s+(?:down|advance)\s+payment", r"advance\s+recovery"])
+        ),
+        "vat_percent": rounded(_first_percent_after(text, [r"vat", r"add\s+vat"])),
+        "previous_payment_amount": 0.0,
+        "payable_amount": 0.0,
+    }
+
+
 def _find_header_column(headers: list[str], candidates: Iterable[str]) -> int:
     normalized_candidates = [_header_key(item) for item in candidates]
     for index, header in enumerate(headers):
@@ -224,6 +320,27 @@ def _excel_rows(raw_bytes: bytes, *, document_type: str) -> tuple[list[dict[str,
         for row_number, raw_row in enumerate(worksheet.iter_rows(values_only=True), start=1):
             values = list(raw_row)
             keys = [_header_key(value) for value in values]
+            row_text = " ".join(str(value or "") for value in values)
+            row_numbers = [
+                number(value)
+                for value in values
+                if isinstance(value, (int, float))
+                or re.fullmatch(r"[0-9][0-9,]*(?:\.[0-9]+)?", str(value or "").strip())
+            ]
+            row_amount = next((value for value in reversed(row_numbers) if value > 0), 0.0)
+            row_key = " ".join(keys)
+            if document_type == "boq" and row_amount > 0:
+                if "subtotal" in row_key or "total amount of contract" in row_key:
+                    header["source_subtotal_amount"] = rounded(row_amount)
+                elif "grand total" in row_key or "total including vat" in row_key:
+                    header["source_total_amount"] = rounded(row_amount)
+                elif "tax" in row_key or "vat amount" in row_key:
+                    header["source_vat_amount"] = rounded(row_amount)
+            elif document_type == "invoice":
+                financial = _extract_financial_header(row_text, "invoice")
+                for key, value in financial.items():
+                    if value > 0 and number(header.get(key)) <= 0:
+                        header[key] = value
             description_index = _find_header_column(keys, ["description", "item description", "work description"])
             unit_index = _find_header_column(keys, ["unit", "uom"])
             amount_index = _find_header_column(keys, ["amount", "line amount", "current amount", "present amount"])
@@ -245,8 +362,7 @@ def _excel_rows(raw_bytes: bytes, *, document_type: str) -> tuple[list[dict[str,
                 blank_streak = 0
                 continue
             if not active_columns:
-                joined = " ".join(str(value or "") for value in values)
-                currency_match = re.search(r"\b(SAR|USD|AED|QAR|EUR|GBP)\b", joined, re.IGNORECASE)
+                currency_match = re.search(r"\b(SAR|USD|AED|QAR|EUR|GBP)\b", row_text, re.IGNORECASE)
                 if currency_match and not header["currency"]:
                     header["currency"] = currency_match.group(1).upper()
                 continue
@@ -265,7 +381,19 @@ def _excel_rows(raw_bytes: bytes, *, document_type: str) -> tuple[list[dict[str,
                 continue
             blank_streak = 0
             description_key = normalize_description(description)
-            if len(description_key) < 3 or description_key in {"DESCRIPTION", "TOTAL", "PAGE TOTAL"}:
+            if len(description_key) < 3 or description_key in {
+                "DESCRIPTION",
+                "TOTAL",
+                "PAGE TOTAL",
+                "SUBTOTAL",
+                "GRAND TOTAL",
+                "VAT",
+                "VAT AMOUNT",
+                "TAX",
+                "TAX AMOUNT",
+                "TOTAL AMOUNT",
+                "TOTAL AMOUNT OF CONTRACT",
+            }:
                 continue
             key = (worksheet.title, item_number, description_key)
             if key in seen:
@@ -347,7 +475,22 @@ def extract_budget_document(
     raw_lines, line_warnings = extract_structured_lines(
         pages, document_type=material_type
     )
-    raw_header = extract_material_header("\n\f\n".join(pages), material_type)
+    extracted_text = "\n\f\n".join(pages)
+    raw_header = {
+        **extract_material_header(extracted_text, material_type),
+        **_extract_financial_header(extracted_text, document_type),
+    }
+    if not raw_header.get("document_date"):
+        fallback_date = re.search(
+            r"(\d{1,2}-[A-Za-z]{3}-\d{2,4})",
+            extracted_text,
+            re.IGNORECASE,
+        )
+        if fallback_date:
+            raw_header["document_date"] = fallback_date.group(1)
+    normalized_date = _normalized_document_date(raw_header.get("document_date"))
+    if normalized_date:
+        raw_header["document_date"] = normalized_date
     lines: list[dict[str, Any]] = []
     if document_type == "boq":
         for line in raw_lines:
@@ -379,6 +522,9 @@ def extract_budget_document(
                     "source_cumulative_percent": number(line.get("certified_percent")),
                 }
             )
+        raw_header["gross_cumulative_amount"] = rounded(
+            sum(number(line.get("source_cumulative_amount")) for line in lines)
+        )
     warnings = [*page_warnings, *line_warnings]
     return lines, raw_header, warnings, extraction_method
 
@@ -394,9 +540,9 @@ def normalize_boq_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
         rate = max(0.0, number(line.get("contract_unit_rate")))
         amount = number(line.get("contract_amount", line.get("line_amount")))
         calculated_amount = quantity * rate
-        amount_was_recalculated = calculated_amount > 0 and (
-            amount <= 0
-            or abs(amount - calculated_amount) > max(1.0, calculated_amount * 0.05)
+        amount_was_recalculated = calculated_amount > 0 and amount <= 0
+        amount_is_inconsistent = calculated_amount > 0 and amount > 0 and (
+            abs(amount - calculated_amount) > max(1.0, calculated_amount * 0.05)
         )
         if amount_was_recalculated:
             amount = calculated_amount
@@ -404,6 +550,10 @@ def normalize_boq_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
         if amount_was_recalculated:
             line_warnings.append(
                 "Amount was recalculated from quantity x unit rate during review."
+            )
+        if amount_is_inconsistent:
+            line_warnings.append(
+                "Amount does not equal quantity x unit rate. Confirm this source row before activation."
             )
         output.append(
             {
@@ -446,8 +596,22 @@ def normalize_invoice_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, A
         current_qty = max(0.0, number(line.get("current_claimed_qty")))
         rate = max(0.0, number(line.get("claimed_unit_rate")))
         current_amount = max(0.0, number(line.get("current_claimed_amount")))
-        if current_amount <= 0 and current_qty > 0 and rate > 0:
-            current_amount = current_qty * rate
+        calculated_amount = current_qty * rate
+        amount_was_recalculated = calculated_amount > 0 and current_amount <= 0
+        amount_is_inconsistent = calculated_amount > 0 and current_amount > 0 and (
+            abs(current_amount - calculated_amount) > max(1.0, calculated_amount * 0.05)
+        )
+        if amount_was_recalculated:
+            current_amount = calculated_amount
+        line_warnings = [str(value) for value in (line.get("warnings") or [])]
+        if amount_was_recalculated:
+            line_warnings.append(
+                "Current amount was recalculated from quantity x unit rate during review."
+            )
+        if amount_is_inconsistent:
+            line_warnings.append(
+                "Current amount does not equal quantity x unit rate. Confirm the source row."
+            )
         output.append(
             {
                 "line_id": str(line.get("line_id") or f"line_{uuid4().hex}"),
@@ -467,11 +631,15 @@ def normalize_invoice_lines(lines: Iterable[dict[str, Any]]) -> list[dict[str, A
                     if line.get("manual_verified_percent") not in {None, ""}
                     else None
                 ),
+                "manual_override_reason": str(line.get("manual_override_reason") or "").strip(),
+                "manual_override_evidence_reference": str(
+                    line.get("manual_override_evidence_reference") or ""
+                ).strip(),
                 "source_page": int(number(line.get("source_page"))) or None,
                 "source_sheet": str(line.get("source_sheet") or ""),
                 "source_row": int(number(line.get("source_row"))) or None,
                 "confidence": min(1.0, max(0.0, number(line.get("confidence")))),
-                "warnings": [str(value) for value in (line.get("warnings") or [])],
+                "warnings": line_warnings,
             }
         )
     return output
@@ -508,7 +676,98 @@ def _active_boq_items(project_id: str) -> list[dict[str, Any]]:
     )
 
 
-def _boq_summary(lines: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def _active_boq_validation(project_id: str) -> dict[str, Any]:
+    document = _active_boq(project_id)
+    if not document:
+        return {
+            "is_ready": False,
+            "errors": ["Activate a validated priced BOQ before uploading invoices."],
+        }
+    header = {
+        **dict(document.get("extracted_header") or {}),
+        **dict(document.get("reviewed_header") or {}),
+    }
+    return _boq_validation(header, _active_boq_items(project_id))
+
+
+def _require_ready_active_boq(project_id: str) -> None:
+    validation = _active_boq_validation(project_id)
+    if validation.get("is_ready"):
+        return
+    reasons = " ".join(str(value) for value in validation.get("errors") or [])
+    raise HTTPException(
+        409,
+        reasons or "Validate the active BOQ contract total before processing invoices.",
+    )
+
+
+def _boq_validation(
+    header: Optional[dict[str, Any]], lines: Iterable[dict[str, Any]]
+) -> dict[str, Any]:
+    values = list(lines)
+    source = dict(header or {})
+    line_total = sum(number(line.get("contract_amount")) for line in values)
+    expected = number(
+        source.get("expected_contract_amount")
+        or source.get("source_subtotal_amount")
+    )
+    tolerance = max(1.0, expected * BOQ_TOTAL_RELATIVE_TOLERANCE) if expected else 0.0
+    variance = line_total - expected if expected else 0.0
+    zero_priced = sum(1 for line in values if number(line.get("contract_amount")) <= 0)
+    inconsistent_lines = sum(
+        1
+        for line in values
+        if number(line.get("contract_qty")) > 0
+        and number(line.get("contract_unit_rate")) > 0
+        and abs(
+            number(line.get("contract_amount"))
+            - number(line.get("contract_qty"))
+            * number(line.get("contract_unit_rate"))
+        )
+        > max(
+            1.0,
+            number(line.get("contract_qty"))
+            * number(line.get("contract_unit_rate"))
+            * 0.05,
+        )
+    )
+    errors: list[str] = []
+    if not values:
+        errors.append("At least one priced BOQ line is required.")
+    if expected <= 0:
+        errors.append(
+            "Confirm the approved contract subtotal before activation. Use the subtotal excluding VAT."
+        )
+    elif abs(variance) > tolerance:
+        errors.append(
+            "The BOQ line total does not match the approved contract subtotal."
+        )
+    if zero_priced:
+        errors.append(f"{zero_priced} BOQ line(s) have no priced amount.")
+    if inconsistent_lines:
+        errors.append(
+            f"{inconsistent_lines} BOQ line(s) have inconsistent quantity, rate, and amount values."
+        )
+    return {
+        "is_ready": not errors,
+        "expected_contract_amount": rounded(expected),
+        "extracted_line_amount": rounded(line_total),
+        "source_vat_amount": rounded(source.get("source_vat_amount")),
+        "source_total_amount": rounded(source.get("source_total_amount")),
+        "amount_variance": rounded(variance),
+        "amount_tolerance": rounded(tolerance),
+        "zero_priced_line_count": zero_priced,
+        "financial_mismatch_line_count": inconsistent_lines,
+        "low_confidence_line_count": sum(
+            1 for line in values if 0 < number(line.get("confidence")) < 0.8
+        ),
+        "errors": errors,
+    }
+
+
+def _boq_summary(
+    lines: Iterable[dict[str, Any]], header: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     values = list(lines)
     categories = {str(line.get("category") or "Uncategorized") for line in values}
     original_amount = sum(number(line.get("contract_amount")) for line in values)
@@ -523,6 +782,7 @@ def _boq_summary(lines: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "category_count": len(categories),
         "original_contract_amount": rounded(original_amount),
         "unmapped_line_count": unmapped,
+        "validation": _boq_validation(header, values),
     }
 
 
@@ -534,13 +794,8 @@ def _next_boq_version(project_id: str) -> int:
 
 
 def should_reuse_uploaded_boq(existing: Optional[dict[str, Any]]) -> bool:
-    """Reuse a draft duplicate, but let an active source start a new revision."""
-    if not existing:
-        return False
-    return not existing.get("is_active") and str(existing.get("status") or "") in {
-        "needs_review",
-        "reviewed",
-    }
+    """The same source bytes are one immutable BOQ revision for a project."""
+    return bool(existing)
 
 
 def upload_boq(
@@ -592,6 +847,7 @@ def upload_boq(
         "revision": resolved_revision,
         "currency": resolved_currency,
     }
+    normalized_lines = normalize_boq_lines(extracted_lines)
     boq_id = f"boq_{uuid4().hex}"
     now = utc_now()
     document = {
@@ -609,10 +865,10 @@ def upload_boq(
         "extraction_method": method,
         "extraction_warnings": warnings,
         "extracted_header": extracted_header,
-        "extracted_lines": normalize_boq_lines(extracted_lines),
+        "extracted_lines": normalized_lines,
         "reviewed_header": {},
         "reviewed_lines": [],
-        "summary": _boq_summary(normalize_boq_lines(extracted_lines)),
+        "summary": _boq_summary(normalized_lines, extracted_header),
         "uploaded_at": now,
         "uploaded_by_user_id": user.user_id,
         "uploaded_by_email": user.email,
@@ -656,6 +912,11 @@ def material_boq_to_budget_payload(
     source_lines = [dict(line) for line in document.get("confirmed_lines") or []]
     refreshed_count = 0
     extracted_text = str(document.get("extracted_text") or "")
+    if extracted_text:
+        source_header = {
+            **_extract_financial_header(extracted_text, "boq"),
+            **source_header,
+        }
     if int(document.get("processing_version") or 0) < 10 and extracted_text:
         fresh_lines, _ = extract_structured_lines(
             extracted_text.split("\n\f\n"), document_type="boq"
@@ -831,7 +1092,7 @@ def import_material_boq(
                 extraction_warnings=warnings,
                 extracted_header=extracted_header,
                 extracted_lines=extracted_lines,
-                summary=_boq_summary(extracted_lines),
+                summary=_boq_summary(extracted_lines, extracted_header),
             )
         budget_boqs_collection.update_one(
             {"project_id": project_id, "boq_id": existing["boq_id"]},
@@ -865,7 +1126,7 @@ def import_material_boq(
         "extracted_lines": extracted_lines,
         "reviewed_header": {},
         "reviewed_lines": [],
-        "summary": _boq_summary(extracted_lines),
+        "summary": _boq_summary(extracted_lines, extracted_header),
         "uploaded_at": now,
         "uploaded_by_user_id": user.user_id,
         "uploaded_by_email": user.email,
@@ -969,6 +1230,21 @@ def get_boq(project_ref: str, boq_id: str) -> dict[str, Any]:
         "revision": result.get("revision") or "",
         "currency": result.get("currency") or "",
     }
+    validation_header = {
+        **dict(result.get("extracted_header") or {}),
+        **dict(result.get("reviewed_header") or {}),
+    }
+    validation_lines = (
+        _active_boq_items(project["project_id"])
+        if result.get("is_active")
+        else normalize_boq_lines(
+            result.get("reviewed_lines") or result.get("extracted_lines") or []
+        )
+    )
+    result["summary"] = {
+        **dict(result.get("summary") or {}),
+        "validation": _boq_validation(validation_header, validation_lines),
+    }
     return result
 
 
@@ -1022,7 +1298,7 @@ def review_boq(
         "revision": resolved_revision,
         "currency": resolved_currency,
         "status": "reviewed",
-        "summary": _boq_summary(normalized),
+        "summary": _boq_summary(normalized, reviewed_header),
         "reviewed_at": now,
         "reviewed_by_user_id": user.user_id,
         "reviewed_by_email": user.email,
@@ -1097,6 +1373,15 @@ def activate_boq(
     if not lines or document.get("status") not in {"reviewed", "active"}:
         raise HTTPException(409, "Review and confirm the BOQ lines before activation")
     lines = _reuse_boq_item_ids(project_id, lines)
+    header = {
+        **dict(document.get("extracted_header") or {}),
+        **dict(document.get("reviewed_header") or {}),
+    }
+    summary = _boq_summary(lines, header)
+    validation = dict(summary.get("validation") or {})
+    if not validation.get("is_ready"):
+        reasons = " ".join(str(value) for value in validation.get("errors") or [])
+        raise HTTPException(409, reasons or "Resolve the BOQ validation errors before activation")
     now = utc_now()
     budget_boqs_collection.update_many(
         {"project_id": project_id, "is_active": True},
@@ -1118,7 +1403,6 @@ def activate_boq(
             for line in lines
         ]
     )
-    summary = _boq_summary(lines)
     budget_boqs_collection.update_one(
         {"project_id": project_id, "boq_id": boq_id},
         {
@@ -1178,9 +1462,21 @@ def create_variation(
         {"project_id": project_id, "boq_id": boq["boq_id"], "boq_item_id": boq_item_id}
     ):
         raise HTTPException(422, "Variation BOQ item was not found in the active revision")
-    status = str(payload.get("status") or "approved").strip().lower()
+    status = str(payload.get("status") or "pending").strip().lower()
     if status not in {"pending", "approved", "rejected", "voided"}:
         raise HTTPException(422, "Unsupported variation status")
+    if status == "approved" and not boq_item_id:
+        raise HTTPException(
+            422,
+            "Approved variations must be allocated to an active BOQ line item",
+        )
+    reference = str(payload.get("reference") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    if status == "approved" and (not reference or not description):
+        raise HTTPException(
+            422,
+            "Approved variations require a reference and description",
+        )
     effective_date = parse_iso_date(
         payload.get("effective_date"), field="effective_date", required=status == "approved"
     )
@@ -1191,8 +1487,8 @@ def create_variation(
         "site_name": project["site_name"],
         "boq_id": boq["boq_id"],
         "boq_item_id": boq_item_id,
-        "reference": str(payload.get("reference") or "").strip(),
-        "description": str(payload.get("description") or "").strip(),
+        "reference": reference,
+        "description": description,
         "quantity_delta": rounded(payload.get("quantity_delta")),
         "amount_delta": rounded(payload.get("amount_delta")),
         "rate_override": rounded(payload.get("rate_override")),
@@ -1237,16 +1533,15 @@ def upload_invoice(
     billing_end_date: str,
     billing_cutoff_date: str,
     currency: str,
-    retention_percent: float,
-    advance_recovery_percent: float,
-    vat_percent: float,
+    retention_percent: Optional[float],
+    advance_recovery_percent: Optional[float],
+    vat_percent: Optional[float],
     user: AuthenticatedUser,
 ) -> dict[str, Any]:
     safe_name, _ = _validate_upload(filename, raw_bytes)
     project = resolve_project(project_ref)
     project_id = project["project_id"]
-    if not _active_boq(project_id):
-        raise HTTPException(409, "Activate a priced BOQ before uploading invoices")
+    _require_ready_active_boq(project_id)
     digest = hashlib.sha256(raw_bytes).hexdigest()
     existing = budget_invoices_collection.find_one(
         {"project_id": project_id, "source_sha256": digest}
@@ -1263,17 +1558,31 @@ def upload_invoice(
         invoice_number or extracted_header.get("document_number") or ""
     ).strip()
     resolved_invoice_date = parse_iso_date(
-        invoice_date or extracted_header.get("document_date"), field="invoice_date"
+        invoice_date or _normalized_document_date(extracted_header.get("document_date")),
+        field="invoice_date",
     )
     resolved_start = parse_iso_date(billing_start_date, field="billing_start_date")
     resolved_end = parse_iso_date(billing_end_date, field="billing_end_date")
     resolved_cutoff = parse_iso_date(
-        billing_cutoff_date or billing_end_date or invoice_date,
+        billing_cutoff_date or billing_end_date or resolved_invoice_date,
         field="billing_cutoff_date",
-        required=True,
     )
     if resolved_start and resolved_end and resolved_start > resolved_end:
         raise HTTPException(422, "Billing start date must be on or before billing end date")
+    if resolved_end and resolved_cutoff and resolved_end > resolved_cutoff:
+        raise HTTPException(422, "Billing cutoff date must be on or after billing end date")
+    if resolved_invoice_date and resolved_cutoff and resolved_invoice_date < resolved_cutoff:
+        raise HTTPException(422, "Invoice date must be on or after the billing cutoff date")
+    if resolved_number:
+        duplicate_number = budget_invoices_collection.find_one(
+            {
+                "project_id": project_id,
+                "invoice_number": resolved_number,
+                "status": {"$ne": "rejected"},
+            }
+        )
+        if duplicate_number:
+            raise HTTPException(409, "This invoice number already exists in the project budget")
     invoice_id = f"invoice_{uuid4().hex}"
     now = utc_now()
     normalized_lines = normalize_invoice_lines(extracted_lines)
@@ -1290,9 +1599,19 @@ def upload_invoice(
             or extracted_header.get("currency")
             or ""
         ).strip().upper(),
-        "retention_percent": rounded(retention_percent),
-        "advance_recovery_percent": rounded(advance_recovery_percent),
-        "vat_percent": rounded(vat_percent),
+        "retention_percent": rounded(
+            extracted_header.get("retention_percent")
+            if retention_percent is None
+            else retention_percent
+        ),
+        "advance_recovery_percent": rounded(
+            extracted_header.get("advance_recovery_percent")
+            if advance_recovery_percent is None
+            else advance_recovery_percent
+        ),
+        "vat_percent": rounded(
+            extracted_header.get("vat_percent") if vat_percent is None else vat_percent
+        ),
     }
     document = {
         "invoice_id": invoice_id,
@@ -1370,6 +1689,16 @@ def get_invoice(project_ref: str, invoice_id: str) -> dict[str, Any]:
         **dict(result.get("extracted_header") or {}),
         "currency": result.get("currency") or "",
     }
+    ordered_ids = [
+        str(item.get("invoice_id") or "")
+        for item in sorted(
+            list(budget_invoices_collection.find({"project_id": project["project_id"]})),
+            key=_invoice_sort_key,
+        )
+    ]
+    result["billing_sequence"] = (
+        ordered_ids.index(invoice_id) + 1 if invoice_id in ordered_ids else result.get("sequence")
+    )
     return result
 
 
@@ -1420,13 +1749,50 @@ def review_invoice(
     )
     if start and end and start > end:
         raise HTTPException(422, "Billing start date must be on or before billing end date")
+    if end and cutoff and end > cutoff:
+        raise HTTPException(422, "Billing cutoff date must be on or after billing end date")
+    resolved_invoice_date = parse_iso_date(
+        reviewed_header.get("invoice_date") or document.get("invoice_date"),
+        field="invoice_date",
+    )
+    if resolved_invoice_date and cutoff and resolved_invoice_date < cutoff:
+        raise HTTPException(422, "Invoice date must be on or after the billing cutoff date")
+    resolved_invoice_number = str(
+        reviewed_header.get("invoice_number") or document.get("invoice_number") or ""
+    ).strip()
+    if not resolved_invoice_number:
+        raise HTTPException(422, "Invoice number is required before verification")
+    duplicate_number = budget_invoices_collection.find_one(
+        {
+            "project_id": project_id,
+            "invoice_id": {"$ne": invoice_id},
+            "invoice_number": resolved_invoice_number,
+            "status": {"$ne": "rejected"},
+        }
+    )
+    if duplicate_number:
+        raise HTTPException(409, "This invoice number already exists in the project budget")
+    reviewed_header.update(
+        {
+            "invoice_number": resolved_invoice_number,
+            "invoice_date": resolved_invoice_date,
+            "billing_start_date": start,
+            "billing_end_date": end,
+            "billing_cutoff_date": cutoff,
+            "retention_percent": rounded(max(0.0, number(reviewed_header.get("retention_percent")))),
+            "advance_recovery_percent": rounded(
+                max(0.0, number(reviewed_header.get("advance_recovery_percent")))
+            ),
+            "vat_percent": rounded(max(0.0, number(reviewed_header.get("vat_percent")))),
+        }
+    )
     now = utc_now()
     update = {
         "reviewed_header": reviewed_header,
         "reviewed_lines": normalized,
         "review_note": str(note or "").strip(),
-        "invoice_number": str(reviewed_header.get("invoice_number") or document.get("invoice_number") or "").strip(),
-        "invoice_date": parse_iso_date(reviewed_header.get("invoice_date") or document.get("invoice_date"), field="invoice_date"),
+        "invoice_number": resolved_invoice_number,
+        "invoice_date": resolved_invoice_date,
         "billing_start_date": start,
         "billing_end_date": end,
         "billing_cutoff_date": cutoff,
@@ -1455,7 +1821,11 @@ def review_invoice(
 def _effective_variations(
     project_id: str, cutoff: str
 ) -> dict[str, list[dict[str, Any]]]:
-    query: dict[str, Any] = {"project_id": project_id, "status": "approved"}
+    query: dict[str, Any] = {
+        "project_id": project_id,
+        "status": "approved",
+        "boq_item_id": {"$nin": ["", None]},
+    }
     if cutoff:
         query["effective_date"] = {"$lte": cutoff}
     output: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1755,12 +2125,14 @@ def calculate_invoice_line(
     cumulative_qty = previous_qty + current_qty
     cumulative_amount = previous_amount + current_amount
 
-    manual_percent = invoice_line.get("manual_verified_percent")
     activity_percent = number((activity or {}).get("physical_progress_percent"))
+    has_approved_activity_evidence = (
+        number((activity or {}).get("approved_evidence_count")) > 0
+    )
     supported_percent = (
-        min(100.0, max(0.0, number(manual_percent)))
-        if manual_percent is not None
-        else min(100.0, max(0.0, activity_percent))
+        min(100.0, max(0.0, activity_percent))
+        if has_approved_activity_evidence
+        else 0.0
     )
     supported_qty = max(0.0, revised_qty * supported_percent / 100.0)
     supported_amount = max(0.0, revised_amount * supported_percent / 100.0)
@@ -1770,14 +2142,17 @@ def calculate_invoice_line(
         not normalize_unit(boq_item.get("unit"))
         or normalize_unit(boq_item.get("unit")) == normalize_unit(material.get("unit"))
     )
-    if material_is_linked and material_unit_matches and number(material.get("accepted_qty")) > 0:
-        supported_qty = min(supported_qty, number(material.get("accepted_qty")))
+    if material_is_linked and material_unit_matches:
+        supported_qty = min(supported_qty, max(0.0, number(material.get("accepted_qty"))))
         if revised_qty > 0:
             supported_amount = min(supported_amount, revised_amount * supported_qty / revised_qty)
 
     commercial_remaining = max(revised_amount - previous_amount, 0.0)
     evidence_remaining = max(supported_amount - previous_amount, 0.0)
     recommended = min(current_amount, commercial_remaining, evidence_remaining)
+    commercial_remaining_qty = max(revised_qty - previous_qty, 0.0)
+    evidence_remaining_qty = max(supported_qty - previous_qty, 0.0)
+    recommended_qty = min(current_qty, commercial_remaining_qty, evidence_remaining_qty)
 
     status = "verified"
     if cumulative_qty > revised_qty + VERIFICATION_TOLERANCE or cumulative_amount > revised_amount + VERIFICATION_TOLERANCE:
@@ -1820,6 +2195,14 @@ def calculate_invoice_line(
     if match_method == "description" and match_confidence < 0.9:
         status = "needs_review" if status == "verified" else status
         reasons.append("Description-based BOQ mapping requires reviewer confirmation.")
+    if invoice_line.get("manual_verified_percent") not in {None, ""}:
+        status = "needs_review" if status == "verified" else status
+        reasons.append(
+            "Manual verified percentage is not payment evidence. Approve Activity/tour evidence instead."
+        )
+    if status != "verified":
+        recommended = 0.0
+        recommended_qty = 0.0
     if not reasons and status == "verified":
         reasons.append("Claim is within revised BOQ limits and supported by approved progress evidence.")
 
@@ -1845,6 +2228,7 @@ def calculate_invoice_line(
             "verified_progress_percent": rounded(supported_percent),
             "verified_cumulative_qty": rounded(supported_qty),
             "verified_cumulative_amount": rounded(supported_amount),
+            "recommended_current_qty": rounded(max(recommended_qty, 0.0)),
             "recommended_current_amount": rounded(max(recommended, 0.0)),
             "variance_amount": rounded(max(cumulative_amount - supported_amount, 0.0)),
             "verification_status": status,
@@ -2017,7 +2401,7 @@ def rebuild_invoice_history(
                 certified_lines = [
                     {
                         "boq_item_id": item.get("boq_item_id"),
-                        "certified_current_qty": item.get("current_claimed_qty"),
+                        "certified_current_qty": item.get("recommended_current_qty"),
                         "certified_current_amount": item.get("recommended_current_amount"),
                     }
                     for item in results
@@ -2046,11 +2430,14 @@ def verify_invoice(
 ) -> dict[str, Any]:
     project = resolve_project(project_ref)
     project_id = project["project_id"]
+    _require_ready_active_boq(project_id)
     document = budget_invoices_collection.find_one(
         {"project_id": project_id, "invoice_id": invoice_id}
     )
     if not document:
         raise HTTPException(404, "Invoice/payment application not found")
+    if document.get("status") in {"certified", "paid", "rejected"}:
+        raise HTTPException(409, "Certified, paid, or rejected invoices cannot be re-verified")
     if document.get("status") == "needs_review" and not document.get("reviewed_lines"):
         raise HTTPException(409, "Review the extracted invoice before verification")
     rebuild_invoice_history(project_id, user=user, audit_event=False)
@@ -2069,6 +2456,8 @@ def verify_invoice(
         "created_by_user_id": user.user_id,
         "created_by_email": user.email,
     }
+    flagged_line_count = int((run["comparison"] or {}).get("flagged_line_count") or 0)
+    next_status = "verified" if flagged_line_count == 0 else "needs_review"
     budget_verification_runs_collection.insert_one(run)
     budget_invoices_collection.update_one(
         {"project_id": project_id, "invoice_id": invoice_id},
@@ -2076,10 +2465,10 @@ def verify_invoice(
             "$set": {
                 "verification_version": version,
                 "latest_verification_run_id": run["verification_run_id"],
-                "verified_at": run["created_at"],
+                "verification_checked_at": run["created_at"],
                 "verified_by_user_id": user.user_id,
                 "verified_by_email": user.email,
-                "status": "verified",
+                "status": next_status,
                 "updated_at": run["created_at"],
             }
         },
@@ -2088,11 +2477,12 @@ def verify_invoice(
         project_id=project_id,
         entity_type="invoice",
         entity_id=invoice_id,
-        event_type="verified",
+        event_type="verified" if next_status == "verified" else "verification_blocked",
         user=user,
         details={
             "version": version,
-            "flagged_line_count": (run["comparison"] or {}).get("flagged_line_count", 0),
+            "flagged_line_count": flagged_line_count,
+            "status": next_status,
         },
     )
     return get_invoice(project_id, invoice_id)
@@ -2119,12 +2509,10 @@ def decide_invoice(
     )
     if not invoice:
         raise HTTPException(404, "Invoice/payment application not found")
-    if normalized_action == "certify" and invoice.get("status") not in {
-        "verified",
-        "on_hold",
-        "correction_requested",
-    }:
+    if normalized_action == "certify" and invoice.get("status") != "verified":
         raise HTTPException(409, "Verify the invoice before certification")
+    if normalized_action == "certify":
+        _require_ready_active_boq(project_id)
     now = utc_now()
     status = {
         "certify": "certified",
@@ -2151,20 +2539,37 @@ def decide_invoice(
     }
     if normalized_action == "certify":
         results = list(invoice.get("verification_results") or [])
+        flagged_line_count = int(
+            number((invoice.get("comparison") or {}).get("flagged_line_count"))
+        )
+        if flagged_line_count:
+            raise HTTPException(
+                409,
+                "Resolve every flagged invoice line and run verification again before certification",
+            )
         recommended = sum(number(item.get("recommended_current_amount")) for item in results)
+        if recommended <= VERIFICATION_TOLERANCE:
+            raise HTTPException(409, "There is no verified amount available to certify")
         approved_gross = max(0.0, number(certified_amount) if certified_amount is not None else recommended)
         if approved_gross > recommended + VERIFICATION_TOLERANCE:
             raise HTTPException(422, "Certified amount cannot exceed the verified recommendation")
+        if (
+            abs(approved_gross - recommended) > VERIFICATION_TOLERANCE
+            and len(str(note or "").strip()) < 3
+        ):
+            raise HTTPException(422, "A note is required when changing the recommended amount")
         ratio = approved_gross / recommended if recommended > 0 else 0.0
         certified_lines = [
             {
                 "boq_item_id": item.get("boq_item_id"),
                 "line_id": item.get("line_id"),
-                "certified_current_qty": rounded(number(item.get("current_claimed_qty")) * ratio),
+                "certified_current_qty": rounded(
+                    number(item.get("recommended_current_qty")) * ratio
+                ),
                 "certified_current_amount": rounded(number(item.get("recommended_current_amount")) * ratio),
             }
             for item in results
-            if item.get("boq_item_id")
+            if item.get("boq_item_id") and item.get("verification_status") == "verified"
         ]
         comparison = invoice.get("comparison") or {}
         retention_percent = number(comparison.get("retention_percent"))
@@ -2242,14 +2647,21 @@ def record_payment(
 ) -> dict[str, Any]:
     project = resolve_project(project_ref)
     project_id = project["project_id"]
+    _require_ready_active_boq(project_id)
     invoice = budget_invoices_collection.find_one(
         {"project_id": project_id, "invoice_id": invoice_id}
     )
     if not invoice:
         raise HTTPException(404, "Invoice/payment application not found")
-    if invoice.get("status") not in {"certified", "paid"}:
+    if invoice.get("status") != "certified":
         raise HTTPException(409, "Only a certified invoice can receive a payment")
     resolved_date = parse_iso_date(payment_date, field="payment_date", required=True)
+    resolved_reference = str(reference or "").strip()
+    if len(resolved_reference) < 2:
+        raise HTTPException(422, "Payment reference is required")
+    certified_at = str(invoice.get("certified_at") or "")[:10]
+    if certified_at and resolved_date < certified_at:
+        raise HTTPException(422, "Payment date cannot be before the certification date")
     existing_paid = sum(number(item.get("amount")) for item in invoice.get("payments") or [])
     certified_payable = number(invoice.get("certified_payable_amount"))
     paid_total, status = calculate_payment_state(
@@ -2262,7 +2674,7 @@ def record_payment(
         "payment_id": f"payment_{uuid4().hex}",
         "amount": rounded(paid_amount),
         "payment_date": resolved_date,
-        "reference": str(reference or "").strip(),
+        "reference": resolved_reference,
         "note": str(note or "").strip(),
         "recorded_at": utc_now(),
         "recorded_by_user_id": user.user_id,
@@ -2305,7 +2717,13 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
     variations = list(
         budget_variations_collection.find({"project_id": project_id}).sort([("effective_date", -1)])
     )
-    approved_variations = [item for item in variations if item.get("status") == "approved"]
+    active_item_ids = {str(item.get("boq_item_id") or "") for item in boq_items}
+    approved_variations = [
+        item
+        for item in variations
+        if item.get("status") == "approved"
+        and str(item.get("boq_item_id") or "") in active_item_ids
+    ]
     original_contract = sum(number(item.get("contract_amount")) for item in boq_items)
     variation_amount = sum(number(item.get("amount_delta")) for item in approved_variations)
     revised_contract = original_contract + variation_amount
@@ -2316,25 +2734,56 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
         for item in invoices
         for payment in (item.get("payments") or [])
     )
-    latest = invoices[-1] if invoices else {}
+    reporting_invoices = [item for item in invoices if item.get("status") != "rejected"]
+    latest = reporting_invoices[-1] if reporting_invoices else {}
     latest_comparison = latest.get("comparison") or {}
     cumulative_claimed = number(latest_comparison.get("cumulative_claimed_amount"))
-    current_payable = number(latest_comparison.get("recommended_payable_amount"))
-    physical_progress = number(latest_comparison.get("project_physical_progress_percentage"))
-    if not invoices:
-        try:
-            physical_progress = number(
-                (build_baseline_comparison(project_id) or {}).get("summary", {}).get("actual_percent")
-            )
-        except Exception:
-            physical_progress = 0.0
+    current_payable = (
+        number(latest_comparison.get("recommended_payable_amount"))
+        if latest.get("status") in {"needs_review", "reviewed", "verified"}
+        else 0.0
+    )
+    try:
+        schedule_analysis = build_baseline_comparison(project_id) or {}
+    except Exception:
+        schedule_analysis = {}
+    physical_progress = number(
+        (schedule_analysis.get("summary") or {}).get("actual_percent")
+    )
+    planned_curve = list((schedule_analysis.get("curves") or {}).get("planned") or [])
+    actual_curve = list((schedule_analysis.get("curves") or {}).get("actual") or [])
+
+    def planned_percent_as_of(raw_date: Any) -> float:
+        target = str(raw_date or "")[:10]
+        eligible = [
+            item
+            for item in planned_curve
+            if str(item.get("date") or "")[:10] <= target
+        ]
+        return number((eligible[-1] if eligible else {}).get("percent"))
+
+    def actual_percent_as_of(raw_date: Any) -> float:
+        target = str(raw_date or "")[:10]
+        eligible = [
+            item for item in actual_curve if str(item.get("date") or "")[:10] <= target
+        ]
+        return number((eligible[-1] if eligible else {}).get("percent"))
     try:
         material_summary = get_material_summary(project_id)
     except Exception:
         material_summary = {}
     committed_value = number((material_summary.get("totals") or {}).get("committed_value"))
     exceptions: list[dict[str, Any]] = []
+    open_exception_statuses = {
+        "needs_review",
+        "reviewed",
+        "verified",
+        "on_hold",
+        "correction_requested",
+    }
     for invoice in reversed(invoices):
+        if invoice.get("status") not in open_exception_statuses:
+            continue
         for result in invoice.get("verification_results") or []:
             status = str(result.get("verification_status") or "")
             if status == "verified":
@@ -2351,6 +2800,7 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
                     "amount": result.get("current_claimed_amount"),
                     "variance_amount": result.get("variance_amount"),
                     "reasons": result.get("verification_reasons") or [],
+                    "resolution_status": "open",
                 }
             )
     financial_curve: list[dict[str, Any]] = []
@@ -2365,12 +2815,31 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
             {
                 "date": invoice.get("billing_cutoff_date") or invoice.get("invoice_date"),
                 "invoice_id": invoice.get("invoice_id"),
+                "planned_percent": rounded(
+                    planned_percent_as_of(
+                        invoice.get("billing_cutoff_date") or invoice.get("invoice_date")
+                    )
+                ),
                 "claimed_percent": rounded(number(comparison.get("cumulative_claimed_amount")) / revised_contract * 100 if revised_contract else 0.0),
                 "certified_percent": rounded(certified_running / revised_contract * 100 if revised_contract else 0.0),
                 "paid_percent": rounded(paid_running / revised_contract * 100 if revised_contract else 0.0),
                 "physical_percent": rounded(number(comparison.get("project_physical_progress_percentage"))),
             }
         )
+    if not financial_curve:
+        for point in planned_curve:
+            point_date = str(point.get("date") or "")[:10]
+            financial_curve.append(
+                {
+                    "date": point_date,
+                    "invoice_id": "",
+                    "planned_percent": rounded(point.get("percent")),
+                    "claimed_percent": 0.0,
+                    "certified_percent": 0.0,
+                    "paid_percent": 0.0,
+                    "physical_percent": rounded(actual_percent_as_of(point_date)),
+                }
+            )
     active_boq_public = _public(boq)
     if active_boq_public:
         active_boq_public["currency"] = (
@@ -2389,7 +2858,13 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
             "revised_contract_amount": rounded(revised_contract),
             "approved_variation_count": len(approved_variations),
             "pending_variation_count": sum(1 for item in variations if item.get("status") == "pending"),
+            "validation": _active_boq_validation(project_id),
         }
+    invoices_public = []
+    for billing_sequence, invoice in enumerate(invoices, start=1):
+        invoices_public.append(
+            {**_public(invoice), "billing_sequence": billing_sequence}
+        )
     return {
         "project_id": project_id,
         "site_name": project["site_name"],
@@ -2423,12 +2898,16 @@ def get_budget_workspace(project_ref: str) -> dict[str, Any]:
             "vat_amount": rounded(latest_comparison.get("vat_amount")),
             "invoice_count": len(invoices),
             "exception_count": len(exceptions),
+            "budget_ready": bool(
+                active_boq_public
+                and ((active_boq_public.get("summary") or {}).get("validation") or {}).get("is_ready")
+            ),
         },
         "active_boq": active_boq_public,
         "materials_boq_sources": materials_boq_sources,
         "boq_items": [_public(item) for item in boq_items],
         "variations": [_public(item) for item in variations],
-        "invoices": [_public(item) for item in reversed(invoices)],
+        "invoices": list(reversed(invoices_public)),
         "exceptions": exceptions,
         "financial_curve": financial_curve,
         "material_summary": public_value(material_summary),
