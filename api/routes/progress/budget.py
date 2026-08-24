@@ -19,6 +19,7 @@ from services.progress.budget.budget_service import (
     list_invoices,
     list_variations,
     record_payment,
+    reset_budget_data,
     review_boq,
     review_invoice,
     upload_boq,
@@ -62,6 +63,12 @@ class InvoicePaymentRequest(BaseModel):
     note: str = Field("", max_length=2000)
 
 
+class BudgetResetRequest(BaseModel):
+    scope: Literal["pending", "applications", "all"]
+    reason: str = Field(..., min_length=3, max_length=1000)
+    confirmation: str = Field(..., min_length=3, max_length=100)
+
+
 @router.get("/projects/{project_id}/budget")
 def project_budget_workspace(
     project_id: str,
@@ -69,6 +76,22 @@ def project_budget_workspace(
 ):
     del current_user
     return get_budget_workspace(project_id)
+
+
+@router.post("/projects/{project_id}/budget/reset")
+def reset_project_budget(
+    project_id: str,
+    payload: BudgetResetRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return reset_budget_data(
+        project_ref=project_id,
+        scope=payload.scope,
+        reason=payload.reason,
+        confirmation=payload.confirmation,
+        user=current_user,
+    )
 
 
 @router.get("/projects/{project_id}/budget/boqs")

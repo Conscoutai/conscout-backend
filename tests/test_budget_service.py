@@ -13,6 +13,7 @@ from services.progress.budget.budget_service import (
     _boq_validation,
     _excel_rows,
     _extract_financial_header,
+    budget_record_matches_reset_scope,
     calculate_invoice_line,
     calculate_payment_state,
     material_boq_to_budget_payload,
@@ -51,7 +52,13 @@ def _invoice_line(**overrides) -> dict:
     return value
 
 
-def _calculate(line: dict, *, previous_amount: float = 200, previous_qty: float = 20, activity_percent: float = 50):
+def _calculate(
+    line: dict,
+    *,
+    previous_amount: float = 200,
+    previous_qty: float = 20,
+    activity_percent: float = 50,
+):
     return calculate_invoice_line(
         invoice_line=line,
         boq_item=_boq_item(),
@@ -121,7 +128,10 @@ def test_pending_material_inspection_forces_review_without_proving_installation(
     )
 
     assert result["verification_status"] == "needs_review"
-    assert any("pending inspection" in reason.lower() for reason in result["verification_reasons"])
+    assert any(
+        "pending inspection" in reason.lower()
+        for reason in result["verification_reasons"]
+    )
     assert result["recommended_current_amount"] == 0
 
 
@@ -156,7 +166,10 @@ def test_manual_verified_percent_is_not_accepted_as_payment_evidence():
 
     assert result["verification_status"] == "needs_review"
     assert result["recommended_current_amount"] == 0
-    assert any("not payment evidence" in reason.lower() for reason in result["verification_reasons"])
+    assert any(
+        "not payment evidence" in reason.lower()
+        for reason in result["verification_reasons"]
+    )
 
 
 def test_source_cumulative_invoice_value_derives_current_claim_after_previous():
@@ -373,6 +386,24 @@ def test_same_boq_source_is_reused_regardless_of_revision_state():
     assert should_reuse_uploaded_boq(draft)
 
 
+def test_budget_reset_scopes_preserve_active_financial_records_until_full_reset():
+    active_boq = {"status": "active", "is_active": True}
+    draft_boq = {"status": "needs_review", "is_active": False}
+    draft_invoice = {"status": "reviewed"}
+    held_invoice = {"status": "on_hold"}
+    paid_invoice = {"status": "paid"}
+
+    assert not budget_record_matches_reset_scope("boq", active_boq, "pending")
+    assert budget_record_matches_reset_scope("boq", draft_boq, "pending")
+    assert budget_record_matches_reset_scope("invoice", draft_invoice, "pending")
+    assert not budget_record_matches_reset_scope("invoice", held_invoice, "pending")
+    assert not budget_record_matches_reset_scope("invoice", paid_invoice, "pending")
+    assert budget_record_matches_reset_scope("invoice", paid_invoice, "applications")
+    assert not budget_record_matches_reset_scope("boq", active_boq, "applications")
+    assert budget_record_matches_reset_scope("boq", active_boq, "all")
+    assert budget_record_matches_reset_scope("invoice", paid_invoice, "all")
+
+
 def test_payment_state_supports_partial_and_full_payment_without_overpayment():
     assert calculate_payment_state(
         amount=250, existing_paid=100, certified_payable=500
@@ -382,17 +413,13 @@ def test_payment_state_supports_partial_and_full_payment_without_overpayment():
     ) == (500, "paid")
 
     with pytest.raises(HTTPException, match="cannot exceed") as error:
-        calculate_payment_state(
-            amount=401, existing_paid=100, certified_payable=500
-        )
+        calculate_payment_state(amount=401, existing_paid=100, certified_payable=500)
     assert error.value.status_code == 422
 
 
 def test_payment_state_rejects_an_already_paid_invoice():
     with pytest.raises(HTTPException, match="already been paid") as error:
-        calculate_payment_state(
-            amount=1, existing_paid=500, certified_payable=500
-        )
+        calculate_payment_state(amount=1, existing_paid=500, certified_payable=500)
     assert error.value.status_code == 409
 
 
