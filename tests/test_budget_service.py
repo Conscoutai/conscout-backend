@@ -16,6 +16,7 @@ from services.progress.budget.budget_service import (
     budget_record_matches_reset_scope,
     calculate_invoice_line,
     calculate_payment_state,
+    extract_priced_boq_lines,
     material_boq_to_budget_payload,
     material_documents_as_of,
     normalize_boq_lines,
@@ -283,6 +284,84 @@ def test_signed_boq_summary_amounts_are_detected_by_arithmetic_reconciliation():
         "source_vat_amount": 3300202.88,
         "source_total_amount": 25301555.4,
     }
+
+
+def test_priced_pdf_parser_handles_wrapped_groups_composite_and_continuation_rows():
+    pages = [
+        """HARDSCAPE WORKS
+S.NO DESCRIPTION QUANTITY UNIT RATE AMOUNT (SAR)
+17 Site Furnitures
+A Name Board 1 Nos 100.00 100.00
+D Shade Structures
+a. Long Type A Nos 8 B & 2 H 45.00
+450.00
+18 Skate Area
+A. Concrete Skate Area
+m2 20
+10.00
+200.00
+19 OUT OF SCOPE WORK
+35 m2 - -
+Page total B1/1 750.00 SAR""",
+        """SOFTSCAPE WORKS
+S.NO DESCRIPTION QUANTITY UNIT RATE AMOUNT (SAR)
+A Washingtonia Robusta 10 Nos 10.00 100.00
+Washingtonia Robusta tall 5 Nos 20.00 100.00
+Page total B2/1 200.00 SAR""",
+        """IRRIGATION WORKS
+S.NO DESCRIPTION QUANTITY UNIT RATE AMOUNT (SAR)
+1
+PVC pipe work
+1-1 UPVC 160 mm 10 Lm 5.00 50.00
+2
+Solenoid valve complete
+5 No. 10.00
+50.00""",
+    ]
+
+    lines, warnings = extract_priced_boq_lines(pages)
+
+    assert len(lines) == 7
+    assert sum(line["contract_amount"] for line in lines) == 1050
+    composite = next(line for line in lines if line["contract_amount"] == 450)
+    assert composite["contract_qty"] == 10
+    assert composite["unit"] == "PCS"
+    assert any(item["code"] == "unpriced_boq_rows_excluded" for item in warnings)
+
+
+def test_materials_source_import_uses_reconciled_full_priced_contract_and_links_rows():
+    header, lines, warnings = material_boq_to_budget_payload(
+        {
+            "confirmed_header": {
+                "currency": "SAR",
+                "source_subtotal_amount": 1000,
+            },
+            "confirmed_lines": [
+                {
+                    "material_id": "material-paver",
+                    "item_number": "1",
+                    "description": "Supply and install pavers",
+                    "unit": "M2",
+                    "planned_qty": 10,
+                    "contract_unit_rate": 100,
+                    "line_amount": 1000,
+                }
+            ],
+            "extracted_text": (
+                "HARDSCAPE WORKS\n"
+                "S.NO DESCRIPTION QUANTITY UNIT RATE AMOUNT (SAR)\n"
+                "1 Supply and install pavers 10 m2 100.00 1,000.00\n\f\n"
+                "BILL SUMMARY 1,000.00 150.00 1,150.00 "
+                "TOTAL AMOUNT SUBTOTAL TAX%"
+            ),
+        }
+    )
+
+    assert header["source_subtotal_amount"] == 1000
+    assert len(lines) == 1
+    assert lines[0]["contract_amount"] == 1000
+    assert lines[0]["material_id"] == "material-paver"
+    assert any(item["code"] == "full_priced_boq_reconciled" for item in warnings)
 
 
 def test_confirmed_materials_boq_converts_to_linked_budget_lines():

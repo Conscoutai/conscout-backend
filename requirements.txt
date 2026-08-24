@@ -10,7 +10,7 @@ fpdf
 ezdxf
 exif
 pdf2image
-pypdf
+pypdf>=6.10.0
 openpyxl
 pypdfium2
 pytesseract

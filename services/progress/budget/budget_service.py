@@ -337,6 +337,330 @@ def _extract_financial_header(text: str, document_type: str) -> dict[str, Any]:
     }
 
 
+_PRICED_BOQ_ITEM = re.compile(
+    r"^(?P<item>(?:[A-Z]\.?|[a-z]\.|[1-9]\d?(?:-[1-9]\d?)*))\s+(?P<text>.+)$"
+)
+_PRICED_BOQ_BARE_ITEM = re.compile(
+    r"^(?P<item>(?:[A-Z]\.?|[a-z]\.|[1-9]\d?(?:-[1-9]\d?)*))$"
+)
+_PRICED_BOQ_NUMBER = r"(?:[0-9][0-9,]*(?:\.[0-9]+)?)"
+_PRICED_BOQ_UNIT = (
+    r"(?:ITEMS?|NOS?\.?|PCS?|EA|EACH|LM|L\.M\.?|M2|M3|SQM|SQ\.M\.?|LS|LOT)"
+)
+_PRICED_BOQ_FINANCIAL_PATTERNS = (
+    re.compile(
+        rf"(?P<qty>{_PRICED_BOQ_NUMBER})\s+"
+        rf"(?P<unit>{_PRICED_BOQ_UNIT})\s+"
+        rf"(?P<rate>{_PRICED_BOQ_NUMBER})\s+"
+        rf"(?P<amount>{_PRICED_BOQ_NUMBER})\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<unit>{_PRICED_BOQ_UNIT})\s+"
+        rf"(?P<qty>{_PRICED_BOQ_NUMBER})\s+"
+        rf"(?P<rate>{_PRICED_BOQ_NUMBER})\s+"
+        rf"(?P<amount>{_PRICED_BOQ_NUMBER})\s*$",
+        re.IGNORECASE,
+    ),
+)
+_PRICED_BOQ_PARTIAL_FINANCIAL_PATTERNS = (
+    re.compile(
+        rf"{_PRICED_BOQ_NUMBER}\s+{_PRICED_BOQ_UNIT}"
+        rf"(?:\s+{_PRICED_BOQ_NUMBER})?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"{_PRICED_BOQ_UNIT}\s+{_PRICED_BOQ_NUMBER}"
+        rf"(?:\s+{_PRICED_BOQ_NUMBER})?\s*$",
+        re.IGNORECASE,
+    ),
+)
+_PRICED_BOQ_UNIT_SEARCH = re.compile(rf"\b(?P<unit>{_PRICED_BOQ_UNIT})\b", re.I)
+_PRICED_BOQ_NUMBER_SEARCH = re.compile(_PRICED_BOQ_NUMBER)
+
+
+def _priced_boq_category(page_text: str) -> str:
+    upper = str(page_text or "").upper()
+    if "BILL SUMMARY" in upper or "PAGE COLLECTION TO SUMMARY" in upper:
+        return ""
+    if "HARDSCAPE WORKS" in upper:
+        return "Hardscape"
+    if "SOFTSCAPE WORKS" in upper:
+        return "Softscape"
+    if "LIGHTING" in upper and "ELECTRICAL" in upper:
+        return "Lighting & Electrical"
+    if "IRRIGATION WORKS" in upper:
+        return "Irrigation"
+    return ""
+
+
+def _priced_boq_item_level(item_number: str) -> int:
+    token = str(item_number or "").rstrip(".")
+    if token.isdigit() or "-" in token:
+        return 0
+    return 2 if token.islower() else 1
+
+
+def _priced_boq_financials(
+    text: str,
+) -> tuple[float, str, float, float, int, list[str]] | None:
+    compact = " ".join(str(text or "").replace("\u00a0", " ").split())
+    if "OUT OF SCOPE" in compact.upper():
+        return None
+    for pattern in _PRICED_BOQ_FINANCIAL_PATTERNS:
+        match = pattern.search(compact)
+        if not match:
+            continue
+        quantity = number(match.group("qty"))
+        rate = number(match.group("rate"))
+        amount = number(match.group("amount"))
+        if quantity > 0 and rate > 0 and amount > 0:
+            return (
+                quantity,
+                normalize_unit(match.group("unit")),
+                rate,
+                amount,
+                match.start(),
+                [],
+            )
+
+    # Some signed BOQs contain a composite quantity, for example
+    # ``NOS 8 B & 2 H 450.00 4,500.00``. The printed rate and amount are
+    # authoritative, so safely derive the combined quantity (10) while keeping
+    # the first recognised unit.
+    numbers = list(_PRICED_BOQ_NUMBER_SEARCH.finditer(compact))
+    if len(numbers) < 2:
+        return None
+    rate_match, amount_match = numbers[-2:]
+    rate = number(rate_match.group())
+    amount = number(amount_match.group())
+    if rate <= 0 or amount <= 0:
+        return None
+    unit_matches = []
+    for match in _PRICED_BOQ_UNIT_SEARCH.finditer(compact):
+        if match.start() >= rate_match.start():
+            continue
+        numbers_after_unit = [
+            value
+            for value in numbers
+            if match.end() <= value.start() <= amount_match.start()
+        ]
+        composite_quantity = compact[match.end() : rate_match.start()]
+        raw_unit = match.group("unit").upper().rstrip(".")
+        if (
+            raw_unit in {"NO", "NOS"}
+            and len(numbers_after_unit) >= 4
+            and "&" in composite_quantity
+        ):
+            unit_matches.append(match)
+    if not unit_matches:
+        return None
+    unit_match = unit_matches[-1]
+    derived_quantity = amount / rate
+    if derived_quantity <= 0:
+        return None
+    return (
+        derived_quantity,
+        normalize_unit(unit_match.group("unit")),
+        rate,
+        amount,
+        unit_match.start(),
+        [
+            "Quantity was derived from the printed amount / unit rate because "
+            "the source uses a composite quantity label."
+        ],
+    )
+
+
+def _priced_boq_skip_line(value: str) -> bool:
+    upper = str(value or "").upper()
+    return bool(
+        not upper
+        or upper.startswith("PROJECT:")
+        or upper == "LANDSCAPE PACKAGE"
+        or upper.startswith("S.NO DESCRIPTION")
+        or upper.startswith("PAGE TOTAL")
+        or upper.startswith("PAGE COLLECTION")
+        or upper.startswith("COLLECTION TOTAL")
+        or re.match(r"^PAGE\s+\d+\s+OF\s+\d+", upper)
+        or upper
+        in {
+            "HARDSCAPE WORKS",
+            "HARDSCAPE WORKS (CONT'D)",
+            "SOFTSCAPE WORKS",
+            "SOFTSCAPE WORKS (CONT'D)",
+            "IRRIGATION WORKS",
+            "IRRIGATION WORKS (CONT'D)",
+            "LIGHTING & ELECTRICAL WORKS",
+            "LIGHTING & ELECTRICAL WORKS (CONT'D)",
+        }
+    )
+
+
+def extract_priced_boq_lines(
+    pages: Iterable[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract every priced contract row from a multi-section BOQ PDF.
+
+    Materials intentionally keeps only material-ledger rows. Budget instead
+    needs the complete priced contract, including work and installation rows.
+    This parser follows item blocks across wrapped PDF text and excludes group,
+    summary, and explicitly unpriced/out-of-scope rows.
+    """
+
+    output: list[dict[str, Any]] = []
+    excluded_unpriced = 0
+    for page_number, page_text in enumerate(list(pages), start=1):
+        category = _priced_boq_category(page_text)
+        if not category:
+            continue
+        parents: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+
+        def finish_current() -> bool:
+            nonlocal current, excluded_unpriced
+            if not current:
+                return False
+            combined = " ".join(current["parts"])
+            financials = _priced_boq_financials(combined)
+            if not financials:
+                upper = combined.upper()
+                if "OUT OF SCOPE" in upper or re.search(
+                    rf"{_PRICED_BOQ_NUMBER}\s+{_PRICED_BOQ_UNIT}\s+-\s+-\s*$",
+                    combined,
+                    re.IGNORECASE,
+                ):
+                    excluded_unpriced += 1
+                return False
+            quantity, unit, rate, amount, financial_start, line_warnings = financials
+            description = combined[:financial_start].strip(" -:")
+            parent_description = " ".join(
+                " ".join(parent["parts"]).strip(" -:") for parent in parents
+            ).strip()
+            if parent_description:
+                description = f"{parent_description}: {description}"
+            if len(description) < 4:
+                return False
+            item_path = ".".join(
+                [
+                    *(str(parent["item"]).rstrip(".") for parent in parents),
+                    str(current["item"]).rstrip("."),
+                ]
+            )
+            calculated = quantity * rate
+            if abs(calculated - amount) > max(1.0, amount * 0.05):
+                derived_quantity = amount / rate
+                if derived_quantity > 0:
+                    quantity = derived_quantity
+                    line_warnings.append(
+                        "Quantity was reconciled from the printed rate and amount."
+                    )
+            output.append(
+                {
+                    "line_id": f"line_{uuid4().hex}",
+                    "source_page": page_number,
+                    "item_number": item_path,
+                    "description": description,
+                    "category": category,
+                    "unit": unit,
+                    "contract_qty": rounded(quantity),
+                    "contract_unit_rate": rounded(rate),
+                    "contract_amount": rounded(amount),
+                    "confidence": 0.94 if not line_warnings else 0.86,
+                    "warnings": line_warnings,
+                }
+            )
+            return True
+
+        for raw_line in str(page_text or "").splitlines():
+            compact = " ".join(raw_line.replace("\u00a0", " ").split())
+            if current:
+                ready_financials = _priced_boq_financials(" ".join(current["parts"]))
+                if ready_financials:
+                    quantity, _, rate, amount, _, _ = ready_financials
+                    if abs(quantity * rate - amount) <= max(1.0, amount * 0.05):
+                        finish_current()
+                        current = None
+            if _priced_boq_skip_line(compact):
+                continue
+            if (
+                current
+                and "&" in " ".join(current["parts"])
+                and re.fullmatch(
+                    rf"[A-Z]\s+{_PRICED_BOQ_NUMBER}", compact, re.IGNORECASE
+                )
+            ):
+                current["parts"].append(compact)
+                continue
+            item_match = _PRICED_BOQ_ITEM.match(compact)
+            bare_item_match = _PRICED_BOQ_BARE_ITEM.match(compact)
+            if not item_match and bare_item_match:
+                item_match = bare_item_match
+            if (
+                current
+                and item_match
+                and str(item_match.group("item")).rstrip(".").isdigit()
+                and any(
+                    pattern.fullmatch(compact)
+                    for pattern in (
+                        *_PRICED_BOQ_FINANCIAL_PATTERNS,
+                        *_PRICED_BOQ_PARTIAL_FINANCIAL_PATTERNS,
+                    )
+                )
+            ):
+                current["parts"].append(compact)
+                continue
+            if not item_match:
+                if current:
+                    current["parts"].append(compact)
+                elif _priced_boq_financials(compact):
+                    current = {
+                        "item": f"row-{page_number}-{len(output) + 1}",
+                        "level": 1,
+                        "parts": [compact],
+                    }
+                continue
+
+            item = item_match.group("item")
+            level = _priced_boq_item_level(item)
+            completed = finish_current()
+            if current and not completed and current["level"] < level:
+                parents = [
+                    parent
+                    for parent in parents
+                    if int(parent["level"]) < current["level"]
+                ]
+                parents.append(current)
+            else:
+                parents = [parent for parent in parents if int(parent["level"]) < level]
+            current = {
+                "item": item,
+                "level": level,
+                "parts": [str(item_match.groupdict().get("text") or "")],
+            }
+        finish_current()
+
+    warnings: list[dict[str, Any]] = []
+    if excluded_unpriced:
+        warnings.append(
+            {
+                "code": "unpriced_boq_rows_excluded",
+                "message": (
+                    f"{excluded_unpriced} unpriced or out-of-scope BOQ row(s) were "
+                    "excluded from the payable contract baseline."
+                ),
+            }
+        )
+    if not output:
+        warnings.append(
+            {
+                "code": "priced_boq_table_not_detected",
+                "message": "No complete priced BOQ line-item table was detected.",
+            }
+        )
+    return output, warnings
+
+
 def _find_header_column(headers: list[str], candidates: Iterable[str]) -> int:
     normalized_candidates = [_header_key(item) for item in candidates]
     for index, header in enumerate(headers):
@@ -588,19 +912,43 @@ def extract_budget_document(
         raw_header["document_date"] = normalized_date
     lines: list[dict[str, Any]] = []
     if document_type == "boq":
-        for line in raw_lines:
-            quantity = number(line.get("planned_qty"))
-            rate = number(line.get("contract_unit_rate"))
-            amount = number(line.get("line_amount")) or quantity * rate
-            lines.append(
-                {
-                    **line,
-                    "contract_qty": quantity,
-                    "contract_unit_rate": rate,
-                    "contract_amount": amount,
-                    "category": str(line.get("category") or ""),
-                }
-            )
+        priced_lines, priced_warnings = extract_priced_boq_lines(pages)
+        expected_subtotal = number(raw_header.get("source_subtotal_amount"))
+        priced_total = sum(number(line.get("contract_amount")) for line in priced_lines)
+        priced_tolerance = max(1.0, expected_subtotal * BOQ_TOTAL_RELATIVE_TOLERANCE)
+        if priced_lines and (
+            expected_subtotal <= 0
+            or abs(priced_total - expected_subtotal) <= priced_tolerance
+        ):
+            lines = priced_lines
+            line_warnings = priced_warnings
+        else:
+            for line in raw_lines:
+                quantity = number(line.get("planned_qty"))
+                rate = number(line.get("contract_unit_rate"))
+                amount = number(line.get("line_amount")) or quantity * rate
+                lines.append(
+                    {
+                        **line,
+                        "contract_qty": quantity,
+                        "contract_unit_rate": rate,
+                        "contract_amount": amount,
+                        "category": str(line.get("category") or ""),
+                    }
+                )
+            if priced_lines:
+                line_warnings = [
+                    *priced_warnings,
+                    *line_warnings,
+                    {
+                        "code": "priced_boq_total_requires_review",
+                        "message": (
+                            "The full priced-table extraction did not reconcile to the "
+                            "printed contract subtotal, so the conservative table "
+                            "extraction was retained for review."
+                        ),
+                    },
+                ]
     else:
         for line in raw_lines:
             cumulative_qty = number(line.get("certified_qty"))
@@ -922,6 +1270,86 @@ def upload_boq(
         sort=[("version", -1)],
     )
     if should_reuse_uploaded_boq(existing):
+        existing_validation = dict(
+            (existing.get("summary") or {}).get("validation") or {}
+        )
+        if (
+            existing.get("status") == "needs_review"
+            and not existing.get("is_active")
+            and not existing_validation.get("is_ready")
+        ):
+            refreshed_lines, refreshed_header, refreshed_warnings, refreshed_method = (
+                extract_budget_document(
+                    raw_bytes, filename=safe_name, document_type="boq"
+                )
+            )
+            refreshed_revision = str(
+                revision
+                or refreshed_header.get("revision")
+                or revision_from_filename(safe_name)
+            ).strip()
+            refreshed_currency = (
+                str(
+                    project_currency_code(project)
+                    or currency
+                    or refreshed_header.get("currency")
+                    or ""
+                )
+                .strip()
+                .upper()
+            )
+            refreshed_header = {
+                **dict(refreshed_header or {}),
+                "revision": refreshed_revision,
+                "currency": refreshed_currency,
+            }
+            normalized_refreshed_lines = normalize_boq_lines(refreshed_lines)
+            refreshed_summary = _boq_summary(
+                normalized_refreshed_lines, refreshed_header
+            )
+            if (refreshed_summary.get("validation") or {}).get("is_ready"):
+                budget_boqs_collection.update_one(
+                    {"project_id": project_id, "boq_id": existing["boq_id"]},
+                    {
+                        "$set": {
+                            "revision": refreshed_revision,
+                            "currency": refreshed_currency,
+                            "original_filename": safe_name,
+                            "extraction_method": refreshed_method,
+                            "extraction_warnings": refreshed_warnings,
+                            "extracted_header": refreshed_header,
+                            "extracted_lines": normalized_refreshed_lines,
+                            "summary": refreshed_summary,
+                            "storage_path": _store_source(
+                                project_id=project_id,
+                                entity_type="boq",
+                                entity_id=existing["boq_id"],
+                                filename=safe_name,
+                                raw_bytes=raw_bytes,
+                            ),
+                            "updated_at": utc_now(),
+                        },
+                        "$unset": {
+                            "reviewed_header": "",
+                            "reviewed_lines": "",
+                            "review_note": "",
+                            "reviewed_at": "",
+                            "reviewed_by_user_id": "",
+                            "reviewed_by_email": "",
+                        },
+                    },
+                )
+                _audit(
+                    project_id=project_id,
+                    entity_type="boq",
+                    entity_id=existing["boq_id"],
+                    event_type="source_reprocessed",
+                    user=user,
+                    details={
+                        "filename": safe_name,
+                        "line_count": len(normalized_refreshed_lines),
+                    },
+                )
         logger.info(
             "Budget BOQ duplicate upload reused",
             extra={
@@ -1014,10 +1442,158 @@ def upload_boq(
     return {"status": "needs_review", "boq": _public(document)}
 
 
+def _link_priced_boq_materials(
+    priced_lines: Iterable[dict[str, Any]], material_lines: Iterable[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    materials = [
+        dict(line)
+        for line in material_lines
+        if str(line.get("material_id") or "").strip()
+    ]
+    used_material_ids: set[str] = set()
+    output: list[dict[str, Any]] = []
+    linked_count = 0
+    for raw_line in priced_lines:
+        line = dict(raw_line)
+        line_unit = normalize_unit(line.get("unit"))
+        line_item = str(line.get("item_number") or "").strip().lower()
+        best: dict[str, Any] | None = None
+        best_score = 0.0
+        for material in materials:
+            material_id = str(material.get("material_id") or "").strip()
+            if material_id in used_material_ids:
+                continue
+            material_unit = normalize_unit(material.get("unit"))
+            if line_unit and material_unit and line_unit != material_unit:
+                continue
+            score = _match_score(
+                str(line.get("description") or ""),
+                str(material.get("description") or ""),
+            )
+            material_item = str(material.get("item_number") or "").strip().lower()
+            if (
+                line_item
+                and material_item
+                and (
+                    line_item == material_item
+                    or line_item.endswith(f".{material_item}")
+                )
+            ):
+                score = min(1.0, score + 0.18)
+            if score > best_score:
+                best = material
+                best_score = score
+        if best and best_score >= 0.68:
+            material_id = str(best.get("material_id") or "").strip()
+            line["material_id"] = material_id
+            line["material_match_confidence"] = rounded(best_score)
+            used_material_ids.add(material_id)
+            linked_count += 1
+        output.append(line)
+    return output, linked_count
+
+
+def _full_priced_material_boq(
+    document: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
+    confirmed_header = dict(document.get("confirmed_header") or {})
+    candidates: list[tuple[list[str], list[dict[str, Any]]]] = []
+    storage_path = str(document.get("storage_path") or "").strip()
+    if storage_path and Path(storage_path).suffix.lower() == ".pdf":
+        try:
+            source_path = Path(storage_path)
+            if source_path.is_file():
+                pages, _, page_warnings = extract_pdf_pages(
+                    source_path.read_bytes(),
+                    document_type_hint="boq",
+                    filename_hint=str(document.get("original_filename") or ""),
+                )
+                candidates.append((pages, page_warnings))
+        except Exception as error:
+            logger.warning(
+                "Budget could not re-read the Materials BOQ source",
+                extra={
+                    "document_id": document.get("document_id"),
+                    "error": str(error),
+                },
+            )
+    extracted_text = str(document.get("extracted_text") or "")
+    if extracted_text:
+        candidates.append((extracted_text.split("\n\f\n"), []))
+
+    best: (
+        tuple[
+            tuple[int, int, float],
+            dict[str, Any],
+            list[dict[str, Any]],
+            list[dict[str, Any]],
+        ]
+        | None
+    ) = None
+    for pages, page_warnings in candidates:
+        page_text = "\n\f\n".join(pages)
+        financial_header = _extract_financial_header(page_text, "boq")
+        lines, parser_warnings = extract_priced_boq_lines(pages)
+        line_total = sum(number(line.get("contract_amount")) for line in lines)
+        expected = number(
+            financial_header.get("source_subtotal_amount")
+            or confirmed_header.get("source_subtotal_amount")
+            or confirmed_header.get("expected_contract_amount")
+        )
+        tolerance = max(1.0, expected * BOQ_TOTAL_RELATIVE_TOLERANCE)
+        reconciled = bool(expected > 0 and abs(line_total - expected) <= tolerance)
+        score = (1 if reconciled else 0, len(lines), line_total)
+        value = (
+            score,
+            {**financial_header, **confirmed_header},
+            lines,
+            [*page_warnings, *parser_warnings],
+        )
+        if best is None or score > best[0]:
+            best = value
+
+    if not best or not best[2]:
+        return None
+    score, header, lines, warnings = best
+    expected = number(
+        header.get("source_subtotal_amount") or header.get("expected_contract_amount")
+    )
+    line_total = sum(number(line.get("contract_amount")) for line in lines)
+    tolerance = max(1.0, expected * BOQ_TOTAL_RELATIVE_TOLERANCE)
+    if expected <= 0 or abs(line_total - expected) > tolerance:
+        return None
+    linked_lines, linked_count = _link_priced_boq_materials(
+        lines, document.get("confirmed_lines") or []
+    )
+    warnings = [
+        {
+            "code": "imported_from_materials",
+            "message": (
+                "The complete priced contract BOQ was imported from the shared "
+                "Materials source file. Material-ledger rows remain linked for "
+                "delivery verification."
+            ),
+        },
+        {
+            "code": "full_priced_boq_reconciled",
+            "message": (
+                f"{len(lines)} payable BOQ line(s) reconcile to the printed contract "
+                f"subtotal; {linked_count} line(s) are linked to Materials."
+            ),
+        },
+        *warnings,
+    ]
+    return header, normalize_boq_lines(linked_lines), warnings
+
+
 def material_boq_to_budget_payload(
     document: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert a confirmed Materials BOQ into a reviewable Budget BOQ payload."""
+    full_priced_payload = _full_priced_material_boq(document)
+    if full_priced_payload:
+        return full_priced_payload
+
     source_header = dict(document.get("confirmed_header") or {})
     source_lines = [dict(line) for line in document.get("confirmed_lines") or []]
     refreshed_count = 0
@@ -1178,6 +1754,13 @@ def import_material_boq(
         "revision": revision,
         "currency": currency,
     }
+    extraction_method = (
+        "materials_full_priced_boq"
+        if any(
+            warning.get("code") == "full_priced_boq_reconciled" for warning in warnings
+        )
+        else "materials_confirmed_boq"
+    )
 
     existing = budget_boqs_collection.find_one(
         {
@@ -1200,15 +1783,25 @@ def import_material_boq(
             update.update(
                 revision=revision,
                 currency=currency,
-                extraction_method="materials_confirmed_boq",
+                extraction_method=extraction_method,
                 extraction_warnings=warnings,
                 extracted_header=extracted_header,
                 extracted_lines=extracted_lines,
                 summary=_boq_summary(extracted_lines, extracted_header),
             )
+        mongo_update: dict[str, Any] = {"$set": update}
+        if "extracted_lines" in update:
+            mongo_update["$unset"] = {
+                "reviewed_header": "",
+                "reviewed_lines": "",
+                "review_note": "",
+                "reviewed_at": "",
+                "reviewed_by_user_id": "",
+                "reviewed_by_email": "",
+            }
         budget_boqs_collection.update_one(
             {"project_id": project_id, "boq_id": existing["boq_id"]},
-            {"$set": update},
+            mongo_update,
         )
         return {
             "status": "already_imported",
@@ -1232,7 +1825,7 @@ def import_material_boq(
         "source_type": "materials_boq",
         "source_material_document_id": source["document_id"],
         "source_material_confirmed_at": source.get("confirmed_at"),
-        "extraction_method": "materials_confirmed_boq",
+        "extraction_method": extraction_method,
         "extraction_warnings": warnings,
         "extracted_header": extracted_header,
         "extracted_lines": extracted_lines,
@@ -1282,13 +1875,8 @@ def _materials_boq_sources(project: dict[str, Any]) -> list[dict[str, Any]]:
                     "source_sha256": source.get("source_sha256"),
                 }
             )
-        lines = list(source.get("confirmed_lines") or [])
-        contract_amount = sum(
-            number(line.get("line_amount"))
-            or number(line.get("planned_qty")) * number(line.get("contract_unit_rate"))
-            for line in lines
-        )
-        header = dict(source.get("confirmed_header") or {})
+        header, lines, _ = material_boq_to_budget_payload(source)
+        contract_amount = sum(number(line.get("contract_amount")) for line in lines)
         values.append(
             {
                 "document_id": source.get("document_id"),
