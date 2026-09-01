@@ -253,6 +253,9 @@ def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
         "author_type": _clean(message.get("author_type")),
         "author_name": _clean(message.get("author_name")),
         "body": _clean(message.get("body")),
+        "event_type": _clean(message.get("event_type")),
+        "event_from": _clean(message.get("event_from")),
+        "event_to": _clean(message.get("event_to")),
         "internal_note": message.get("internal_note") is True,
         "automated": message.get("automated") is True,
         "attachments": [
@@ -262,6 +265,122 @@ def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
         ],
         "created_at": int(message.get("created_at") or 0),
     }
+
+
+def _activity_message(
+    *,
+    ticket_id: str,
+    actor: AuthenticatedUser,
+    event_type: str,
+    event_from: str,
+    event_to: str,
+    body: str,
+    created_at: int,
+) -> dict[str, Any]:
+    return {
+        "message_id": uuid.uuid4().hex,
+        "ticket_id": ticket_id,
+        "author_type": "system",
+        "author_user_id": actor.user_id,
+        "author_email": _normalized_email(actor.email),
+        "author_name": _display_name(actor),
+        "body": body,
+        "event_type": event_type,
+        "event_from": event_from,
+        "event_to": event_to,
+        "internal_note": False,
+        "automated": True,
+        "attachments": [],
+        "created_at": created_at,
+    }
+
+
+def _ticket_activity_messages(
+    *,
+    ticket: dict[str, Any],
+    update: dict[str, Any],
+    actor: AuthenticatedUser,
+    starting_at: int,
+    include_assignment: bool = True,
+) -> list[dict[str, Any]]:
+    ticket_id = _clean(ticket.get("ticket_id"))
+    actor_name = _display_name(actor)
+    messages: list[dict[str, Any]] = []
+
+    previous_status = _clean(ticket.get("status")) or "open"
+    next_status = _clean(update.get("status")) or previous_status
+    if next_status != previous_status:
+        status_bodies = {
+            "open": f"{actor_name} reopened this ticket.",
+            "in_progress": f"{actor_name} moved this ticket to In progress.",
+            "waiting_for_user": f"{actor_name} is waiting for your reply.",
+            "resolved": f"{actor_name} marked this ticket as resolved.",
+            "closed": f"{actor_name} closed this ticket.",
+        }
+        messages.append(
+            _activity_message(
+                ticket_id=ticket_id,
+                actor=actor,
+                event_type="status_changed",
+                event_from=previous_status,
+                event_to=next_status,
+                body=status_bodies[next_status],
+                created_at=starting_at + len(messages),
+            )
+        )
+
+    previous_priority = _clean(ticket.get("priority")) or "normal"
+    next_priority = _clean(update.get("priority")) or previous_priority
+    if next_priority != previous_priority:
+        messages.append(
+            _activity_message(
+                ticket_id=ticket_id,
+                actor=actor,
+                event_type="priority_changed",
+                event_from=previous_priority,
+                event_to=next_priority,
+                body=(
+                    f"{actor_name} changed the ticket priority to "
+                    f"{next_priority.replace('_', ' ').title()}."
+                ),
+                created_at=starting_at + len(messages),
+            )
+        )
+
+    previous_assignee_id = _clean(ticket.get("assigned_admin_user_id"))
+    next_assignee_id = _clean(
+        update.get("assigned_admin_user_id", previous_assignee_id)
+    )
+    if include_assignment and next_assignee_id != previous_assignee_id:
+        previous_name = _clean(ticket.get("assigned_admin_name"))
+        next_name = _clean(update.get("assigned_admin_name"))
+        if not next_assignee_id:
+            body = f"{actor_name} returned this ticket to the Technical Support queue."
+        elif not previous_assignee_id and next_assignee_id == actor.user_id:
+            body = f"{next_name or actor_name} joined this ticket as your Technical Admin."
+        elif previous_name:
+            body = (
+                f"{actor_name} reassigned this ticket from {previous_name} "
+                f"to {next_name or 'Technical Support'}."
+            )
+        else:
+            body = (
+                f"{actor_name} assigned this ticket to "
+                f"{next_name or 'Technical Support'}."
+            )
+        messages.append(
+            _activity_message(
+                ticket_id=ticket_id,
+                actor=actor,
+                event_type="assignment_changed",
+                event_from=previous_assignee_id,
+                event_to=next_assignee_id,
+                body=body,
+                created_at=starting_at + len(messages),
+            )
+        )
+
+    return messages
 
 
 def _message_map(
@@ -728,7 +847,8 @@ def admin_update_ticket(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ticket = _find_admin_ticket(ticket_id, current_user)
-    update: dict[str, Any] = {"updated_at": _now_ms()}
+    now = max(_now_ms(), int(ticket.get("updated_at") or 0) + 2)
+    update: dict[str, Any] = {"updated_at": now}
     if payload.status.strip():
         status = _normalize_choice(payload.status, TICKET_STATUSES, "status")
         update["status"] = status
@@ -777,8 +897,19 @@ def admin_update_ticket(
             }
         )
 
+    activity_messages = _ticket_activity_messages(
+        ticket=ticket,
+        update=update,
+        actor=current_user,
+        starting_at=now,
+    )
+    for activity_message in activity_messages:
+        raw_helpdesk_messages_collection.insert_one(activity_message)
+    ticket_update: dict[str, Any] = {"$set": update}
+    if activity_messages:
+        ticket_update["$inc"] = {"message_count": len(activity_messages)}
     raw_helpdesk_tickets_collection.update_one(
-        {"ticket_id": _clean(ticket.get("ticket_id"))}, {"$set": update}
+        {"ticket_id": _clean(ticket.get("ticket_id"))}, ticket_update
     )
     refreshed = raw_helpdesk_tickets_collection.find_one(
         {"ticket_id": _clean(ticket.get("ticket_id"))}
@@ -809,7 +940,7 @@ async def admin_reply_to_ticket(
             status_code=400, detail="Reply must be between 1 and 10,000 characters."
         )
     saved = await _save_attachments(ticket_id=ticket_id, uploads=attachments)
-    now = _now_ms()
+    now = max(_now_ms(), int(ticket.get("updated_at") or 0) + 2)
     message = {
         "message_id": uuid.uuid4().hex,
         "ticket_id": _clean(ticket.get("ticket_id")),
@@ -845,11 +976,23 @@ async def admin_reply_to_ticket(
         update["status"] = next_status
         update["resolved_at"] = now if next_status == "resolved" else 0
         update["closed_at"] = now if next_status == "closed" else 0
+    activity_messages = _ticket_activity_messages(
+        ticket=ticket,
+        update=update,
+        actor=current_user,
+        starting_at=now + 1,
+        include_assignment=False,
+    )
+    for activity_message in activity_messages:
+        raw_helpdesk_messages_collection.insert_one(activity_message)
     raw_helpdesk_tickets_collection.update_one(
         {"ticket_id": _clean(ticket.get("ticket_id"))},
         {
             "$set": update,
-            "$inc": {"message_count": 1, "attachment_count": len(saved)},
+            "$inc": {
+                "message_count": 1 + len(activity_messages),
+                "attachment_count": len(saved),
+            },
         },
     )
     refreshed = raw_helpdesk_tickets_collection.find_one(

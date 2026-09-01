@@ -231,7 +231,19 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
         public_ticket = helpdesk.get_ticket(ticket_id, current_user=self.user)[
             "ticket"
         ]
-        self.assertEqual(len(public_ticket["messages"]), 2)
+        self.assertEqual(len(public_ticket["messages"]), 4)
+        activity_events = [
+            message
+            for message in public_ticket["messages"]
+            if message["author_type"] == "system"
+        ]
+        self.assertEqual(
+            [message["event_type"] for message in activity_events],
+            ["status_changed", "assignment_changed"],
+        )
+        self.assertEqual(activity_events[0]["event_to"], "in_progress")
+        self.assertIn("moved this ticket to In progress", activity_events[0]["body"])
+        self.assertIn("joined this ticket", activity_events[1]["body"])
 
         admin_reply = await helpdesk.admin_reply_to_ticket(
             ticket_id=ticket_id,
@@ -242,7 +254,30 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
             current_user=self.admin,
         )
         self.assertEqual(admin_reply["ticket"]["status"], "waiting_for_user")
-        self.assertEqual(len(admin_reply["ticket"]["messages"]), 4)
+        self.assertEqual(len(admin_reply["ticket"]["messages"]), 7)
+        customer_ticket = helpdesk.get_ticket(ticket_id, current_user=self.user)[
+            "ticket"
+        ]
+        self.assertEqual(len(customer_ticket["messages"]), 6)
+        waiting_event = customer_ticket["messages"][-1]
+        self.assertEqual(waiting_event["event_type"], "status_changed")
+        self.assertEqual(waiting_event["event_to"], "waiting_for_user")
+        self.assertIn("waiting for your reply", waiting_event["body"])
+
+        closed = helpdesk.admin_update_ticket(
+            ticket_id=ticket_id,
+            payload=helpdesk.AdminTicketUpdate(status="closed"),
+            current_user=self.admin,
+        )["ticket"]
+        self.assertEqual(closed["status"], "closed")
+        closed_event = closed["messages"][-1]
+        self.assertEqual(closed_event["author_type"], "system")
+        self.assertEqual(closed_event["event_type"], "status_changed")
+        self.assertEqual(closed_event["event_from"], "waiting_for_user")
+        self.assertEqual(closed_event["event_to"], "closed")
+        self.assertEqual(
+            closed_event["body"], "Technical Support closed this ticket."
+        )
 
     async def test_public_admin_reply_automatically_assigns_the_responder(self):
         created = await helpdesk.create_ticket(
