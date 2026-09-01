@@ -254,6 +254,7 @@ def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
         "author_name": _clean(message.get("author_name")),
         "body": _clean(message.get("body")),
         "internal_note": message.get("internal_note") is True,
+        "automated": message.get("automated") is True,
         "attachments": [
             _public_attachment(ticket_id, attachment)
             for attachment in message.get("attachments", [])
@@ -372,9 +373,11 @@ async def _create_ticket_record(
     ticket_id = uuid.uuid4().hex
     attachments = await _save_attachments(ticket_id=ticket_id, uploads=uploads)
     now = _now_ms()
+    acknowledgement_at = now + 1
+    ticket_number = _ticket_number()
     ticket = {
         "ticket_id": ticket_id,
-        "ticket_number": _ticket_number(),
+        "ticket_number": ticket_number,
         "subject": normalized_subject,
         "description": normalized_description,
         "category": normalized_category,
@@ -390,12 +393,13 @@ async def _create_ticket_record(
         "assigned_admin_email": "",
         "assigned_admin_name": "",
         "attachment_count": len(attachments),
-        "message_count": 1,
+        "message_count": 2,
         "linked_ai_flag_id": linked_ai_flag_id,
         "created_at": now,
         "updated_at": now,
         "last_user_reply_at": now,
         "last_admin_reply_at": 0,
+        "last_automated_reply_at": acknowledgement_at,
         "resolved_at": 0,
         "closed_at": 0,
     }
@@ -408,18 +412,44 @@ async def _create_ticket_record(
         "author_name": _display_name(current_user),
         "body": normalized_description,
         "internal_note": False,
+        "automated": False,
         "attachments": attachments,
         "created_at": now,
+    }
+    acknowledgement = {
+        "message_id": uuid.uuid4().hex,
+        "ticket_id": ticket_id,
+        "author_type": "support",
+        "author_user_id": "system",
+        "author_email": "support@conscout.com",
+        "author_name": "ConScout Technical Support",
+        "body": (
+            f"Thanks for contacting ConScout Technical Support. We've received "
+            f"your request as {ticket_number}. A Technical Admin will review it "
+            "and respond in this conversation. You can add any further details "
+            "here while our team investigates."
+        ),
+        "internal_note": False,
+        "automated": True,
+        "attachments": [],
+        "created_at": acknowledgement_at,
     }
     try:
         raw_helpdesk_tickets_collection.insert_one(ticket)
         raw_helpdesk_messages_collection.insert_one(message)
+        raw_helpdesk_messages_collection.insert_one(acknowledgement)
     except Exception:
         raw_helpdesk_tickets_collection.delete_one({"ticket_id": ticket_id})
         raw_helpdesk_messages_collection.delete_many({"ticket_id": ticket_id})
         shutil.rmtree(_ticket_storage_dir(ticket_id), ignore_errors=True)
         raise
-    return _serialize_ticket(ticket, messages=[_serialize_message(message)])
+    return _serialize_ticket(
+        ticket,
+        messages=[
+            _serialize_message(message),
+            _serialize_message(acknowledgement),
+        ],
+    )
 
 
 @router.post("/helpdesk/tickets", status_code=201)
@@ -545,6 +575,7 @@ async def reply_to_ticket(
         "author_name": _display_name(current_user),
         "body": normalized_body,
         "internal_note": False,
+        "automated": False,
         "attachments": saved,
         "created_at": now,
     }
@@ -788,6 +819,7 @@ async def admin_reply_to_ticket(
         "author_name": _display_name(current_user),
         "body": normalized_body,
         "internal_note": internal_note,
+        "automated": False,
         "attachments": saved,
         "created_at": now,
     }
@@ -801,6 +833,14 @@ async def admin_reply_to_ticket(
         "updated_at": now,
         "last_admin_reply_at": now,
     }
+    if not internal_note:
+        update.update(
+            {
+                "assigned_admin_user_id": current_user.user_id,
+                "assigned_admin_email": _normalized_email(current_user.email),
+                "assigned_admin_name": _display_name(current_user),
+            }
+        )
     if next_status:
         update["status"] = next_status
         update["resolved_at"] = now if next_status == "resolved" else 0

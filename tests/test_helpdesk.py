@@ -178,6 +178,16 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other_list["tickets"], [])
         self.assertEqual(ticket["priority"], "high")
         self.assertEqual(ticket["app"], "web")
+        self.assertEqual(ticket["message_count"], 2)
+        self.assertEqual(len(ticket["messages"]), 2)
+        acknowledgement = ticket["messages"][1]
+        self.assertEqual(acknowledgement["author_type"], "support")
+        self.assertEqual(
+            acknowledgement["author_name"], "ConScout Technical Support"
+        )
+        self.assertTrue(acknowledgement["automated"])
+        self.assertIn(ticket["ticket_number"], acknowledgement["body"])
+        self.assertIn("A Technical Admin will review it", acknowledgement["body"])
 
         replied = await helpdesk.reply_to_ticket(
             ticket_id=ticket["id"],
@@ -186,7 +196,7 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
             current_user=self.user,
         )
         self.assertEqual(replied["ticket"]["status"], "open")
-        self.assertEqual(len(replied["ticket"]["messages"]), 2)
+        self.assertEqual(len(replied["ticket"]["messages"]), 3)
 
     async def test_admin_assignment_reply_and_internal_note_workflow(self):
         created = await helpdesk.create_ticket(
@@ -221,7 +231,7 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
         public_ticket = helpdesk.get_ticket(ticket_id, current_user=self.user)[
             "ticket"
         ]
-        self.assertEqual(len(public_ticket["messages"]), 1)
+        self.assertEqual(len(public_ticket["messages"]), 2)
 
         admin_reply = await helpdesk.admin_reply_to_ticket(
             ticket_id=ticket_id,
@@ -232,7 +242,42 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
             current_user=self.admin,
         )
         self.assertEqual(admin_reply["ticket"]["status"], "waiting_for_user")
-        self.assertEqual(len(admin_reply["ticket"]["messages"]), 3)
+        self.assertEqual(len(admin_reply["ticket"]["messages"]), 4)
+
+    async def test_public_admin_reply_automatically_assigns_the_responder(self):
+        created = await helpdesk.create_ticket(
+            subject="Project report will not load",
+            description="The report remains on the loading screen.",
+            category="technical_issue",
+            priority="normal",
+            app="web",
+            attachments=None,
+            current_user=self.user,
+        )
+        ticket_id = created["ticket"]["id"]
+
+        internal_note = await helpdesk.admin_reply_to_ticket(
+            ticket_id=ticket_id,
+            body="Checking the report logs before responding.",
+            internal_note=True,
+            status="",
+            attachments=None,
+            current_user=self.admin,
+        )
+        self.assertEqual(internal_note["ticket"]["assigned_admin"]["id"], "")
+
+        public_reply = await helpdesk.admin_reply_to_ticket(
+            ticket_id=ticket_id,
+            body="I am reviewing the report and will help you resolve this.",
+            internal_note=False,
+            status="waiting_for_user",
+            attachments=None,
+            current_user=self.admin,
+        )
+        assigned = public_reply["ticket"]["assigned_admin"]
+        self.assertEqual(assigned["id"], "admin-1")
+        self.assertEqual(assigned["name"], "Technical Support")
+        self.assertEqual(assigned["email"], "support@conscout.com")
 
     async def test_customer_can_delete_only_their_own_ticket(self):
         created = await helpdesk.create_ticket(
