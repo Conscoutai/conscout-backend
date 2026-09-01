@@ -111,6 +111,9 @@ raw_safety_audit_events_collection = db["safety_audit_events"]
 raw_subscription_requests_collection = db["subscription_requests"]
 raw_subscription_checkout_sessions_collection = db["subscription_checkout_sessions"]
 raw_subscription_payments_collection = db["subscription_payments"]
+raw_helpdesk_tickets_collection = db["helpdesk_tickets"]
+raw_helpdesk_messages_collection = db["helpdesk_messages"]
+raw_ai_quality_flags_collection = db["ai_quality_flags"]
 
 
 def ensure_admin_directory_indexes() -> None:
@@ -124,6 +127,46 @@ def ensure_admin_directory_indexes() -> None:
     )
     raw_admins_collection.create_index(
         "auth_sessions.refresh_token", sparse=True, name="admin_refresh_token"
+    )
+
+
+def ensure_helpdesk_indexes() -> None:
+    """Create indexes for customer support and AI-quality review queues."""
+    raw_helpdesk_tickets_collection.create_index(
+        "ticket_id", unique=True, name="unique_helpdesk_ticket_id"
+    )
+    raw_helpdesk_tickets_collection.create_index(
+        "ticket_number", unique=True, name="unique_helpdesk_ticket_number"
+    )
+    raw_helpdesk_tickets_collection.create_index(
+        [("owner_user_id", 1), ("updated_at", -1)],
+        name="helpdesk_owner_updated",
+    )
+    raw_helpdesk_tickets_collection.create_index(
+        [("status", 1), ("priority_rank", -1), ("updated_at", -1)],
+        name="helpdesk_admin_queue",
+    )
+    raw_helpdesk_tickets_collection.create_index(
+        [("assigned_admin_user_id", 1), ("status", 1), ("updated_at", -1)],
+        name="helpdesk_admin_assignment",
+    )
+    raw_helpdesk_messages_collection.create_index(
+        "message_id", unique=True, name="unique_helpdesk_message_id"
+    )
+    raw_helpdesk_messages_collection.create_index(
+        [("ticket_id", 1), ("created_at", 1)],
+        name="helpdesk_ticket_messages",
+    )
+    raw_ai_quality_flags_collection.create_index(
+        "flag_id", unique=True, name="unique_ai_quality_flag_id"
+    )
+    raw_ai_quality_flags_collection.create_index(
+        [("owner_user_id", 1), ("created_at", -1)],
+        name="ai_quality_owner_created",
+    )
+    raw_ai_quality_flags_collection.create_index(
+        [("status", 1), ("created_at", -1)],
+        name="ai_quality_review_queue",
     )
 
 
