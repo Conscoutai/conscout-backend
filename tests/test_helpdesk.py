@@ -234,6 +234,46 @@ class HelpdeskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admin_reply["ticket"]["status"], "waiting_for_user")
         self.assertEqual(len(admin_reply["ticket"]["messages"]), 3)
 
+    async def test_customer_can_delete_only_their_own_ticket(self):
+        created = await helpdesk.create_ticket(
+            subject="Incorrect AI safety detection",
+            description="The Fozan tour image does not match the AI detection.",
+            category="ai_response",
+            priority="normal",
+            app="web",
+            attachments=None,
+            current_user=self.user,
+        )
+        ticket_id = created["ticket"]["id"]
+
+        with self.assertRaises(HTTPException) as denied:
+            helpdesk.delete_ticket(ticket_id, current_user=self.other_user)
+        self.assertEqual(denied.exception.status_code, 404)
+
+        result = helpdesk.delete_ticket(ticket_id, current_user=self.user)
+        self.assertEqual(result["message"], "Support ticket deleted.")
+        self.assertGreater(self.tickets.documents[0]["deleted_at"], 0)
+        self.assertEqual(
+            helpdesk.list_tickets(status="all", limit=100, current_user=self.user)[
+                "tickets"
+            ],
+            [],
+        )
+        self.assertEqual(
+            helpdesk.admin_list_tickets(
+                status="all",
+                priority="all",
+                assignment="all",
+                search="",
+                limit=100,
+                current_user=self.admin,
+            )["tickets"],
+            [],
+        )
+        with self.assertRaises(HTTPException) as missing:
+            helpdesk.get_ticket(ticket_id, current_user=self.user)
+        self.assertEqual(missing.exception.status_code, 404)
+
     async def test_attachment_is_stored_and_only_available_to_ticket_participants(self):
         upload = UploadFile(
             file=io.BytesIO(b"support screenshot"),

@@ -317,6 +317,7 @@ def _find_owned_ticket(ticket_id: str, current_user: AuthenticatedUser) -> dict:
     ticket = raw_helpdesk_tickets_collection.find_one(
         {
             "ticket_id": normalized_id,
+            "deleted_at": {"$in": [0, None]},
             "$or": [
                 {"owner_user_id": current_user.user_id},
                 {"owner_email": _normalized_email(current_user.email)},
@@ -331,7 +332,7 @@ def _find_owned_ticket(ticket_id: str, current_user: AuthenticatedUser) -> dict:
 def _find_admin_ticket(ticket_id: str, current_user: AuthenticatedUser) -> dict:
     _require_helpdesk_admin(current_user)
     ticket = raw_helpdesk_tickets_collection.find_one(
-        {"ticket_id": _clean(ticket_id)}
+        {"ticket_id": _clean(ticket_id), "deleted_at": {"$in": [0, None]}}
     )
     if not ticket:
         raise HTTPException(status_code=404, detail="Support ticket not found.")
@@ -450,6 +451,7 @@ def list_tickets(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     query: dict[str, Any] = {
+        "deleted_at": {"$in": [0, None]},
         "$or": [
             {"owner_user_id": current_user.user_id},
             {"owner_email": _normalized_email(current_user.email)},
@@ -488,6 +490,30 @@ def get_ticket(
             ticket, messages=messages.get(_clean(ticket.get("ticket_id")), [])
         )
     }
+
+
+@router.delete("/helpdesk/tickets/{ticket_id}")
+def delete_ticket(
+    ticket_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ticket = _find_owned_ticket(ticket_id, current_user)
+    now = _now_ms()
+    raw_helpdesk_tickets_collection.update_one(
+        {
+            "ticket_id": _clean(ticket.get("ticket_id")),
+            "deleted_at": {"$in": [0, None]},
+        },
+        {
+            "$set": {
+                "deleted_at": now,
+                "deleted_by_user_id": current_user.user_id,
+                "deleted_by_email": _normalized_email(current_user.email),
+                "updated_at": now,
+            }
+        },
+    )
+    return {"message": "Support ticket deleted."}
 
 
 @router.post("/helpdesk/tickets/{ticket_id}/replies", status_code=201)
@@ -558,7 +584,7 @@ def download_attachment(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     ticket = raw_helpdesk_tickets_collection.find_one(
-        {"ticket_id": _clean(ticket_id)}
+        {"ticket_id": _clean(ticket_id), "deleted_at": {"$in": [0, None]}}
     )
     if not ticket:
         raise HTTPException(status_code=404, detail="Support ticket not found.")
@@ -622,7 +648,7 @@ def admin_list_tickets(
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     _require_helpdesk_admin(current_user)
-    query: dict[str, Any] = {}
+    query: dict[str, Any] = {"deleted_at": {"$in": [0, None]}}
     normalized_status = status.strip().lower().replace("-", "_")
     if normalized_status and normalized_status != "all":
         query["status"] = _normalize_choice(
