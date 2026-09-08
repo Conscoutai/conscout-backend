@@ -363,6 +363,7 @@ def sync_schedule_delay_notifications(
     *,
     project_id: str,
     current_user: AuthenticatedUser | None = None,
+    comparison: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_project_id = (project_id or "").strip()
     if not normalized_project_id:
@@ -370,7 +371,8 @@ def sync_schedule_delay_notifications(
 
     project = _project_doc(normalized_project_id)
     site_name = _site_name(project, normalized_project_id)
-    comparison = work_schedule_comparison(normalized_project_id)
+    if comparison is None:
+        comparison = work_schedule_comparison(normalized_project_id)
     baseline = comparison.get("baseline")
     if isinstance(baseline, dict) and baseline.get("is_active") is not True:
         return {

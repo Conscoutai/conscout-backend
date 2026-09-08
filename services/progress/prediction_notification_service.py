@@ -344,6 +344,7 @@ def sync_prediction_notifications(
     *,
     project_id: str,
     current_user: AuthenticatedUser | None = None,
+    comparison: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_project_id = str(project_id or "").strip()
     if not normalized_project_id:
@@ -351,7 +352,8 @@ def sync_prediction_notifications(
 
     project = _project_doc(normalized_project_id)
     site_name = _site_name(project, normalized_project_id)
-    comparison = work_schedule_comparison(normalized_project_id)
+    if comparison is None:
+        comparison = work_schedule_comparison(normalized_project_id)
     recipients = _resolve_project_recipients(project, fallback_user=current_user)
     if not recipients:
         raise HTTPException(status_code=400, detail="No project recipients found")

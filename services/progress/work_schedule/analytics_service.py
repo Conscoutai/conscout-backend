@@ -69,13 +69,15 @@ def _working_days(
 ) -> int:
     if end < start:
         return 0
-    total = 0
-    current = start
-    while current <= end:
-        if current.weekday() in (working_weekdays or {0, 1, 2, 3, 4}):
-            total += 1
-        current += timedelta(days=1)
-    return total
+    weekdays = working_weekdays or {0, 1, 2, 3, 4}
+    full_weeks, remainder = divmod((end - start).days + 1, 7)
+    # Curve generation calls this for every activity and week. Count complete
+    # weeks arithmetically, then inspect at most six remaining days.
+    valid_weekdays = weekdays.intersection(range(7))
+    return full_weeks * len(valid_weekdays) + sum(
+        (start.weekday() + offset) % 7 in valid_weekdays
+        for offset in range(remainder)
+    )
 
 
 def _add_working_days(

@@ -46,11 +46,13 @@ router = APIRouter(tags=["WorkSchedule"])
 def _best_effort_schedule_notification_sync(
     project_id: str,
     current_user: Optional[AuthenticatedUser] = None,
+    comparison: Optional[dict] = None,
 ) -> dict:
     try:
         result = sync_schedule_delay_notifications_service(
             project_id=project_id,
             current_user=current_user,
+            **({"comparison": comparison} if comparison is not None else {}),
         )
         return {
             "status": "synced",
@@ -68,11 +70,13 @@ def _best_effort_schedule_notification_sync(
 def _best_effort_prediction_notification_sync(
     project_id: str,
     current_user: Optional[AuthenticatedUser] = None,
+    comparison: Optional[dict] = None,
 ) -> dict:
     try:
         result = sync_prediction_notifications_service(
             project_id=project_id,
             current_user=current_user,
+            **({"comparison": comparison} if comparison is not None else {}),
         )
         return {
             "status": "synced",
@@ -226,10 +230,12 @@ def work_schedule_comparison(project_id: str):
     comparison = work_schedule_comparison_service(project_id)
     comparison["notification_sync"] = _best_effort_schedule_notification_sync(
         project_id,
+        comparison=comparison,
     )
     comparison["prediction_notification_sync"] = (
         _best_effort_prediction_notification_sync(
             project_id,
+            comparison=comparison,
         )
     )
     return comparison
