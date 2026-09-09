@@ -23,6 +23,17 @@ and support native tool calling plus structured JSON output. The existing model
 name is a compatibility default, not a quality recommendation: evaluate it on
 real project questions and the deployment hardware before production rollout.
 
+Ollama must share the API's Docker network. For the existing VPS containers:
+
+```sh
+docker network connect conscout-main conscout-ollama
+```
+
+Run this only if Ollama is not already attached. The existing 4 GB VPS needs
+swap to load the 3B model alongside the other services and uses
+`CHAT_CONTEXT_TOKENS=8192`. Evidence/history budgets shrink with this context
+setting. Swap prevents out-of-memory kills; measure response latency on the host.
+
 The old `CHAT_INTENT_PROVIDER`, `CHAT_ANSWER_STYLE_PROVIDER` and
 `CHAT_ANSWER_FORMATTER` switches do not control the new agent. It does not silently
 fall back to keyword templates if Ollama is unavailable. Restart the API after
@@ -61,7 +72,8 @@ Record searches return exact `total_matching` counts for their filters before
 pagination. Result pages contain at most 20 records and expose `has_more` and
 truncation. Field text is capped at 1,200 characters and nested lists at 30 items;
 the result is a bounded evidence excerpt, not a full document. A request permits
-at most 6 tools by default, four tool rounds and 24,000 characters of tool evidence.
+at most 6 tools by default, four tool rounds and up to 24,000 characters of tool evidence
+(8,384 at an 8,192-token context). History is also capped relative to the context.
 Database aggregation queries use a three-second server execution limit. Existing
 schedule calculations retain their own execution behavior. Model calls share a
 45-second request budget; hardware must serve within the frontend's 60-second

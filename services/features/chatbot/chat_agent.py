@@ -66,6 +66,19 @@ def _setting(name, default, low, high):
         return default
 
 
+def _generation_schema(value):
+    """Keep semantic structure without huge bounded grammar repetitions.
+
+    Ollama's grammar compiler rejects large maxLength values. Pydantic still
+    validates the full schema, including length limits, after generation.
+    """
+    if isinstance(value, dict):
+        return {key: _generation_schema(item) for key, item in value.items() if key != "maxLength"}
+    if isinstance(value, list):
+        return [_generation_schema(item) for item in value]
+    return value
+
+
 class OllamaChat:
     def __init__(self):
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
@@ -80,14 +93,18 @@ class OllamaChat:
         if tools is not None:
             payload["tools"] = tools
         if output_schema is not None:
-            payload["format"] = output_schema
+            payload["format"] = _generation_schema(output_schema)
         try:
             response = requests.post(self.base_url + "/api/chat", json=payload,
                                      timeout=(min(3, remaining / 4), max(0.5, remaining - 3)))
             response.raise_for_status()
-            message = response.json().get("message")
+            response_data = response.json()
+            message = response_data.get("message")
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 raise ValueError("Missing assistant message")
+            logger.info("chat_model_response model=%s input_tokens=%s output_tokens=%s duration_ns=%s",
+                        self.model, response_data.get("prompt_eval_count"), response_data.get("eval_count"),
+                        response_data.get("total_duration"))
             return message
         except requests.Timeout as exc:
             raise ChatAgentError("The assistant took too long. Please try again.", 504) from exc
@@ -105,9 +122,12 @@ def answer_question(*, message, data_tools, site_name="", tour_id="", history=No
     deadline = started + _setting("CHAT_TIMEOUT_SECONDS", 45, 10, 50)
     request_id = uuid4().hex
     max_calls = _setting("CHAT_MAX_TOOL_CALLS", 6, 1, 8)
+    context_tokens = _setting("CHAT_CONTEXT_TOKENS", 16384, 8192, 32768)
+    history_limit = min(12000, context_tokens // 2)
+    evidence_limit = min(24000, max(4000, context_tokens * 2 - 8000))
     history = [HistoryMessage.model_validate(item).model_dump() for item in (history or [])[-12:]]
     # Bound context by both message count and characters.
-    while sum(len(item["content"]) for item in history) > 12000:
+    while sum(len(item["content"]) for item in history) > history_limit:
         history.pop(0)
     messages = [{"role": "system", "content": SYSTEM_PROMPT + "\nCurrent UTC time: " +
                  datetime.now(timezone.utc).isoformat()}, *history,
@@ -146,9 +166,9 @@ def answer_question(*, message, data_tools, site_name="", tour_id="", history=No
                         arguments = json.loads(arguments)
                     if not isinstance(arguments, dict):
                         raise ValueError("Tool arguments must be an object")
-                    if evidence_chars >= 24000:
+                    if evidence_chars >= evidence_limit:
                         raise ValueError("Evidence budget reached. Answer with available evidence and state limitations.")
-                    result = bounded_result(data_tools.execute(name, arguments), min(10000, 24000 - evidence_chars))
+                    result = bounded_result(data_tools.execute(name, arguments), min(10000, evidence_limit - evidence_chars))
                     if "error" not in result:
                         source_id = "S" + str(len(evidence) + 1)
                         result["source_id"] = source_id

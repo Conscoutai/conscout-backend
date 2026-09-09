@@ -168,6 +168,10 @@ def test_ollama_sends_native_tools_and_structured_final_schema(monkeypatch):
     assert post.call_args.kwargs["json"]["tools"] == [{"example": True}]
     assert post.call_args.args[0].endswith("/api/chat")
     assert post.call_args.kwargs["json"]["stream"] is False
+    schema = {"type": "object", "properties": {"answer": {"type": "string", "maxLength": 6000}}}
+    OllamaChat().chat([], remaining=10, output_schema=schema)
+    assert "maxLength" not in post.call_args.kwargs["json"]["format"]["properties"]["answer"]
+    assert schema["properties"]["answer"]["maxLength"] == 6000
 
 
 def test_unknown_tool_and_raw_query_are_rejected_before_database_access():
