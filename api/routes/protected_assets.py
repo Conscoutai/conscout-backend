@@ -9,7 +9,6 @@ from core.auth import require_authenticated_user
 from core.auth_context import AuthenticatedUser
 from core.config import DATA_DIR, site_storage_roots, tour_storage_roots
 from core.database import raw_floorplans_collection, raw_tours_collection
-from services.tour_management.panorama_preview import panorama_preview
 
 
 router = APIRouter(tags=["ProtectedAssets"])
@@ -191,10 +190,7 @@ def _tour_relative_path_candidates(
 def get_tour_asset(
     asset_path: str,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
-    render_width: int | None = None,
 ):
-    if render_width is not None and render_width not in (2048, 4096):
-        return _asset_error(400, "Unsupported panorama display width.")
     normalized = asset_path.strip().lstrip("/")
     parts = [part for part in normalized.split("/") if part]
     if len(parts) < 2:
@@ -221,12 +217,6 @@ def get_tour_asset(
         )
     except FileNotFoundError:
         return _asset_error(404, "Asset file not found.")
-    if render_width is not None:
-        try:
-            preview = panorama_preview(file_path, os.path.join(DATA_DIR, ".panorama-previews"), render_width)
-            return FileResponse(preview, media_type="image/jpeg", headers=_ASSET_CACHE_HEADERS)
-        except (OSError, ValueError):
-            return _asset_error(503, "Panorama display image unavailable.")
     return FileResponse(file_path, headers=_ASSET_CACHE_HEADERS)
 
 
