@@ -56,9 +56,9 @@ def tool_call(name, arguments):
     return {"role": "assistant", "tool_calls": [{"function": {"name": name, "arguments": arguments}}]}
 
 
-def final(answer="There are 3 open inspections. [S1]", ids=None, clarify=False):
+def final(answer="There are 3 open inspections. [S1]", ids=None, clarify=False, kind="project_data"):
     return {"role": "assistant", "content": json.dumps({"answer": answer,
-            "source_ids": ["S1"] if ids is None else ids, "needs_clarification": clarify})}
+            "source_ids": ["S1"] if ids is None else ids, "needs_clarification": clarify, "answer_kind": kind})}
 
 
 class Model:
@@ -92,7 +92,7 @@ def test_questions_reach_model_without_keyword_rewriting(question, dataset):
     assert result["citations"][0]["total_matching"] == 3
     # A UI tour hint must not silently constrain project-wide data.
     tool_messages = [m for m in model.calls[1][0] if m["role"] == "tool"]
-    assert json.loads(tool_messages[0]["content"])["filters"]["tour_id"] == ""
+    assert not json.loads(tool_messages[0]["content"])["filters"].get("tour_id")
 
 
 def test_model_can_combine_datasets_and_uses_fresh_data_for_followup():
@@ -110,7 +110,7 @@ def test_model_can_combine_datasets_and_uses_fresh_data_for_followup():
 def test_invented_citations_are_rejected_and_repaired():
     tools, _, _ = make_tools()
     model = Model(tool_call("list_projects", {}), {"role": "assistant", "content": "ready"},
-                  final("Made up [S99]", ["S99"]), final("Fozan is available. [S1]"))
+                  final("Made up [S99]", ["S99"]), final("Fozan is available. [S1]", kind="project_directory"))
     result = answer_question(message="List projects", data_tools=tools, client=model)
     assert "S99" not in result["answer"]
     assert len(model.calls) == 4
@@ -161,11 +161,13 @@ def test_ollama_timeout_and_connection_error_are_explicit(monkeypatch):
         assert "internal URL" not in str(exc.value)
 
 
-def test_ollama_sends_native_tools_and_structured_final_schema(monkeypatch):
-    post = Mock(return_value=Mock(json=Mock(return_value={"message": {"role": "assistant", "content": "hello"}})))
+def test_ollama_sends_typed_tool_plan_and_structured_final_schema(monkeypatch):
+    from services.features.chatbot.chat_tools import TOOLS
+    post = Mock(return_value=Mock(json=Mock(return_value={"message": {"role": "assistant", "content": '{"calls":[]}'}})))
     monkeypatch.setattr(requests, "post", post)
-    OllamaChat().chat([], remaining=10, tools=[{"example": True}])
-    assert post.call_args.kwargs["json"]["tools"] == [{"example": True}]
+    result = OllamaChat().chat([], remaining=10, tools=TOOLS)
+    assert result["tool_calls"] == [] and result["planned_batch"] is True
+    assert post.call_args.kwargs["json"]["format"]["properties"]["calls"]["maxItems"] == 4
     assert post.call_args.args[0].endswith("/api/chat")
     assert post.call_args.kwargs["json"]["stream"] is False
     schema = {"type": "object", "properties": {"answer": {"type": "string", "maxLength": 6000}}}
@@ -181,6 +183,20 @@ def test_unknown_tool_and_raw_query_are_rejected_before_database_access():
     with pytest.raises(ValidationError):
         tools.execute("read_project_records", {"project": "Fozan", "dataset": "tours", "filter": {}})
     assert not records.pipelines and not projects.find_calls
+
+
+def test_numeric_paging_strings_are_safely_capped():
+    tools, _, records = make_tools()
+    result = tools.execute("read_project_records", {"project": "Fozan", "dataset": "tours", "limit": "100", "offset": "0"})
+    assert records.pipelines[0][0][-1]["$facet"]["records"][2] == {"$limit": 20}
+
+
+def test_directory_evidence_cannot_support_project_work_answer():
+    tools, _, _ = make_tools()
+    model = Model(tool_call("list_projects", {}), {"role": "assistant", "content": "ready"},
+                  final("No tours exist. [S1]"), final("No tours exist. [S1]"))
+    with pytest.raises(ChatAgentError, match="supported"):
+        answer_question(message="Summarize the latest tour", data_tools=tools, client=model)
 
 
 def test_client_named_project_does_not_grant_access():
@@ -238,6 +254,19 @@ def test_sensitive_nested_fields_never_reach_model():
     result = tools.execute("read_project_records", {"project": "Fozan", "dataset": "comments"})
     assert "secret" not in json.dumps(result)
     assert result["records"][0]["assigned_to"]["name"] == "Sam"
+
+
+def test_tour_dates_and_metrics_are_unambiguous():
+    from bson.int64 import Int64
+    tools, _, _ = make_tools({"count": [{"value": 1}], "records": [{"id": "t1",
+        "created_at": Int64(1783327084740), "updated_at": 1783328431.756,
+        "progress": {"summary": {"planned": 2214, "covered": 205, "verified": 103, "percentage": 50.24}}}]})
+    row = tools.execute("read_project_records", {"project": "Fozan", "dataset": "tours"})["records"][0]
+    assert row["created_at"].startswith("2026-07-06")
+    assert row["updated_at"].startswith("2026-07-06")
+    assert row["tour_metrics"]["coverage_percent"] == 9.26
+    assert row["tour_metrics"]["verification_percent_of_covered"] == 50.24
+    assert "progress" not in row
 
 
 def test_progress_preserves_server_metrics_and_paginates_activities():

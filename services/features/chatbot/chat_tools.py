@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -67,7 +68,7 @@ TOOL_DESCRIPTIONS = {
     ),
     "get_project_progress": (
         "Get the project's server-calculated schedule comparison: planned/actual progress, activities, dates and "
-        "delays, plus recorded tour progress. Filter activity names/descriptions with query or exact status, and "
+        "delays. Filter activity names/descriptions with query or exact status, and "
         "paginate using offset/limit. Project summary remains unfiltered. Capture coverage is not physical construction completion."
     ),
     "get_project_details": "Read project description, location, dates and team members. Use with records to investigate a member's work.",
@@ -114,12 +115,24 @@ def clean_value(value, depth=0):
     if depth > 5:
         return "[nested data omitted]"
     if isinstance(value, dict):
-        return {k: clean_value(v, depth + 1) for k, v in value.items() if k in NESTED_FIELDS}
+        result = {}
+        for key, item in value.items():
+            if key not in NESTED_FIELDS:
+                continue
+            if key in {"created_at", "createdAt", "updated_at", "recalculated_at", "due_date"} and isinstance(item, (int, float)) and not isinstance(item, bool):
+                try:
+                    item = datetime.fromtimestamp(item / 1000 if abs(item) >= 100000000000 else item, timezone.utc)
+                except (ValueError, OverflowError, OSError):
+                    item = None
+            result[key] = clean_value(item, depth + 1)
+        return result
     if isinstance(value, list):
         items = [clean_value(item, depth + 1) for item in value[:30]]
         return items + (["[additional items omitted]"] if len(value) > 30 else [])
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if value is None or isinstance(value, (bool, int, float)):
         return value
     text = str(value)
@@ -173,6 +186,15 @@ class ProjectDataTools:
     def execute(self, name, arguments):
         if name not in TOOL_MODELS:
             raise ValueError("Unknown read-only tool")
+        arguments = dict(arguments)
+        # Some tool-capable models serialize numeric arguments as strings. Parse
+        # only integer paging values, then retain normal validation and row caps.
+        for field in ("offset", "limit"):
+            value = arguments.get(field)
+            if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 6:
+                arguments[field] = int(value)
+        if type(arguments.get("limit")) is int:
+            arguments["limit"] = min(arguments["limit"], 20)
         args = TOOL_MODELS[name].model_validate(arguments)
         if name == "list_projects":
             return {"projects": [{"name": p["name"]} for p in self.projects()]}
@@ -237,7 +259,10 @@ class ProjectDataTools:
         if args.date_field == "updated_at":
             date_input = {"$ifNull": ["$updated_at", {"$ifNull": ["$recalculated_at", {"$ifNull": ["$created_at", "$createdAt"]}]}]}
         pipeline.append({"$set": {"_chat_date": {"$convert": {
-            "input": date_input, "to": "date", "onError": None, "onNull": None}}}})
+            "input": {"$let": {"vars": {"value": date_input}, "in": {"$cond": [
+                {"$isNumber": "$$value"}, {"$cond": [{"$lt": [{"$abs": "$$value"}, 100000000000]},
+                    {"$multiply": ["$$value", 1000]}, "$$value"]}, "$$value"]}}},
+            "to": "date", "onError": None, "onNull": None}}}})
         bounds = {}
         for key, value in (("$gte", args.start_date), ("$lt", args.end_date)):
             if value:
@@ -258,9 +283,22 @@ class ProjectDataTools:
         result = next(iter(collection.aggregate(pipeline, maxTimeMS=3000)), {})
         total = (result.get("count") or [{"value": 0}])[0]["value"]
         rows = [clean_value(row) for row in result.get("records", [])]
+        if args.dataset == "tours":
+            for row in rows:
+                summary = (row.get("progress") or {}).get("summary") or {}
+                counts = {key: summary.get(key) for key in ("planned", "covered", "verified")}
+                if all(type(value) in (int, float) and value >= 0 for value in counts.values()):
+                    planned, covered, verified = (counts[key] for key in ("planned", "covered", "verified"))
+                    row["tour_metrics"] = {"planned_units": planned, "covered_units": covered, "verified_units": verified,
+                        "coverage_percent": round(100 * covered / planned, 2) if planned else None,
+                        "verification_percent_of_covered": round(100 * verified / covered, 2) if covered else None,
+                        "scope": "Tour coverage and verification; not overall project completion."}
+                    row.pop("progress", None)
+                    row.pop("coverage", None)
         return {"project": project["name"], "dataset": args.dataset, "total_matching": total,
                 "offset": args.offset, "returned": len(rows), "has_more": args.offset + len(rows) < total,
-                "filters": args.model_dump(exclude={"project", "dataset", "offset", "limit"}),
+                "filters": {"date_field": args.date_field, **args.model_dump(
+                    exclude={"project", "dataset", "offset", "limit"}, exclude_defaults=True)},
                 "records": rows}
 
     def progress(self, project, args):
@@ -291,7 +329,8 @@ class ProjectDataTools:
                   "activities_truncated": args.offset + args.limit < len(matched),
                   "note": "Only recorded or server-calculated values; missing percentages are unknown, not zero."}
         # The caller may retrieve more tour history separately; never force a stale UI tour ID here.
-        result["latest_tour"] = self.records(project, ReadRecords(project=project["name"], dataset="tours", date_field="created_at", limit=1))
+        if not schedule_available:
+            result["latest_tour"] = self.records(project, ReadRecords(project=project["name"], dataset="tours", date_field="created_at", limit=1))
         return result
 
 

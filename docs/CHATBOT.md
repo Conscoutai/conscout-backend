@@ -19,7 +19,10 @@ CHAT_CONTEXT_TOKENS=16384
 
 Use the reachable Ollama service hostname when API and Ollama run in separate
 containers. The configured model must already be pulled into that Ollama runtime
-and support native tool calling plus structured JSON output. The existing model
+and support structured JSON output. The backend asks the model for a typed batch
+of read-only tool calls, executes it, then requests a grounded final answer. This
+also works with Llama templates that drop native tool descriptions after a result.
+The existing model
 name is a compatibility default, not a quality recommendation: evaluate it on
 real project questions and the deployment hardware before production rollout.
 
@@ -29,10 +32,14 @@ Ollama must share the API's Docker network. For the existing VPS containers:
 docker network connect conscout-main conscout-ollama
 ```
 
-Run this only if Ollama is not already attached. The existing 4 GB VPS needs
-swap to load the 3B model alongside the other services and uses
-`CHAT_CONTEXT_TOKENS=8192`. Evidence/history budgets shrink with this context
-setting. Swap prevents out-of-memory kills; measure response latency on the host.
+Run this only if Ollama is not already attached. The existing 2-CPU/4-GB VPS
+uses the lighter local `OLLAMA_MODEL=qwen2.5:1.5b` with `CHAT_CONTEXT_TOKENS=4096`,
+`CHAT_BATCH_TOKENS=128`, `CHAT_OUTPUT_TOKENS=400`, and `CHAT_TIMEOUT_SECONDS=50`.
+Llama 3B was tested on this host but exceeded the browser timeout on broader
+questions; it remains supported for better-provisioned deployments. Evidence and
+history budgets shrink with context size. The VPS also has a 2 GB swap file to
+protect the co-located services from out-of-memory kills. Measure answer quality
+and latency on real queries; a small model is not a guarantee of correct inference.
 
 The old `CHAT_INTENT_PROVIDER`, `CHAT_ANSWER_STYLE_PROVIDER` and
 `CHAT_ANSWER_FORMATTER` switches do not control the new agent. It does not silently
@@ -53,8 +60,8 @@ to inspect its capabilities. Ollama API reference:
 * `read_project_records`: tours, comments (including panorama comments),
   inspections, recipient-scoped notifications, and the material ledger. Supports
   literal text, exact status, UTC date ranges, specific tours, and pagination.
-* `get_project_progress`: existing server schedule calculations and recorded
-  latest-tour data. Activities support text/status filters and pagination.
+* `get_project_progress`: existing server schedule calculations, with recorded
+  tour data when no schedule exists. Activities support text/status filters and pagination.
 
 The model can combine tools to answer explanations and comparisons. A frontend
 tour ID is a context hint; it does not force every project question into that tour.
@@ -73,7 +80,7 @@ pagination. Result pages contain at most 20 records and expose `has_more` and
 truncation. Field text is capped at 1,200 characters and nested lists at 30 items;
 the result is a bounded evidence excerpt, not a full document. A request permits
 at most 6 tools by default, four tool rounds and up to 24,000 characters of tool evidence
-(8,384 at an 8,192-token context). History is also capped relative to the context.
+(8,384 at an 8,192-token context; 2,500 at a 4,096-token context). History is also capped relative to the context.
 Database aggregation queries use a three-second server execution limit. Existing
 schedule calculations retain their own execution behavior. Model calls share a
 45-second request budget; hardware must serve within the frontend's 60-second
