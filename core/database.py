@@ -104,6 +104,7 @@ raw_users_collection = db["users"]
 raw_admins_collection = admin_db["admins"]
 raw_inspections_collection = db["inspections"]
 raw_notifications_collection = db["notifications"]
+chat_conversations_collection = db["chat_conversations"]
 raw_notification_devices_collection = db["notification_devices"]
 raw_safety_records_collection = db["safety_records"]
 raw_safety_analysis_jobs_collection = db["safety_analysis_jobs"]
@@ -114,6 +115,13 @@ raw_subscription_payments_collection = db["subscription_payments"]
 raw_helpdesk_tickets_collection = db["helpdesk_tickets"]
 raw_helpdesk_messages_collection = db["helpdesk_messages"]
 raw_ai_quality_flags_collection = db["ai_quality_flags"]
+
+
+def ensure_chat_indexes() -> None:
+    chat_conversations_collection.create_index("expires_at", expireAfterSeconds=0, name="chat_expiry")
+    chat_conversations_collection.create_index(
+        [("owner_user_id", 1), ("updated_at", -1)], name="chat_owner_updated"
+    )
 
 
 def ensure_admin_directory_indexes() -> None:

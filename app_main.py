@@ -20,6 +20,7 @@ from core.config import (
     DATA_DIR,
 )
 from core.database import (
+    ensure_chat_indexes,
     ensure_admin_directory_indexes,
     ensure_budget_indexes,
     ensure_helpdesk_indexes,
@@ -61,6 +62,7 @@ for directory in (DATA_DIR,):
 
 @app.on_event("startup")
 def startup_background_jobs():
+    ensure_chat_indexes()
     if APP_SURFACE == "main":
         ensure_admin_directory_indexes()
         ensure_budget_indexes()
