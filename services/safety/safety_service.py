@@ -6,7 +6,7 @@ import statistics
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -32,7 +32,7 @@ from services.project_setup.safety_notification_service import (
 from services.safety.daily_report_pdf import build_daily_report_pdf
 
 
-ANALYSIS_VERSION = "phase1-existing-worker-v1"
+ANALYSIS_VERSION = "phase1-existing-worker-per-image-v2"
 WEATHER_CACHE_MINUTES = 15
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 ALLOWED_ATTACHMENT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf", ".mp4", ".mov"}
@@ -358,6 +358,7 @@ def create_record(
     user: AuthenticatedUser,
 ) -> dict[str, Any]:
     context = project_context(project_ref)
+    payload = validate_finding_evidence(context, record_type, payload)
     project = context.get("document") or {}
     client_reference_id = str(payload.get("client_reference_id") or "").strip()
     if client_reference_id:
@@ -441,6 +442,7 @@ def update_record(
     existing = safety_records_collection.find_one(query)
     if not existing:
         raise HTTPException(404, f"{record_type.replace('_', ' ').title()} not found")
+    payload = validate_finding_evidence(context, record_type, payload, existing)
     if record_type == "daily_report" and str(existing.get("status") or "").lower() == "finalized":
         raise HTTPException(409, "Finalized daily reports are immutable; generate a new revision")
     protected = {
@@ -472,6 +474,7 @@ def update_record(
         "confirmed",
         "dismissed",
         "verified",
+        "resolved",
     }:
         changes.setdefault("requires_review", False)
         changes.setdefault("reviewed_at", now.isoformat())
@@ -1006,42 +1009,13 @@ def run_analysis_job(job_id: str) -> None:
             raise ValueError("Tour no longer exists")
         metric = preliminary_worker_count(tour.get("nodes") or [])
         result_status = "completed" if metric["observed_workers"] is not None else "partially_completed"
-        observation_id = ""
-        if metric["observed_workers"] is not None:
-            observation_id = _record_id("workforce_observation")
-            observed_at = tour.get("created_at") or tour.get("date") or utc_now().isoformat()
-            record_date = str(observed_at)[:10] if str(observed_at) else today_iso()
-            observation = {
-                "record_id": observation_id,
-                "record_type": "workforce_observation",
-                "record_date": record_date,
-                "status": "needs_review",
-                "observed_workers": metric["observed_workers"],
-                "source": "existing_tour_ai",
-                "confidence_label": "preliminary",
-                "requires_review": True,
-                "tour_id": job["tour_id"],
-                "analysis_job_id": job_id,
-                "analysis_version": job["analysis_version"],
-                "calculation": metric,
-                "observed_at": observed_at,
-                "created_at": utc_now(),
-                "updated_at": utc_now(),
-                "owner_user_id": job.get("owner_user_id"),
-                "owner_email": job.get("owner_email"),
-                **{key: job.get(key) for key in ("project_id", "site_name", "floorplan_id")},
-            }
-            raw_safety_records_collection.update_one(
-                {"project_id": job["project_id"], "record_type": "workforce_observation", "analysis_job_id": job_id},
-                {"$set": observation},
-                upsert=True,
-            )
+        observation_ids = store_workforce_image_observations(job, tour)
         finished = utc_now()
         raw_safety_analysis_jobs_collection.update_one(
             {"job_id": job_id},
             {"$set": {
                 "status": result_status,
-                "result": {**metric, "observation_id": observation_id, "ppe_status": "not_available_in_phase1_model"},
+                "result": {**metric, "observation_ids": observation_ids, "ppe_status": "not_available_in_phase1_model"},
                 "finished_at": finished,
                 "updated_at": finished,
                 "error": None,
@@ -1053,6 +1027,68 @@ def run_analysis_job(job_id: str) -> None:
             {"job_id": job_id},
             {"$set": {"status": "failed", "error": str(error), "finished_at": failed_at, "updated_at": failed_at}},
         )
+
+
+def workforce_image_observations(job: dict[str, Any], tour: dict[str, Any]) -> list[dict[str, Any]]:
+    """One stable, independently reviewable record for each counted capture."""
+    observed_at = tour.get("created_at") or tour.get("date") or utc_now().isoformat()
+    records = []
+    seen = set()
+    for index, node in enumerate(tour.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if not node_id or node_id in seen:
+            continue
+        metric = preliminary_worker_count([node])
+        count = metric["observed_workers"]
+        if count is None:
+            continue
+        seen.add(node_id)
+        record_id = "observation_" + uuid5(NAMESPACE_URL, f"{job['project_id']}/{job['tour_id']}/{node_id}/workforce").hex
+        records.append({
+            "record_id": record_id,
+            "record_type": "workforce_observation",
+            "record_date": str(observed_at)[:10],
+            "title": f"Workforce observation · Point {index + 1}",
+            "status": "needs_review" if count > 0 else "recorded",
+            "observed_workers": count,
+            "source": "existing_tour_ai",
+            "confidence_label": "preliminary",
+            "requires_review": count > 0,
+            "tour_id": job["tour_id"],
+            "tour_name": tour.get("tour_name") or tour.get("name") or "",
+            "node_id": node_id,
+            "point_index": index + 1,
+            "analysis_job_id": job["job_id"],
+            "analysis_version": job["analysis_version"],
+            "calculation": {"observed_workers": count, "sample_count": 1, "method": "existing_worker_count_per_image", "node_id": node_id},
+            "observed_at": observed_at,
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            **{key: job.get(key) for key in ("project_id", "site_name", "floorplan_id", "owner_user_id", "owner_email")},
+        })
+    return records
+
+
+def store_workforce_image_observations(job: dict[str, Any], tour: dict[str, Any]) -> list[str]:
+    records = workforce_image_observations(job, tour)
+    for record in records:
+        # Retrying analysis must never overwrite a person's review or duplicate it.
+        raw_safety_records_collection.update_one(
+            {"record_id": record["record_id"], "project_id": job["project_id"]},
+            {"$setOnInsert": record}, upsert=True,
+        )
+    if records:
+        # Retain old tour summaries for audit, but replace them in the active queue.
+        raw_safety_records_collection.update_many(
+            {"project_id": job["project_id"], "tour_id": job["tour_id"],
+             "record_type": "workforce_observation", "node_id": {"$exists": False},
+             "source": "existing_tour_ai", "status": {"$ne": "superseded"}},
+            {"$set": {"status": "superseded", "requires_review": False,
+                      "superseded_by": [record["record_id"] for record in records], "updated_at": utc_now()}},
+        )
+    return [record["record_id"] for record in records]
 
 
 def list_analysis_jobs(project_ref: str, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1270,6 +1306,63 @@ def _filter_records(
     return [item for item in records if matches(item)]
 
 
+def validate_finding_evidence(context: dict[str, Any], record_type: str, payload: dict[str, Any], existing=None) -> dict[str, Any]:
+    if record_type != "safety_finding":
+        return payload
+    changes = dict(payload)
+    if "ppe_status" in changes and changes["ppe_status"] not in {"compliant", "non_compliant", "unknown"}:
+        raise HTTPException(400, "Select a valid PPE classification")
+    merged = {**(existing or {}), **changes}
+    if not existing:
+        changes.setdefault("ppe_status", "unknown")
+    # Validate only changed evidence; reviewing legacy records must remain possible.
+    if "tour_id" not in changes and "node_id" not in changes:
+        return changes
+    tour_id, node_id = str(merged.get("tour_id") or ""), str(merged.get("node_id") or "")
+    if not tour_id:
+        if node_id:
+            raise HTTPException(400, "Select a tour for the evidence image")
+        changes.update(tour_id="", node_id="", tour_name="", point_index=None)
+        return changes
+    tour = raw_tours_collection.find_one({"tour_id": tour_id})
+    project = context.get("document") or {}
+    matches_id = tour and (tour.get("project_id") == context["project_id"] or tour.get("floorplan_id") == context["floorplan_id"])
+    matches_owner = tour and any(project.get(key) and tour.get(key) == project[key] for key in ("owner_user_id", "owner_email"))
+    matches_site = tour and (tour.get("site_name") == context["site_name"] or tour.get("site") == context["site_name"])
+    if not matches_id and not (matches_owner and matches_site):
+        tour = None
+    if not tour:
+        raise HTTPException(400, "Evidence tour does not belong to this project")
+    changes["tour_name"] = tour.get("name") or tour.get("tour_name") or ""
+    changes["point_index"] = None
+    if node_id:
+        match = next((i for i, node in enumerate(tour.get("nodes") or []) if node.get("id") == node_id), None)
+        if match is None:
+            raise HTTPException(400, "Evidence image does not belong to the selected tour")
+        changes["point_index"] = match + 1
+    return changes
+
+
+def _dashboard_records(records, day, *, tour_id="", shift="", zone_id="", exact_date=False):
+    """Include dated records through the selected day and explicitly shared site records."""
+    selected = []
+    for item in records:
+        record_day = str((item.get("created_at") if item.get("record_type") == "project_inspection" else item.get("record_date")) or item.get("created_at") or item.get("requested_at") or "")[:10]
+        if record_day and (record_day != day if exact_date else record_day > day):
+            continue
+        if any(value and item.get(key) and item.get(key) != value
+               for key, value in (("tour_id", tour_id), ("shift", shift), ("zone_id", zone_id))):
+            continue
+        if tour_id and item.get("linked_tours") and tour_id not in item["linked_tours"]:
+            continue
+        selected.append(item)
+    return selected
+
+
+def _is_demo_record(item):
+    return item.get("source") == "demo_scenario" or item.get("is_demo") is True
+
+
 def _automated_workforce_observations(
     records: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1282,6 +1375,8 @@ def _automated_workforce_observations(
     }
     automated: list[dict[str, Any]] = []
     for item in records:
+        if item.get("status") == "superseded":
+            continue
         source = str(item.get("source") or "").strip().lower()
         linked_analysis = bool(item.get("analysis_job_id")) and bool(
             item.get("tour_id")
@@ -1289,6 +1384,19 @@ def _automated_workforce_observations(
         if source in accepted_sources or linked_analysis:
             automated.append(item)
     return automated
+
+
+def _workforce_daily_observation(records: Iterable[dict[str, Any]], record_date: str) -> Optional[dict[str, Any]]:
+    candidates = [item for item in records if item.get("record_date") == record_date
+                  and item.get("status") not in {"dismissed", "superseded"}
+                  and _float(item.get("observed_workers")) is not None]
+    if not candidates:
+        return None
+    peak = max(candidates, key=lambda item: float(item["observed_workers"]))
+    return {**peak,
+            "requires_review": any(item.get("requires_review") for item in candidates),
+            "calculation": {**(peak.get("calculation") or {}),
+                            "sample_count": sum(int((item.get("calculation") or {}).get("sample_count") or 1) for item in candidates)}}
 
 
 def _manpower_history(
@@ -1304,21 +1412,16 @@ def _manpower_history(
         through = date.today()
     start = through - timedelta(days=max(1, days) - 1)
     latest_plans: dict[str, dict[str, Any]] = {}
-    latest_observations: dict[str, dict[str, Any]] = {}
     for item in plans:
         record_day = str(item.get("record_date") or "")
         if record_day and record_day not in latest_plans:
             latest_plans[record_day] = item
-    for item in observations:
-        record_day = str(item.get("record_date") or "")
-        if record_day and record_day not in latest_observations:
-            latest_observations[record_day] = item
     history: list[dict[str, Any]] = []
     cursor = start
     while cursor <= through:
         record_day = cursor.isoformat()
         plan = latest_plans.get(record_day) or {}
-        observation = latest_observations.get(record_day) or {}
+        observation = _workforce_daily_observation(observations, record_day) or {}
         planned_raw = plan.get("planned_workers")
         observed_raw = observation.get("observed_workers")
         history.append(
@@ -1363,12 +1466,16 @@ def _schedule_manpower_for_dates(
                 start = date.fromisoformat(str(point.get("date") or ""))
             except ValueError:
                 continue
-            if start <= target <= start + timedelta(days=6):
+            try:
+                end = date.fromisoformat(str(point.get("period_end") or ""))
+            except ValueError:
+                end = start + timedelta(days=6)
+            if start <= target <= end:
                 matching = point
                 break
         if matching:
             resolved[raw_day] = {
-                "planned_workers": int(round(float(matching.get("planned_workers") or 0))),
+                "planned_workers": int(round(float(matching["planned_workers"]))) if _float(matching.get("planned_workers")) is not None else None,
                 "planned_labor_hours": float(
                     matching.get("planned_labor_hours") or 0
                 ),
@@ -1404,28 +1511,32 @@ def build_dashboard(
             zone_id=zone_id,
         )
     )
-    findings = _filter_records(
+    findings = _dashboard_records(
         list_records(project_ref, "safety_finding", limit=1000),
+        day,
         shift=shift,
         tour_id=tour_id,
         zone_id=zone_id,
     )
-    hazards = _filter_records(
+    hazards = _dashboard_records(
         list_records(project_ref, "hazard", limit=1000),
+        day,
         shift=shift,
         tour_id=tour_id,
         zone_id=zone_id,
     )
-    permits = list_records(project_ref, "permit", limit=1000)
+    permits = _dashboard_records(list_records(project_ref, "permit", limit=1000), day, tour_id=tour_id, shift=shift, zone_id=zone_id)
     checks, overdue_checks = _project_inspection_status_records(
         context, through_date=day
     )
-    zones = list_records(project_ref, "safety_zone", limit=1000)
-    reports = list_records(project_ref, "daily_report", limit=25)
+    checks = _dashboard_records(checks, day, tour_id=tour_id)
+    overdue_checks = [item for item in checks if item.get("status") == "overdue"]
+    zones = _dashboard_records(list_records(project_ref, "safety_zone", limit=1000), day, tour_id=tour_id, zone_id=zone_id)
+    reports = _dashboard_records(list_records(project_ref, "daily_report", limit=1000), day, tour_id=tour_id, exact_date=True)
     weather_events = list_records(project_ref, "weather_observation", limit=25)
-    jobs = list_analysis_jobs(project_ref, limit=10)
+    jobs = _dashboard_records(list_analysis_jobs(project_ref, limit=500), day, tour_id=tour_id)
     weather = get_weather(project_ref)
-    observation = _latest_by_date(observations, day)
+    observation = _workforce_daily_observation(observations, day)
     history = _manpower_history([], observations, through_date=day)
     schedule_plans, schedule_partial = _schedule_manpower_for_dates(
         project_ref, [item["record_date"] for item in history]
@@ -1444,28 +1555,30 @@ def build_dashboard(
         if observed is not None and planned is not None
         else None
     )
-    open_findings = [item for item in findings if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified"}]
-    open_hazards = [item for item in hazards if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified"}]
+    valid_findings = [item for item in findings if item.get("status") not in {"dismissed", "superseded"}]
+    open_findings = [item for item in valid_findings if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified"}]
+    open_hazards = [item for item in hazards if str(item.get("status") or "open").lower() not in {"closed", "resolved", "verified", "dismissed"}]
     critical = [
         item for item in [*open_findings, *open_hazards]
         if str(item.get("severity") or "").lower() in {"critical", "high"}
     ]
     ppe_compliant = len(
-        [item for item in findings if str(item.get("ppe_status") or "").lower() == "compliant"]
+        [item for item in valid_findings if str(item.get("ppe_status") or "").lower() == "compliant"]
     )
     ppe_non_compliant = len(
         [
             item
-            for item in findings
+            for item in valid_findings
             if str(item.get("ppe_status") or "").lower()
             in {"non_compliant", "missing"}
         ]
     )
     ppe_unknown = len(
-        [item for item in findings if str(item.get("ppe_status") or "").lower() == "unknown"]
+        [item for item in valid_findings if str(item.get("ppe_status") or "unknown").lower() == "unknown"]
     )
     ppe_evaluated = ppe_compliant + ppe_non_compliant
-    active_permits = [item for item in permits if str(item.get("status") or "").lower() in {"approved", "active"}]
+    active_permits = [item for item in permits if str(item.get("status") or "").lower() in {"approved", "active"}
+                      and str(item.get("valid_from") or day)[:10] <= day <= str(item.get("valid_until") or day)[:10]]
     work_state = str(weather.get("work_state") or "unknown")
     reasons = list(weather.get("reasons") or [])
     latest_job_status = str((jobs[0] if jobs else {}).get("status") or "").lower()
@@ -1494,6 +1607,8 @@ def build_dashboard(
         **_identity(context),
         "record_date": day,
         "filters": {"shift": shift, "tour_id": tour_id, "zone_id": zone_id},
+        "filter_note": "Workforce and daily reports use the selected date. Other records are shown through that date with their current status. Tour filters include project-wide records. Weather is the latest available reading.",
+        "demo_record_count": sum(_is_demo_record(item) for item in [*findings, *hazards, *permits, *zones, *reports, *checks]),
         "generated_at": utc_now().isoformat(),
         "work_state": {"status": work_state, "reasons": reasons},
         "manpower": {
@@ -1503,6 +1618,7 @@ def build_dashboard(
             "observation_source": (observation or {}).get("source"),
             "requires_review": bool((observation or {}).get("requires_review")),
             "planned_source": schedule_plan.get("source", "unavailable"),
+            "planned_unavailable_reason": "" if planned is not None else "No staffing value is available from the active schedule for this date. Check the schedule dates and assigned labour resources.",
             "planned_labor_hours": schedule_plan.get("planned_labor_hours"),
             "plan_period_start": schedule_plan.get("period_start"),
             "plan_period_end": schedule_plan.get("period_end"),
@@ -1544,15 +1660,16 @@ def build_dashboard(
                 if ppe_evaluated
                 else None
             ),
+            "demo_count": sum(_is_demo_record(item) for item in valid_findings),
             "model_note": "Dedicated PPE model upgrade is deferred to Phase 2.",
         },
         "counts": {
             "open_hazards": len(open_hazards),
             "active_permits": len(active_permits),
             "overdue_checks": len(overdue_checks),
-            "active_zones": len([zone for zone in zones if str(zone.get("status") or "active").lower() == "active"]),
+            "active_zones": len([zone for zone in zones if str(zone.get("status") or "active").lower() == "active" and str(zone.get("valid_until") or day)[:10] >= day]),
             "pending_reviews": len(
-                [item for item in [*observations, *findings] if item.get("requires_review") is True]
+                [item for item in [*[row for row in observations if row.get("record_date") == day], *open_findings] if item.get("requires_review") is True]
             ),
             "failed_analysis_jobs": len(
                 [item for item in jobs if str(item.get("status") or "").lower() in {"failed", "partially_completed"}]
@@ -1585,14 +1702,18 @@ def build_dashboard(
             ],
         },
         "recent": {
-            "observations": observations[:10],
-            "findings": findings[:10],
-            "hazards": hazards[:10],
-            "permits": permits[:10],
-            "checks": checks[:10],
+            "observations": sorted(
+                [item for item in observations if item.get("record_date") == day
+                 and (_float(item.get("observed_workers")) or _float((item.get("calculation") or {}).get("observed_workers")) or 0) > 0],
+                key=lambda item: (str(item.get("tour_name") or item.get("tour_id") or ""), int(item.get("point_index") or 0)),
+            ),
+            "findings": findings,
+            "hazards": hazards,
+            "permits": permits,
+            "checks": checks,
             "check_templates": [],
-            "zones": zones[:10],
-            "reports": reports[:10],
+            "zones": zones,
+            "reports": reports,
             "weather_events": weather_events[:10],
             "analysis_jobs": jobs[:5],
         },

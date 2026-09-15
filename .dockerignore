@@ -11,3 +11,6 @@ issue_reports/
 virtual_tours/
 streetview/
 floorplans/
+.git/
+output/
+tmp/

@@ -113,6 +113,19 @@ def dispatch_notification_push_async(notification: dict[str, Any]) -> None:
     thread.start()
 
 
+def unregister_device_token(*, user_id: str, fcm_token: str, app: str = "main") -> dict[str, Any]:
+    """Deactivate only this authenticated user's exact device registration."""
+    token = _normalize_text(fcm_token)
+    owner = _normalize_text(user_id)
+    if not token or not owner:
+        return {"unregistered": False}
+    result = notification_devices_collection.update_one(
+        {"fcm_token": token, "user_id": owner, "app": _normalize_text(app).lower() or "main"},
+        {"$set": {"is_active": False, "updated_at": _now_ms()}},
+    )
+    return {"unregistered": bool(result.matched_count)}
+
+
 def send_notification_push(*, notification: dict[str, Any]) -> dict[str, Any]:
     if not _initialize_firebase():
         return {"sent": 0, "failed": 0, "skipped": True}
@@ -182,7 +195,7 @@ def _recipient_tokens(notification: dict[str, Any]) -> list[str]:
 
 def _message_data(notification: dict[str, Any]) -> dict[str, str]:
     metadata = notification.get("metadata") if isinstance(notification.get("metadata"), dict) else {}
-    return {
+    data = {
         "notification_id": _normalize_text(notification.get("_id")),
         "type": _normalize_text(notification.get("type")),
         "title": _normalize_text(notification.get("title")),
@@ -194,6 +207,11 @@ def _message_data(notification: dict[str, Any]) -> dict[str, str]:
         "entity_type": _normalize_text(notification.get("entity_type")),
         "project_name": _normalize_text(metadata.get("project_name")),
     }
+    for key in ("tour_id", "comment_id", "inspection_id", "activity_id", "activity_name", "pano_id", "node_id"):
+        value = _normalize_text(notification.get(key) or metadata.get(key))
+        if value:
+            data[key] = value
+    return data
 
 
 def _is_invalid_token_error(exc: Exception) -> bool:

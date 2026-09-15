@@ -20,6 +20,19 @@ replace `origin` only when necessary.
 
 ## 2. Build the images
 
+Ensure nginx accepts the floor plan, DXF, site-config, and optional schedule
+files sent by both the mobile and web project-creation flows. The nginx default
+is only 1 MB, which returns an HTML `413 Request Entity Too Large` response
+before FastAPI receives the request.
+
+```bash
+bash scripts/configure_nginx_project_uploads.sh
+```
+
+The script updates only the `api.conscout.com` HTTPS server block, validates
+the complete nginx configuration, restores its timestamped backup if
+validation fails, and reloads nginx after a successful check.
+
 ```bash
 docker build -t conscout-backend-api .
 docker build -f Dockerfile.ai -t conscout-backend-ai .

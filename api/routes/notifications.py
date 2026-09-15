@@ -34,6 +34,7 @@ from services.progress.prediction_notification_service import (
 from services.notifications.push_notification_service import (
     dispatch_notification_push_async,
     register_device_token,
+    unregister_device_token,
 )
 
 
@@ -94,6 +95,7 @@ def _serialize_notification(doc: dict) -> dict:
         "status": str(doc.get("status") or "pending"),
         "severity": str(doc.get("severity") or ""),
         "is_read": bool(doc.get("is_read") is True),
+        "is_archived": bool(doc.get("is_archived") is True or doc.get("status") == "archived"),
         "created_at": int(doc.get("created_at") or 0),
         "updated_at": int(doc.get("updated_at") or doc.get("created_at") or 0),
         "acted_at": int(doc.get("acted_at") or 0),
@@ -260,6 +262,7 @@ def _find_notification_for_current_user(
 
 @router.get("")
 def list_notifications(
+    include_archived: bool = False,
     current_user: AuthenticatedUser = Depends(require_authenticated_user),
 ):
     _best_effort_inspection_notification_sync(current_user)
@@ -267,7 +270,10 @@ def list_notifications(
     _best_effort_prediction_notification_sync(current_user)
     _best_effort_safety_notification_sync(current_user)
     records = list(
-        notifications_collection.find(_recipient_filter(current_user)).sort(
+        notifications_collection.find({
+            **_recipient_filter(current_user),
+            **({} if include_archived else {"is_archived": {"$ne": True}, "status": {"$ne": "archived"}}),
+        }).sort(
             "created_at",
             -1,
         )
@@ -282,7 +288,8 @@ def unread_notification_count(
     count = notifications_collection.count_documents(
         {
             **_recipient_filter(current_user),
-            "status": "pending",
+            "status": {"$ne": "archived"},
+            "is_archived": {"$ne": True},
             "is_read": {"$ne": True},
         }
     )
@@ -305,6 +312,60 @@ def register_notification_device(
         app=payload.app,
     )
     return {"message": "Notification device registered", **result}
+
+
+@router.post("/unregister-device")
+def unregister_notification_device(
+    payload: RegisterDeviceRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    if not payload.fcm_token.strip():
+        raise HTTPException(status_code=400, detail="fcm_token is required")
+    return unregister_device_token(
+        user_id=current_user.user_id, fcm_token=payload.fcm_token, app=payload.app,
+    )
+
+
+@router.post("/mark-all-read")
+def mark_all_notifications_read(
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    now = _now_ms()
+    result = notifications_collection.update_many(
+        {**_recipient_filter(current_user), "is_read": {"$ne": True},
+         "is_archived": {"$ne": True}, "status": {"$ne": "archived"}},
+        {"$set": {"is_read": True, "read_at": now, "updated_at": now}},
+    )
+    return {"message": "Notifications marked as read", "updated_count": result.modified_count}
+
+
+def _update_notification_state(notification_id: str, current_user: AuthenticatedUser, changes: dict) -> dict:
+    notification = _find_notification_for_current_user(notification_id, current_user)
+    notifications_collection.update_one(
+        {"_id": notification["_id"]},
+        {"$set": {**changes, "updated_at": _now_ms()}},
+    )
+    updated = notifications_collection.find_one({"_id": notification["_id"]}) or {**notification, **changes}
+    return {"notification": _serialize_notification(updated)}
+
+
+@router.post("/{notification_id}/unread")
+def mark_notification_as_unread(notification_id: str, current_user: AuthenticatedUser = Depends(require_authenticated_user)):
+    return _update_notification_state(notification_id, current_user, {"is_read": False, "read_at": 0})
+
+
+@router.post("/{notification_id}/archive")
+def archive_notification(notification_id: str, current_user: AuthenticatedUser = Depends(require_authenticated_user)):
+    return _update_notification_state(notification_id, current_user, {"is_archived": True})
+
+
+@router.post("/{notification_id}/unarchive")
+def unarchive_notification(notification_id: str, current_user: AuthenticatedUser = Depends(require_authenticated_user)):
+    notification = _find_notification_for_current_user(notification_id, current_user)
+    changes = {"is_archived": False}
+    if notification.get("status") == "archived":
+        changes["status"] = "pending"
+    return _update_notification_state(notification_id, current_user, changes)
 
 
 @router.post("/{notification_id}/read")
