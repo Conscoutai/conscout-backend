@@ -1,6 +1,6 @@
 # Shared notifications for mobile and Next.js web
 
-Updated: 2026-09-15. Status: Main API deployed; live push acceptance blocked by missing Firebase credentials.
+Updated: 2026-09-15. Status: Main API deployed and Firebase authentication verified; physical-device push acceptance pending.
 
 ## Contract additions
 
@@ -65,7 +65,7 @@ alone do not generate those events.
   were preserved. AI and Lite containers did not require replacement for this
   Main API change.
 
-### Remaining push activation blocker
+### Push activation blocker found during initial rollout
 
 The running Main API has the Firebase Admin SDK, but its configured
 `FIREBASE_CREDENTIALS_FILE=/secrets/firebase-adminsdk.json` does not exist inside
@@ -79,3 +79,20 @@ key/provisioning and test authorized delivery on Android and a signed iPhone
 build (foreground, background, cold launch, denied permission and logout).
 Registered device records alone do not prove delivery. No test push was sent
 as part of this deployment.
+
+### Firebase activation completed — 2026-09-15
+
+Installed the user-provided `conscout-mobile` Admin credential outside the
+repository at `/root/conscout-secrets/firebase-adminsdk.json`, with root-only
+permissions (directory `700`, file `600`). The Main API now bind-mounts it
+read-only at `/secrets/firebase-adminsdk.json`.
+
+Verified credential parsing, Firebase initialization and Google OAuth token
+acquisition for Firebase Messaging from the running API. Public API health and
+notification routes pass. These checks do not prove device delivery; no push
+was sent. The user's Firebase/APNs console checks were reported as correct.
+
+The deployment script and manual deployment command now preserve this mount.
+The script rejects a missing credential before replacing running containers.
+Next: enable notifications on the test devices and perform an explicitly
+authorized push-delivery test on Android and iPhone.

@@ -18,6 +18,17 @@ git pull --ff-only origin main
 If the VPS clone tracks a different remote, check it with `git remote -v` and
 replace `origin` only when necessary.
 
+## Firebase Admin credential
+
+The Main API credential is stored outside Git at
+`/root/conscout-secrets/firebase-adminsdk.json` (directory mode `700`, file mode
+`600`). Keep this file private and bind-mount it read-only into the Main API at
+`/secrets/firebase-adminsdk.json`. Do not bake credentials into Docker images.
+
+`scripts/deploy_vps.sh` checks that this file is readable before replacing any
+container and preserves the mount on every deployment. To use another host
+location, set `FIREBASE_CREDENTIALS_HOST_FILE` when running that script.
+
 ## 2. Build the images
 
 Ensure nginx accepts the floor plan, DXF, site-config, and optional schedule
@@ -51,7 +62,7 @@ docker run -d --restart always --network conscout-main -p 8001:8001 --env-file .
 ```
 
 ```bash
-docker run -d --restart always --network conscout-main -p 8000:8000 --env-file .env -e AI_SERVICE_URL=http://conscout-backend-ai:8001 -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-api conscout-backend-api
+docker run -d --restart always --network conscout-main -p 8000:8000 --env-file .env -e AI_SERVICE_URL=http://conscout-backend-ai:8001 -e FIREBASE_CREDENTIALS_FILE=/secrets/firebase-adminsdk.json --mount type=bind,src=/root/conscout-secrets/firebase-adminsdk.json,dst=/secrets/firebase-adminsdk.json,readonly -v ~/conscout-storage/data:/data -v ~/conscout-storage/models:/models --name conscout-backend-api conscout-backend-api
 ```
 
 The named `conscout-main` network is required: the Main API calls the AI
