@@ -1,6 +1,6 @@
 # Shared notifications for mobile and Next.js web
 
-Updated: 2026-09-10. Status: implemented locally, not deployed.
+Updated: 2026-09-15. Status: Main API deployed; live push acceptance blocked by missing Firebase credentials.
 
 ## Contract additions
 
@@ -48,3 +48,34 @@ gated immediately.
 Budget/Materials/Activity event producers and production verification of the
 existing event generators remain follow-up work. Endpoint and routing support
 alone do not generate those events.
+
+## VPS rollout — 2026-09-15
+
+- Source commit `f8316df` was pushed to both `origin/main` and `client/main`.
+- Main API deployed as `conscout-backend-api:f8316df`; the prior container is
+  retained stopped for rollback. Existing environment, mounts, network and
+  restart configuration were preserved.
+- All 32 focused notification, safety and workforce tests passed locally and
+  inside the production image with mocked data and no production DB access.
+- Public Main/Lite health, Main database ping, Main-to-AI health, and all five
+  new notification action routes passed read-only checks.
+- Applied the project upload nginx configuration (256 MB); nginx validation
+  and reload succeeded.
+- Existing VPS Dockerfile.ai customization and deployment-script permissions
+  were preserved. AI and Lite containers did not require replacement for this
+  Main API change.
+
+### Remaining push activation blocker
+
+The running Main API has the Firebase Admin SDK, but its configured
+`FIREBASE_CREDENTIALS_FILE=/secrets/firebase-adminsdk.json` does not exist inside
+its container. Firebase initialization fails. No matching credential was found
+in the checked backend, storage or standard secret directories on the VPS.
+
+Provision the correct Firebase Admin service-account credential securely outside
+Git and the Docker build context, bind-mount it read-only at the configured
+container path, and recheck Firebase initialization. Then verify the iOS APNs
+key/provisioning and test authorized delivery on Android and a signed iPhone
+build (foreground, background, cold launch, denied permission and logout).
+Registered device records alone do not prove delivery. No test push was sent
+as part of this deployment.
