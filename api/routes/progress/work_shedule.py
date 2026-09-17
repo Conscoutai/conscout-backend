@@ -196,6 +196,7 @@ class ScheduleActivityMappingRequest(BaseModel):
 
 
 class ScheduleEvidenceReviewRequest(BaseModel):
+    resolve_progress_conflict: bool = False
     decision: Literal["approved", "rejected"]
     approved_percent: Optional[float] = Field(None, ge=0, le=100)
     verified_quantity: Optional[float] = Field(None, ge=0)
@@ -407,6 +408,7 @@ def review_activity_evidence(
         review_note=payload.note,
         reviewer_user_id=current_user.user_id,
         reviewer_email=current_user.email,
+        resolve_progress_conflict=payload.resolve_progress_conflict,
     )
 
 

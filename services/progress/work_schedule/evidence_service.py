@@ -362,10 +362,21 @@ def review_schedule_evidence(
     review_note: str,
     reviewer_user_id: str,
     reviewer_email: str,
+    resolve_progress_conflict: bool = False,
 ) -> dict[str, Any]:
     normalized_decision = str(decision or "").strip().lower()
     if normalized_decision not in {"approved", "rejected"}:
         raise HTTPException(400, "decision must be approved or rejected")
+    if evidence_id.startswith("scheduleupdate:"):
+        from .approved_progress_service import review_schedule_observation
+
+        return review_schedule_observation(
+            evidence_id,
+            normalized_decision,
+            approved_percent,
+            review_note,
+            reviewer_email,
+        )
     evidence = schedule_evidence_collection.find_one({"evidence_id": evidence_id})
     if not evidence:
         raise HTTPException(404, "Schedule evidence not found")
@@ -412,6 +423,7 @@ def review_schedule_evidence(
         {
             "$set": {
                 "status": normalized_decision,
+                "progress_conflict_confirmed": resolve_progress_conflict,
                 "approved_percent": (
                     approved_percent if normalized_decision == "approved" else None
                 ),
@@ -460,6 +472,19 @@ def review_schedule_evidence(
     updated = schedule_evidence_collection.find_one(
         {"evidence_id": evidence_id}, {"_id": 0}
     )
+    if comparison:
+        resolved = next(
+            (
+                item
+                for row in comparison.get("activities", [])
+                for item in row.get("evidence", [])
+                if item.get("evidence_id") == evidence_id
+            ),
+            None,
+        )
+        if resolved:
+            normalized_decision = resolved["status"]
+            updated = {**(updated or {}), **resolved}
     return {"status": normalized_decision, "evidence": updated}
 
 
@@ -489,7 +514,7 @@ def record_manual_activity_progress(
         raise HTTPException(400, "Provide approved_percent or verified_quantity")
 
     evidence_id = f"evidence_{uuid4().hex}"
-    manual_tour_id = f"manual:{observed.date().isoformat()}"
+    manual_tour_id = f"manual:{observed.date().isoformat()}:{uuid4().hex}"
     existing = schedule_evidence_collection.find_one(
         {
             "baseline_id": baseline_id,

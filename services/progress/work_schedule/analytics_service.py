@@ -75,8 +75,7 @@ def _working_days(
     # weeks arithmetically, then inspect at most six remaining days.
     valid_weekdays = weekdays.intersection(range(7))
     return full_weeks * len(valid_weekdays) + sum(
-        (start.weekday() + offset) % 7 in valid_weekdays
-        for offset in range(remainder)
+        (start.weekday() + offset) % 7 in valid_weekdays for offset in range(remainder)
     )
 
 
@@ -218,9 +217,7 @@ def _evidence_by_activity(
             "status": str(evidence.get("status") or "needs_review"),
             "suggested_percent": evidence.get("suggested_percent"),
             "approved_percent": evidence.get("approved_percent"),
-            "previous_approved_percent": evidence.get(
-                "previous_approved_percent"
-            ),
+            "previous_approved_percent": evidence.get("previous_approved_percent"),
             "verified_quantity": evidence.get("verified_quantity"),
             "quantity_unit": str(evidence.get("quantity_unit") or ""),
             "review_note": str(evidence.get("review_note") or ""),
@@ -230,11 +227,16 @@ def _evidence_by_activity(
             "rationale": str(evidence.get("rationale") or ""),
         }
         evidence_by_activity[activity_key].append(public_item)
-        if evidence.get("status") == "approved" and evidence.get("approved_percent") is not None:
+        if (
+            evidence.get("status") == "approved"
+            and evidence.get("approved_percent") is not None
+        ):
             actual_by_activity[activity_key] = min(
                 100.0, max(0.0, float(evidence["approved_percent"]))
             )
-            if observed_on and (latest_observation is None or observed_on > latest_observation):
+            if observed_on and (
+                latest_observation is None or observed_on > latest_observation
+            ):
                 latest_observation = observed_on
     for activity_key, items in evidence_by_activity.items():
         evidence_by_activity[activity_key] = list(reversed(items[-10:]))
@@ -265,7 +267,8 @@ def _forecast_schedule_dates(
         evidence_dates = [
             observed
             for item in evidence_by_activity.get(activity_id, [])
-            if (
+            if item.get("status") == "approved"
+            and (
                 observed := _project_date(
                     item.get("captured_at") or item.get("observed_at"),
                     str(baseline.get("timezone") or "UTC"),
@@ -276,8 +279,10 @@ def _forecast_schedule_dates(
         baseline_workdays = max(
             _working_days(baseline_start, baseline_finish, weekdays), 1
         )
-        remaining_workdays = 0 if actual >= 100 else max(
-            1, int(round(baseline_workdays * (1.0 - actual / 100.0)))
+        remaining_workdays = (
+            0
+            if actual >= 100
+            else max(1, int(round(baseline_workdays * (1.0 - actual / 100.0))))
         )
         if actual >= 100:
             finish = max(evidence_dates) if evidence_dates else baseline_finish
@@ -304,9 +309,7 @@ def _forecast_schedule_dates(
         changed = False
         for relationship in relationships:
             successor_id = str(relationship.get("activity_internal_id") or "")
-            predecessor_id = str(
-                relationship.get("predecessor_internal_id") or ""
-            )
+            predecessor_id = str(relationship.get("predecessor_internal_id") or "")
             successor = forecast.get(successor_id)
             predecessor = forecast.get(predecessor_id)
             if not successor or not predecessor or successor["complete"]:
@@ -351,6 +354,7 @@ def _curve_points(
     baseline: dict[str, Any],
     activities: list[dict[str, Any]],
     as_of: date,
+    approved_timeline: Optional[dict] = None,
 ) -> dict[str, list[dict[str, Any]]]:
     project = baseline.get("project") or {}
     start = _parse_date(project.get("planned_start_at"))
@@ -401,51 +405,22 @@ def _curve_points(
             }
         )
 
-    approved_evidence = list(
-        schedule_evidence_collection.find(
-            {
-                "baseline_id": baseline["baseline_id"],
-                "status": "approved",
-                "approved_percent": {"$ne": None},
-            },
-            {"_id": 0},
-        ).sort([("captured_at", 1), ("updated_at", 1)])
-    )
-    observed_dates = sorted(
+    if approved_timeline is None:
+        from .approved_progress_service import load_progress
+
+        approved_timeline = load_progress(
+            baseline["baseline_id"],
+            activities,
+            as_of,
+            str(baseline.get("timezone") or "UTC"),
+        )["timeline"]
+    actual_points = [
         {
-            observed
-            for item in approved_evidence
-            if (
-                observed := _project_date(
-                    item.get("captured_at") or item.get("observed_at"),
-                    str(baseline.get("timezone") or "UTC"),
-                )
-            )
-            and observed <= as_of
+            "date": day,
+            "percent": _weighted_percent(activities, values, weight_field=weight_field),
         }
-    )
-    actual_points: list[dict[str, Any]] = []
-    for observed_on in observed_dates:
-        actual_by_activity: dict[str, float] = {}
-        for evidence in approved_evidence:
-            evidence_date = _project_date(
-                evidence.get("captured_at") or evidence.get("observed_at"),
-                str(baseline.get("timezone") or "UTC"),
-            )
-            if evidence_date and evidence_date <= observed_on:
-                actual_by_activity[str(evidence.get("activity_internal_id") or "")] = float(
-                    evidence.get("approved_percent") or 0.0
-                )
-        actual_points.append(
-            {
-                "date": observed_on.isoformat(),
-                "percent": _weighted_percent(
-                    activities, actual_by_activity, weight_field=weight_field
-                ),
-            }
-        )
-    if not actual_points:
-        actual_points.append({"date": as_of.isoformat(), "percent": 0.0})
+        for day, values in approved_timeline.items()
+    ] or [{"date": as_of.isoformat(), "percent": 0.0}]
 
     return {"planned": planned_points, "actual": actual_points, "forecast": []}
 
@@ -546,11 +521,17 @@ def build_baseline_comparison(
             {"baseline_id": baseline["baseline_id"]}, {"_id": 0}
         ).sort([("start_date", 1), ("activity_id", 1)])
     )
-    actual_by_activity, evidence_by_activity, latest_observation = _evidence_by_activity(
-        baseline_id=baseline["baseline_id"],
-        as_of=observation_date,
-        timezone_name=str(baseline.get("timezone") or "UTC"),
+    from .approved_progress_service import load_progress
+
+    approved = load_progress(
+        baseline["baseline_id"],
+        activities,
+        observation_date,
+        str(baseline.get("timezone") or "UTC"),
     )
+    actual_by_activity = approved["values"]
+    evidence_by_activity = approved["history"]
+    latest_observation = _parse_date(approved["latest_date"])
     calendars = {
         str(item.get("calendar_id") or ""): item
         for item in baseline.get("calendars") or []
@@ -568,9 +549,7 @@ def build_baseline_comparison(
         else "duration"
     )
     primary_weight_field = (
-        "target_cost"
-        if weighting_method == "target_cost"
-        else "target_duration_hours"
+        "target_cost" if weighting_method == "target_cost" else "target_duration_hours"
     )
 
     project_planned = _weighted_percent(
@@ -609,7 +588,11 @@ def build_baseline_comparison(
         primary_status = "NOT STARTED"
         if actual >= 100:
             primary_status = "DONE"
-        elif actual > 0:
+        elif (
+            actual > 0
+            or approved["selected"].get(internal_id, {}).get("schedule_status")
+            == "In progress"
+        ):
             primary_status = "IN PROGRESS"
         elif planned > 0:
             primary_status = "DELAYED" if delay_days > 0 else "NOT STARTED"
@@ -622,19 +605,41 @@ def build_baseline_comparison(
             {
                 **activity,
                 "planned_percent": planned,
-                "progress_weight": max(0.0, float(activity.get(primary_weight_field) or 0)),
+                "progress_weight": max(
+                    0.0, float(activity.get(primary_weight_field) or 0)
+                ),
                 "actual_percent": actual,
                 "has_verified_progress": internal_id in actual_by_activity,
+                "progress_source": (
+                    "client_schedule"
+                    if approved["selected"].get(internal_id, {}).get("review_source")
+                    == "client_schedule"
+                    else (
+                        "manual"
+                        if approved["selected"]
+                        .get(internal_id, {})
+                        .get("review_source")
+                        == "manual"
+                        else "tour" if internal_id in actual_by_activity else ""
+                    )
+                ),
+                "progress_as_of": approved["selected"]
+                .get(internal_id, {})
+                .get("observed_at", ""),
+                "progress_known": internal_id in actual_by_activity,
+                "progress_conflict": any(
+                    item.get("progress_conflict") for item in evidence
+                ),
                 "variance_percent": variance,
                 "delay_days": delay_days,
                 "status": primary_status,
                 "primary_status": primary_status,
-                "observed_start_date": min(observed_dates).isoformat()
-                if observed_dates
-                else "",
-                "observed_end_date": max(observed_dates).isoformat()
-                if observed_dates
-                else "",
+                "observed_start_date": (
+                    min(observed_dates).isoformat() if observed_dates else ""
+                ),
+                "observed_end_date": (
+                    max(observed_dates).isoformat() if observed_dates else ""
+                ),
                 "related_tour_ids": sorted(
                     {
                         str(item.get("tour_id") or "")
@@ -660,9 +665,11 @@ def build_baseline_comparison(
     )
     forecast_delay_days = max(
         0,
-        (forecast_finish - baseline_finish).days
-        if forecast_finish and baseline_finish
-        else 0,
+        (
+            (forecast_finish - baseline_finish).days
+            if forecast_finish and baseline_finish
+            else 0
+        ),
     )
     for activity in activity_rows:
         forecast_item = forecast_by_activity.get(
@@ -678,6 +685,7 @@ def build_baseline_comparison(
         baseline=baseline,
         activities=activities,
         as_of=observation_date,
+        approved_timeline=approved["timeline"],
     )
     if curves["actual"] and forecast_finish:
         latest_actual = curves["actual"][-1]
@@ -699,33 +707,34 @@ def build_baseline_comparison(
             "schedule_planned_percent": duration_planned,
             "schedule_actual_percent": duration_actual,
             "delay_days": forecast_delay_days,
-            "baseline_finish_date": baseline_finish.isoformat()
-            if baseline_finish
-            else "",
-            "forecast_finish_date": forecast_finish.isoformat()
-            if forecast_finish
-            else "",
+            "baseline_finish_date": (
+                baseline_finish.isoformat() if baseline_finish else ""
+            ),
+            "forecast_finish_date": (
+                forecast_finish.isoformat() if forecast_finish else ""
+            ),
             "delayed_activity_count": delayed_count,
             "critical_activity_count": sum(
                 1 for activity in activities if activity.get("is_critical")
             ),
             "needs_review_count": needs_review_count,
             "data_as_of": observation_date.isoformat(),
-            "last_verified_capture_date": latest_observation.isoformat()
-            if latest_observation
-            else "",
+            "progress_as_of": approved["latest_date"],
+            "progress_basis": "approved",
+            "unknown_progress_count": len(activities) - len(actual_by_activity),
+            "last_verified_capture_date": (
+                latest_observation.isoformat() if latest_observation else ""
+            ),
             "weighting_method": weighting_method,
         },
         "curves": curves,
         "manpower": {
             "is_partial": int(
-                (baseline.get("summary") or {}).get("labor_loaded_activity_count")
-                or 0
+                (baseline.get("summary") or {}).get("labor_loaded_activity_count") or 0
             )
             < len(activities),
             "labor_loaded_activity_count": int(
-                (baseline.get("summary") or {}).get("labor_loaded_activity_count")
-                or 0
+                (baseline.get("summary") or {}).get("labor_loaded_activity_count") or 0
             ),
             "activity_count": len(activities),
             "points": _manpower_points(baseline=baseline, activities=activities),
