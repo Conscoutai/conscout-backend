@@ -71,3 +71,16 @@ these historical snapshots.
 Deploy only the Main API, preserving its environment, mounts and network. Retain a
 stopped rollback container. No client files are imported or accepted during deployment.
 The mobile source change requires an updated installed app to remove the old switch.
+
+
+Baseline revision continuity: new XER imports record an immutable progress-parent
+link to the active baseline and unique, compatible Activity IDs. Import warnings
+show matched/new/removed counts and renamed IDs for review. Progress resolution
+reads ancestor source records through those allowed IDs, remaps internal IDs, and
+retains original evidence/update IDs and review history without copying records.
+Each revision intersects allowed IDs; cycles and cross-project links are blocked.
+Reactivation keeps its original parent. A changed active baseline before first
+activation requires returning to the reviewed source baseline. New or incompatible
+activities receive no inherited percentage. No existing baseline/data migration is
+performed. Client snapshot dates/forecasts stay historical; current progress and
+curves use the same inherited approved timeline.

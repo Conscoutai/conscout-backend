@@ -448,16 +448,21 @@ def review_schedule_evidence(
     )
     if comparison:
         summary = comparison.get("summary") or {}
+        # An inherited source observation can be reviewed from a newer baseline.
+        # Store derived totals under the baseline whose scope was calculated.
+        snapshot_baseline_id = (comparison.get("baseline") or {}).get(
+            "baseline_id"
+        ) or evidence.get("baseline_id")
         schedule_progress_snapshots_collection.update_one(
             {
-                "baseline_id": evidence.get("baseline_id"),
+                "baseline_id": snapshot_baseline_id,
                 "snapshot_date": observed_at.date().isoformat(),
             },
             {
                 "$set": {
                     "project_id": evidence.get("project_id"),
                     "floorplan_id": evidence.get("floorplan_id"),
-                    "baseline_id": evidence.get("baseline_id"),
+                    "baseline_id": snapshot_baseline_id,
                     "snapshot_date": observed_at.date().isoformat(),
                     "captured_at": observed_at,
                     "planned_percent": summary.get("planned_percent"),

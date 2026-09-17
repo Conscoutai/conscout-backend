@@ -115,6 +115,7 @@ def _public_baseline(document: dict[str, Any]) -> dict[str, Any]:
         "summary": document.get("summary") or {},
         "warnings": document.get("warnings") or [],
         "calendars": document.get("calendars") or [],
+        "progress_carry_forward": document.get("progress_parent") or {},
         "uploaded_at": document.get("uploaded_at"),
         "activated_at": document.get("activated_at"),
     }
@@ -200,6 +201,43 @@ def import_schedule_baseline(
         "uploaded_at": now,
         "updated_at": now,
     }
+    previous = schedule_baselines_collection.find_one(
+        {"project_id": project_id, "is_active": True}
+    )
+    if (
+        previous
+        and parsed["source_type"] == "xer"
+        and previous.get("source_type") == "xer"
+    ):
+        from .baseline_progress_service import carry_plan
+
+        old_activities = list(
+            schedule_activities_collection.find(
+                {"baseline_id": previous["baseline_id"]}, {"_id": 0}
+            )
+        )
+        plan = carry_plan(previous, old_activities, parsed["activities"])
+        baseline_document["progress_parent"] = plan
+        baseline_document["warnings"] = list(baseline_document["warnings"]) + [
+            {
+                "code": "baseline_progress_carry_forward",
+                "count": plan["matched_count"],
+                "message": (
+                    f"{plan['matched_count']} matching activities will keep previous progress and history. "
+                    f"{plan['new_or_changed_count']} new or changed activities will need progress updates. "
+                    f"{plan['removed_count']} removed activities stay in the previous baseline."
+                ),
+            }
+        ]
+        if plan["renamed_activity_ids"]:
+            baseline_document["warnings"].append(
+                {
+                    "code": "carry_forward_renamed_activities",
+                    "count": len(plan["renamed_activity_ids"]),
+                    "activity_ids": plan["renamed_activity_ids"],
+                    "message": "Some matching Activity IDs have new names. Check that they still describe the same work before activating.",
+                }
+            )
     try:
         schedule_baselines_collection.insert_one(baseline_document)
         activities = [
@@ -311,6 +349,17 @@ def activate_schedule_baseline(*, project_ref: str, baseline_id: str) -> dict[st
     )
     if not baseline:
         raise HTTPException(404, "Schedule baseline not found for this project")
+
+    parent = baseline.get("progress_parent")
+    if parent and not baseline.get("activated_at"):
+        active = schedule_baselines_collection.find_one(
+            {"project_id": project_id, "is_active": True}
+        )
+        if active and active["baseline_id"] not in {parent["baseline_id"], baseline_id}:
+            raise HTTPException(
+                409,
+                "The active baseline changed after this import. Reactivate the reviewed source baseline before activating this revision.",
+            )
 
     now = datetime.now(timezone.utc)
     schedule_baselines_collection.update_many(
@@ -1093,9 +1142,7 @@ def delete_project_schedule_zone_plan(project_ref: str) -> dict[str, Any]:
     project_context = resolve_project(project_ref)
     project = project_context["document"]
     project_id = project_context["project_id"]
-    active_zones, active_plan, proposed_zones, proposed_plan = _zone_plan_state(
-        project
-    )
+    active_zones, active_plan, proposed_zones, proposed_plan = _zone_plan_state(project)
     plan_ids = {
         str(plan.get("zone_plan_id") or "").strip()
         for plan in (active_plan, proposed_plan)

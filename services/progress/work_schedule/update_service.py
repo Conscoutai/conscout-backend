@@ -381,12 +381,33 @@ def accept_schedule_update(
 
 
 def attach_reported_progress(
-    payload: dict, baseline_id: str, as_of: str, calendars: dict | None = None
+    payload: dict,
+    baseline_id: str,
+    as_of: str,
+    calendars: dict | None = None,
+    baseline: dict | None = None,
 ) -> dict:
     update = latest_accepted(baseline_id, as_of)
+    inherited_ids = None
+    if not update and baseline and baseline.get("progress_parent"):
+        from .baseline_progress_service import inherited_sources
+
+        candidates = [
+            (latest_accepted(source["baseline_id"], as_of), ids)
+            for source, ids in inherited_sources(baseline)
+        ]
+        candidates = [(u, ids) for u, ids in candidates if u]
+        if candidates:
+            update, inherited_ids = max(
+                candidates, key=lambda pair: pair[0]["data_date"]
+            )
     if not update:
         return payload
-    by_id = {a["activity_id"]: a for a in update["activities"] if a["matched"]}
+    by_id = {
+        a["activity_id"]: a
+        for a in update["activities"]
+        if a["matched"] and (inherited_ids is None or a["activity_id"] in inherited_ids)
+    }
     differences = 0
     from .analytics_service import _planned_percent
 

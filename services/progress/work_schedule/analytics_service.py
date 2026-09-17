@@ -413,6 +413,7 @@ def _curve_points(
             activities,
             as_of,
             str(baseline.get("timezone") or "UTC"),
+            baseline=baseline,
         )["timeline"]
     actual_points = [
         {
@@ -528,6 +529,7 @@ def build_baseline_comparison(
         activities,
         observation_date,
         str(baseline.get("timezone") or "UTC"),
+        baseline=baseline,
     )
     actual_by_activity = approved["values"]
     evidence_by_activity = approved["history"]
@@ -743,7 +745,11 @@ def build_baseline_comparison(
         "actual_percent": project_actual,
     }
     return attach_reported_progress(
-        payload, baseline["baseline_id"], observation_date.isoformat(), calendars
+        payload,
+        baseline["baseline_id"],
+        observation_date.isoformat(),
+        calendars,
+        baseline=baseline,
     )
 
 

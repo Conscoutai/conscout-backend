@@ -31,7 +31,7 @@ def resolve_progress(
             "evidence_id tour_id tour_name site_name captured_at uploaded_at node_id "
             "node_index total_nodes work_type work_category zone image_url confidence "
             "status suggested_percent approved_percent previous_approved_percent "
-            "verified_quantity quantity_unit review_note review_source reviewed_at "
+            "verified_quantity quantity_unit review_note review_source reviewed_at source_baseline_id "
             "reviewed_by_email rationale activity_internal_id progress_conflict_confirmed"
         )
         item = {key: raw.get(key) for key in fields.split()}
@@ -57,6 +57,7 @@ def resolve_progress(
                     "tour_id": "",
                     "tour_name": update.get("source_filename", "Client schedule"),
                     "review_source": "client_schedule",
+                    "source_baseline_id": update.get("baseline_id", ""),
                     "observed_at": update.get("data_date"),
                     "status": review.get("decision", "approved"),
                     "suggested_percent": pct,
@@ -170,14 +171,25 @@ def resolve_progress(
 
 
 def load_progress(
-    baseline_id: str, activities: list[dict], as_of: date, timezone_name: str
+    baseline_id: str,
+    activities: list[dict],
+    as_of: date,
+    timezone_name: str,
+    baseline: dict | None = None,
 ) -> dict:
+    from .baseline_progress_service import inherited_history
+
+    inherited_evidence, inherited_updates = inherited_history(
+        baseline, activities, schedule_evidence_collection, schedule_updates_collection
+    )
     return resolve_progress(
         activities,
-        list(
+        inherited_evidence
+        + list(
             schedule_evidence_collection.find({"baseline_id": baseline_id}, {"_id": 0})
         ),
-        list(
+        inherited_updates
+        + list(
             schedule_updates_collection.find(
                 {"baseline_id": baseline_id, "status": "accepted"}, {"_id": 0}
             )
