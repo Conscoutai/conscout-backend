@@ -14,9 +14,10 @@ the mobile Activity view filters activities by their current approved source; it
 not switch between competing project totals. The default is all sources.
 
 - Activity matching uses external Activity IDs, not P6 internal numeric IDs.
-- Newer approved observations can advance progress. Older observations uploaded
-  later enrich history without replacing a newer approved observation.
-- A reduction or differing percentage on the same project-local observation date
+- Newer approved observations can advance progress. History is reconciled by progress date, not upload or approval time.
+  An older XER accepted later still protects its completed work from an
+  unconfirmed manual reduction.
+- A reduction (including an existing manual entry) or differing percentage on the same project-local observation date
   is held for review. The previous approved value remains current.
 - Explicit review can approve a correction or reject it. A later observation still
   takes precedence over a correction to an older date.

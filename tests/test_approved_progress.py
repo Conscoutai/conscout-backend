@@ -232,11 +232,38 @@ def test_review_unknown_or_other_owner_snapshot_is_not_found():
         assert error.value.status_code == 404
 
 
-def test_older_higher_observation_cannot_turn_newer_approval_into_conflict():
+def test_late_upload_rechecks_reductions_against_progress_dates():
     result = resolve([evidence("2024-09-01", 90, updated_at="2025-01-01T12:00:00Z")])
-    assert result["values"]["old-2"] == 40
-    assert result["timeline"]["2024-10-27"]["old-2"] == 40
-    assert not any(i.get("progress_conflict") for i in result["history"]["old-2"])
+    assert result["values"]["old-2"] == 90
+    assert result["timeline"]["2024-09-01"]["old-2"] == 90
+    assert result["history"]["old-2"][0]["progress_conflict"]
+
+
+@pytest.mark.parametrize(
+    "accepted_at", ["2024-10-28T12:00:00Z", "2026-09-17T05:29:00Z"]
+)
+def test_completed_xer_stays_100_despite_existing_zero_and_76_manual_entries(
+    accepted_at,
+):
+    result = resolve(
+        [
+            evidence("2026-08-16", 0, evidence_id="zero"),
+            evidence(
+                "2026-08-17", 76, evidence_id="partial", previous_approved_percent=100
+            ),
+        ],
+        [snapshot(percentages=(100, 100), accepted_at=accepted_at)],
+        date(2026, 9, 17),
+    )
+    assert result["values"]["old-2"] == 100
+    assert result["selected"]["old-2"]["review_source"] == "client_schedule"
+    assert result["selected"]["old-2"]["observed_at"] == "2024-10-27"
+    assert all(
+        i["status"] == "needs_review"
+        for i in result["history"]["old-2"]
+        if i["evidence_id"] in {"zero", "partial"}
+    )
+    assert list(result["timeline"].values())[-1]["old-2"] == 100
 
 
 def test_review_persists_audited_decision_without_replacing_snapshot():

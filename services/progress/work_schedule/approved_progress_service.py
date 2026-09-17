@@ -93,7 +93,10 @@ def resolve_progress(
                 order = 0
         dated.append((observed, order, str(item.get("evidence_id") or ""), item))
     selected, values, history, timeline = {}, {}, defaultdict(list), {}
-    for observed, _, _, item in sorted(dated, key=lambda e: (e[1], e[0], e[2])):
+    # Reconcile by progress date, even when an old XER is accepted today.
+    # Otherwise a previously saved manual reduction escapes comparison with
+    # the earlier completed schedule observation.
+    for observed, _, _, item in sorted(dated, key=lambda e: e[:3]):
         key = str(item["activity_internal_id"])
         previous = selected.get(key)
         pct = item.get("approved_percent")
@@ -120,7 +123,7 @@ def resolve_progress(
             item["approved_percent"] = None
             item["previous_approved_percent"] = previous["approved_percent"]
             item["rationale"] = (
-                "Progress decreased or differs on the same observation date. Review before replacing approved progress."
+                "This update lowers progress or gives a different value for the same date. Check it before changing the current progress."
             )
         elif candidate and not older:
             selected[key] = item
@@ -129,7 +132,7 @@ def resolve_progress(
             item["status"] = "needs_review"
             item["approved_percent"] = None
             item["rationale"] = (
-                "No usable completion percentage in this schedule observation."
+                "This schedule update has no usable progress percentage."
             )
         history[key].append(item)
     for key, items in history.items():
@@ -144,9 +147,8 @@ def resolve_progress(
                 item["status"] = "superseded"
                 item["progress_conflict"] = False
         items.sort(key=lambda item: item["observed_at"], reverse=True)
-    # Reconstruct historical points from accepted observations. Conflicts are
-    # excluded; an observation uploaded late can enrich history but cannot
-    # invalidate an already approved, more recent observation.
+    # The curve uses the same reconciled history as the current value.
+    # Unconfirmed reductions never appear as completed progress in either.
     historical_values = {}
     for observed, _, _, item in sorted(dated, key=lambda e: e[:3]):
         if item.get("status") != "approved" or item.get("approved_percent") is None:
