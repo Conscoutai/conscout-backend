@@ -1,8 +1,8 @@
 # Dated XER progress updates
 
-Status: implemented locally on 2026-09-17; backend deployment and installation of
-the updated mobile build have not been performed. AI completion estimation is
-outside this change.
+Status: backend code `5031d20` deployed to the Main API on 2026-09-17 and pushed
+to both `origin/main` and `client/main`. Installation of the updated mobile build
+is still pending. AI completion estimation is outside this change.
 
 ## Workflow
 
@@ -87,11 +87,31 @@ the import does not silently repair client data. Confirm corrections with the
 client. Same-day replacement/corrected updates are currently rejected; the
 workflow accepts strictly newer reporting dates.
 
-Deploy the backend first, then build/install the updated mobile app. On a test
+The backend is deployed; next build/install the updated mobile app. On a test
 project, import October and November in order, accept each, refresh/reopen Activity,
 and compare both sources. Verify the original baseline and existing tour/manual
 records remain available. Do not import client files into production automatically
 as part of deployment.
+
+### VPS rollout — 2026-09-17
+
+- Main API image: `conscout-backend-api:5031d20`; revision label:
+  `5031d207eeb4cdb48eb4853a0decd9d84278b3ca`.
+- Both Git remotes received the source commit before the VPS fast-forward pull.
+- The image's focused suite ran 34 tests: 31 passed and 3 skipped because private
+  Windows fixtures are unavailable in the container. The local suite passed all
+  34, including both real client updates.
+- Verified public Main/Lite health (HTTP 200), registered update routes, public
+  unauthenticated update-route rejection (HTTP 401), database ping, all new update
+  indexes, Main-to-AI health and Firebase credential initialization.
+- Preserved the existing API environment, bind mounts (including the read-only
+  Firebase credential), ports, network and restart policy. API restart count was
+  zero after rollout. Existing AI/Lite services remain running.
+- Retained the previous stopped API for rollback as
+  `conscout-backend-api-rollback-20260917T050528Z`, with automatic restart disabled
+  to avoid a port conflict after a host reboot.
+- No client XER was imported, no verified evidence was changed and no test push
+  notification was sent during deployment.
 
 ```text
 # Backend repository
