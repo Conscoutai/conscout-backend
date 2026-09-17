@@ -86,6 +86,7 @@ raw_floorplans_collection = db["sites"]
 raw_tours_collection = db["tours"]
 raw_work_schedules_collection = db["work_schedules"]
 raw_schedule_baselines_collection = db["schedule_baselines"]
+raw_schedule_updates_collection = db["schedule_updates"]
 raw_schedule_activities_collection = db["schedule_activities"]
 raw_schedule_relationships_collection = db["schedule_relationships"]
 raw_schedule_assignments_collection = db["schedule_assignments"]
@@ -180,6 +181,13 @@ def ensure_helpdesk_indexes() -> None:
 
 def ensure_schedule_indexes() -> None:
     """Create indexes used by versioned baselines and tour evidence."""
+    raw_schedule_updates_collection.create_index("update_id", unique=True)
+    raw_schedule_updates_collection.create_index(
+        [("owner_user_id", 1), ("baseline_id", 1), ("source_sha256", 1)], unique=True
+    )
+    raw_schedule_updates_collection.create_index(
+        [("owner_user_id", 1), ("baseline_id", 1), ("status", 1), ("data_date", -1)]
+    )
     raw_schedule_baselines_collection.create_index(
         "baseline_id", unique=True, name="unique_schedule_baseline_id"
     )
@@ -362,6 +370,7 @@ floorplans_collection = ScopedCollection(raw_floorplans_collection)
 tours_collection = ScopedCollection(raw_tours_collection)
 work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
 schedule_baselines_collection = ScopedCollection(raw_schedule_baselines_collection)
+schedule_updates_collection = ScopedCollection(raw_schedule_updates_collection)
 schedule_activities_collection = ScopedCollection(raw_schedule_activities_collection)
 schedule_relationships_collection = ScopedCollection(raw_schedule_relationships_collection)
 schedule_assignments_collection = ScopedCollection(raw_schedule_assignments_collection)

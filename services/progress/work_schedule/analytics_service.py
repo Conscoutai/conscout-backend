@@ -622,7 +622,9 @@ def build_baseline_comparison(
             {
                 **activity,
                 "planned_percent": planned,
+                "progress_weight": max(0.0, float(activity.get(primary_weight_field) or 0)),
                 "actual_percent": actual,
+                "has_verified_progress": internal_id in actual_by_activity,
                 "variance_percent": variance,
                 "delay_days": delay_days,
                 "status": primary_status,
@@ -684,7 +686,9 @@ def build_baseline_comparison(
             {"date": forecast_finish.isoformat(), "percent": 100.0},
         ]
 
-    return {
+    from .update_service import attach_reported_progress
+
+    payload = {
         "project_id": project_id,
         "site_name": project_context["site_name"],
         "baseline": _baseline_payload(baseline),
@@ -729,6 +733,9 @@ def build_baseline_comparison(
         "activities": activity_rows,
         "actual_percent": project_actual,
     }
+    return attach_reported_progress(
+        payload, baseline["baseline_id"], observation_date.isoformat(), calendars
+    )
 
 
 def baseline_comparison_or_404(project_ref: str) -> dict[str, Any]:

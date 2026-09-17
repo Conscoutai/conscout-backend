@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, validator
 
 from core.auth import ensure_admin_user, require_authenticated_user
@@ -40,7 +40,57 @@ from services.progress.work_schedule.evidence_service import (
     record_manual_activity_progress,
 )
 
+from services.progress.work_schedule.update_service import (
+    MAX_UPDATE_BYTES,
+    accept_schedule_update,
+    import_schedule_update,
+    list_schedule_updates,
+)
+
 router = APIRouter(tags=["WorkSchedule"])
+
+
+class AcceptScheduleUpdateRequest(BaseModel):
+    acknowledge_warnings: bool = False
+
+
+@router.post("/projects/{project_id}/schedule-updates")
+async def upload_schedule_update(
+    project_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    raw = await file.read(MAX_UPDATE_BYTES + 1)
+    if len(raw) > MAX_UPDATE_BYTES:
+        raise HTTPException(413, "Schedule updates must be at most 10 MB.")
+    return import_schedule_update(
+        project_ref=project_id, filename=file.filename or "update.xer", raw_bytes=raw,
+        reviewer_email=current_user.email,
+    )
+
+
+@router.get("/projects/{project_id}/schedule-updates")
+def project_schedule_updates(
+    project_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    return list_schedule_updates(project_id)
+
+
+@router.post("/projects/{project_id}/schedule-updates/{update_id}/accept")
+def accept_project_schedule_update(
+    project_id: str,
+    update_id: str,
+    payload: AcceptScheduleUpdateRequest,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return accept_schedule_update(
+        project_ref=project_id, update_id=update_id,
+        acknowledge_warnings=payload.acknowledge_warnings,
+        reviewer_email=current_user.email,
+    )
 
 
 def _best_effort_schedule_notification_sync(

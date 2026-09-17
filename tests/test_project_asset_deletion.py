@@ -99,6 +99,7 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
         assignments = self._collection()
         evidence = self._collection()
         snapshots = self._collection()
+        updates = self._collection()
 
         with (
             patch.object(baseline_service, "floorplans_collection", self.floorplans),
@@ -113,6 +114,7 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
                 baseline_service, "schedule_assignments_collection", assignments
             ),
             patch.object(baseline_service, "schedule_evidence_collection", evidence),
+            patch.object(baseline_service, "schedule_updates_collection", updates),
             patch.object(
                 baseline_service,
                 "schedule_progress_snapshots_collection",
@@ -130,6 +132,7 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
         self.assertEqual(activities.delete_many.call_count, 2)
         self.assertEqual(evidence.delete_many.call_count, 2)
         self.assertEqual(snapshots.delete_many.call_count, 2)
+        self.assertEqual(updates.delete_many.call_count, 2)
         update = self.floorplans.update_many.call_args.args[1]
         self.assertIn("schedule_baseline", update["$unset"])
         self.assertNotIn("work_schedule", update["$unset"])

@@ -18,6 +18,7 @@ from core.database import (
     schedule_evidence_collection,
     schedule_progress_snapshots_collection,
     schedule_relationships_collection,
+    schedule_updates_collection,
 )
 from core.config import (
     SITE_BASELINE_DIRNAME,
@@ -1028,6 +1029,7 @@ def align_schedule_zones(
 
 
 def delete_baseline_data(baseline_id: str) -> None:
+    schedule_updates_collection.delete_many({"baseline_id": baseline_id})
     schedule_activities_collection.delete_many({"baseline_id": baseline_id})
     schedule_relationships_collection.delete_many({"baseline_id": baseline_id})
     schedule_assignments_collection.delete_many({"baseline_id": baseline_id})

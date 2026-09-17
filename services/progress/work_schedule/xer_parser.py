@@ -55,7 +55,17 @@ class XerParseError(ValueError):
 def _decode_xer(raw_bytes: bytes) -> str:
     if not raw_bytes:
         raise XerParseError("The XER file is empty")
-    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+    # An even-length Windows-1252 export can decode as meaningless UTF-16.
+    # Only try UTF-16 when the BOM or header actually identifies that encoding.
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16",)
+    elif raw_bytes.startswith(b"E\x00R\x00M\x00"):
+        encodings = ("utf-16-le",)
+    elif raw_bytes.startswith(b"\x00E\x00R\x00M"):
+        encodings = ("utf-16-be",)
+    else:
+        encodings = ("utf-8-sig", "cp1252")
+    for encoding in encodings:
         try:
             return raw_bytes.decode(encoding)
         except UnicodeDecodeError:
@@ -328,6 +338,8 @@ def parse_xer(raw_bytes: bytes, *, filename: str = "baseline.xer") -> dict[str, 
                 "actual_end_at": _iso_datetime(row.get("act_end_date")),
                 "target_duration_hours": target_duration_hours,
                 "remaining_duration_hours": _number(row.get("remain_drtn_hr_cnt")),
+                "actual_units": _number(row.get("act_work_qty")) + _number(row.get("act_equip_qty")),
+                "remaining_units": _number(row.get("remain_work_qty")) + _number(row.get("remain_equip_qty")),
                 "total_float_hours": total_float_hours,
                 "free_float_hours": _number(row.get("free_float_hr_cnt")),
                 "is_critical": total_float_hours <= 0,
@@ -440,7 +452,7 @@ def parse_xer(raw_bytes: bytes, *, filename: str = "baseline.xer") -> dict[str, 
             ),
             "last_scheduled_at": _iso_datetime(project.get("last_schedule_date")),
             "data_date": _iso_datetime(
-                project.get("next_data_date") or project.get("last_schedule_date")
+                project.get("last_recalc_date") or project.get("last_schedule_date")
             ),
             "critical_path_type": str(project.get("critical_path_type") or "").strip(),
             "default_percent_complete_type": str(
