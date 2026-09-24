@@ -515,7 +515,7 @@ def get_schedule_zones(project_ref: str) -> dict[str, Any]:
         },
         "zones": zones,
         "zone_plan": zone_plan,
-        "has_proposed_revision": bool(proposed_plan),
+        "has_proposed_revision": bool(project.get("proposed_schedule_zone_plan")),
         "active_zones": active_zones,
         "active_zone_plan": active_plan,
         "proposed_zones": proposed_zones,

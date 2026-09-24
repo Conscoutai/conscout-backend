@@ -201,6 +201,29 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
         self.assertIn("proposed_schedule_zone_plan", update["$unset"])
         self.assertNotIn("schedule_baseline", update["$unset"])
 
+    def test_legacy_unconfirmed_zone_plan_is_not_a_discardable_proposal(self):
+        self.project.update(
+            {
+                "schedule_zones": [{"name": "Legacy"}],
+                "schedule_zone_plan": {
+                    "zone_plan_id": "legacy-plan",
+                    "confirmation_status": "needs_review",
+                },
+            }
+        )
+        with (
+            patch.object(baseline_service, "floorplans_collection", self.floorplans),
+            patch.object(
+                baseline_service, "_schedule_zone_activity_mapping", return_value={}
+            ),
+            patch.object(
+                baseline_service, "_floorplan_asset_available", return_value=False
+            ),
+        ):
+            result = baseline_service.get_schedule_zones("project-1")
+        self.assertFalse(result["has_proposed_revision"])
+        self.assertEqual(result["zone_plan"]["zone_plan_id"], "legacy-plan")
+
     def test_discard_proposed_zone_pdf_preserves_approved_plan_and_file(self):
         self.project.update(
             {
