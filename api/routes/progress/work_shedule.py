@@ -40,6 +40,7 @@ from services.progress.work_schedule.evidence_service import (
     analyze_tour_schedule,
     review_schedule_evidence,
     record_manual_activity_progress,
+    remove_manual_activity_progress,
 )
 
 from services.progress.work_schedule.update_service import (
@@ -436,6 +437,15 @@ def review_activity_evidence(
         reviewer_email=current_user.email,
         resolve_progress_conflict=payload.resolve_progress_conflict,
     )
+
+
+@router.delete("/schedule-evidence/{evidence_id}")
+def delete_manual_activity_progress(
+    evidence_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return remove_manual_activity_progress(evidence_id)
 
 
 @router.get("/projects/{project_id}/schedule-zones")

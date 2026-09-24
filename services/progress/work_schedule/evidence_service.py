@@ -586,3 +586,47 @@ def record_manual_activity_progress(
         reviewer_user_id=reviewer_user_id,
         reviewer_email=reviewer_email,
     )
+
+
+def remove_manual_activity_progress(evidence_id: str) -> dict[str, Any]:
+    evidence_id = str(evidence_id or "").strip()
+    if not evidence_id:
+        raise HTTPException(400, "evidence_id is required")
+    evidence = schedule_evidence_collection.find_one({"evidence_id": evidence_id})
+    if not evidence:
+        raise HTTPException(404, "Schedule evidence not found")
+    is_manual = (
+        str(evidence.get("review_source") or "").strip().lower() == "manual"
+        or str(evidence.get("tour_id") or "").strip().lower().startswith("manual:")
+    )
+    if not is_manual:
+        raise HTTPException(409, "Only manual progress entries can be removed here")
+
+    deleted = schedule_evidence_collection.delete_one(
+        {
+            "evidence_id": evidence_id,
+            "$or": [
+                {"review_source": {"$regex": "^manual$", "$options": "i"}},
+                {"tour_id": {"$regex": "^manual:", "$options": "i"}},
+            ],
+        }
+    )
+    if deleted.deleted_count == 0:
+        raise HTTPException(409, "This manual progress entry has changed")
+
+    # A snapshot is derived from source observations. Invalidate the affected
+    # date so no stored summary can outlive the removed manual observation.
+    observed_at = _timestamp(evidence.get("captured_at"))
+    project_id = str(evidence.get("project_id") or "").strip()
+    if observed_at is not None and project_id:
+        schedule_progress_snapshots_collection.delete_many(
+            {
+                "project_id": project_id,
+                "snapshot_date": observed_at.date().isoformat(),
+            }
+        )
+    return {
+        "status": "removed",
+        "evidence_id": evidence_id,
+        "activity_id": str(evidence.get("activity_id") or ""),
+    }
