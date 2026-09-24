@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, validator
 from core.auth import ensure_admin_user, require_authenticated_user
 from core.auth_context import AuthenticatedUser
 from services.progress.work_schedule.work_schedule_service import (
+    control_manual_schedule_activity,
     latest_work_schedule as latest_work_schedule_service,
     list_work_schedules as list_work_schedules_service,
     save_work_schedule as save_work_schedule_service,
@@ -295,6 +296,33 @@ def list_work_schedules(project_id: str):
 @router.get("/work-schedules/latest")
 def latest_work_schedule(project_id: str):
     return latest_work_schedule_service(project_id)
+
+
+@router.delete("/projects/{project_id}/work-schedules/activities/{entry_id}")
+def remove_manual_schedule_activity(
+    project_id: str,
+    entry_id: str,
+    permanent: bool = False,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return control_manual_schedule_activity(
+        project_id=project_id,
+        entry_id=entry_id,
+        action="delete" if permanent else "remove",
+    )
+
+
+@router.post("/projects/{project_id}/work-schedules/activities/{entry_id}/restore")
+def restore_manual_schedule_activity(
+    project_id: str,
+    entry_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return control_manual_schedule_activity(
+        project_id=project_id, entry_id=entry_id, action="restore"
+    )
 
 
 # Returns comparison output for schedules of a project.
