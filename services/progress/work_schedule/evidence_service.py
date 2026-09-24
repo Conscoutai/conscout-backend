@@ -138,7 +138,12 @@ def _candidate_activity(
     ).strip()
     if explicit_id:
         explicit = schedule_activities_collection.find_one(
-            {"baseline_id": baseline_id, "activity_id": explicit_id}, {"_id": 0}
+            {
+                "baseline_id": baseline_id,
+                "activity_id": explicit_id,
+                "removed_at": None,
+            },
+            {"_id": 0},
         )
         if explicit:
             return (
@@ -149,6 +154,7 @@ def _candidate_activity(
 
     query: dict[str, Any] = {
         "baseline_id": baseline_id,
+        "removed_at": None,
         "photo_trackable": True,
         "work_category": category,
     }
@@ -385,10 +391,13 @@ def review_schedule_evidence(
             {
                 "baseline_id": evidence.get("baseline_id"),
                 "activity_internal_id": evidence.get("activity_internal_id"),
+                "removed_at": None,
             }
         )
         or {}
     )
+    if not activity:
+        raise HTTPException(409, "Restore this activity before reviewing its progress")
     planned_quantity = float(activity.get("planned_quantity") or 0.0)
     if (
         normalized_decision == "approved"
@@ -508,7 +517,7 @@ def record_manual_activity_progress(
     if not baseline:
         raise HTTPException(404, "Schedule baseline not found")
     activity = schedule_activities_collection.find_one(
-        {"baseline_id": baseline_id, "activity_id": activity_id}
+        {"baseline_id": baseline_id, "activity_id": activity_id, "removed_at": None}
     )
     if not activity:
         raise HTTPException(404, "Schedule activity not found")
@@ -595,9 +604,12 @@ def remove_manual_activity_progress(evidence_id: str) -> dict[str, Any]:
     evidence = schedule_evidence_collection.find_one({"evidence_id": evidence_id})
     if not evidence:
         raise HTTPException(404, "Schedule evidence not found")
-    is_manual = (
-        str(evidence.get("review_source") or "").strip().lower() == "manual"
-        or str(evidence.get("tour_id") or "").strip().lower().startswith("manual:")
+    is_manual = str(
+        evidence.get("review_source") or ""
+    ).strip().lower() == "manual" or str(
+        evidence.get("tour_id") or ""
+    ).strip().lower().startswith(
+        "manual:"
     )
     if not is_manual:
         raise HTTPException(409, "Only manual progress entries can be removed here")

@@ -507,7 +507,8 @@ def build_baseline_comparison(
     project_context = resolve_project(project_ref)
     project_id = project_context["project_id"]
     baseline = schedule_baselines_collection.find_one(
-        {"project_id": project_id, "is_active": True, "removed_at": None}, sort=[("version", -1)]
+        {"project_id": project_id, "is_active": True, "removed_at": None},
+        sort=[("version", -1)],
     )
     if not baseline:
         baseline = schedule_baselines_collection.find_one(
@@ -519,8 +520,14 @@ def build_baseline_comparison(
     observation_date = as_of or _project_today(str(baseline.get("timezone") or "UTC"))
     activities = list(
         schedule_activities_collection.find(
-            {"baseline_id": baseline["baseline_id"]}, {"_id": 0}
+            {"baseline_id": baseline["baseline_id"], "removed_at": None}, {"_id": 0}
         ).sort([("start_date", 1), ("activity_id", 1)])
+    )
+    deleted_activities = list(
+        schedule_activities_collection.find(
+            {"baseline_id": baseline["baseline_id"], "removed_at": {"$ne": None}},
+            {"_id": 0, "activity_id": 1, "activity_name": 1, "removed_at": 1},
+        ).sort("removed_at", -1)
     )
     from .approved_progress_service import load_progress
 
@@ -701,7 +708,14 @@ def build_baseline_comparison(
     payload = {
         "project_id": project_id,
         "site_name": project_context["site_name"],
-        "baseline": _baseline_payload(baseline),
+        "baseline": {
+            **_baseline_payload(baseline),
+            "summary": {
+                **dict(baseline.get("summary") or {}),
+                "activity_count": len(activities),
+                "deleted_activity_count": len(deleted_activities),
+            },
+        },
         "summary": {
             "planned_percent": project_planned,
             "actual_percent": project_actual,
@@ -742,6 +756,7 @@ def build_baseline_comparison(
             "points": _manpower_points(baseline=baseline, activities=activities),
         },
         "activities": activity_rows,
+        "deleted_activities": deleted_activities,
         "actual_percent": project_actual,
     }
     return attach_reported_progress(

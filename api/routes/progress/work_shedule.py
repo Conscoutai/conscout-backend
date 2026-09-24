@@ -35,6 +35,7 @@ from services.progress.work_schedule.baseline_service import (
     get_schedule_zones,
     update_schedule_zones,
     update_activity_mapping,
+    control_schedule_activity,
 )
 from services.progress.work_schedule.evidence_service import (
     analyze_tour_schedule,
@@ -69,7 +70,9 @@ async def upload_schedule_update(
     if len(raw) > MAX_UPDATE_BYTES:
         raise HTTPException(413, "Schedule updates must be at most 10 MB.")
     return import_schedule_update(
-        project_ref=project_id, filename=file.filename or "update.xer", raw_bytes=raw,
+        project_ref=project_id,
+        filename=file.filename or "update.xer",
+        raw_bytes=raw,
         reviewer_email=current_user.email,
     )
 
@@ -91,7 +94,8 @@ def accept_project_schedule_update(
 ):
     ensure_admin_user(current_user)
     return accept_schedule_update(
-        project_ref=project_id, update_id=update_id,
+        project_ref=project_id,
+        update_id=update_id,
         acknowledge_warnings=payload.acknowledge_warnings,
         reviewer_email=current_user.email,
     )
@@ -105,7 +109,8 @@ def remove_project_schedule_update(
 ):
     ensure_admin_user(current_user)
     return remove_schedule_update(
-        project_ref=project_id, update_id=update_id,
+        project_ref=project_id,
+        update_id=update_id,
         reviewer_email=current_user.email,
     )
 
@@ -400,6 +405,37 @@ def patch_schedule_activity_mapping(
         baseline_id=baseline_id,
         activity_id=activity_id,
         updates=payload.dict(exclude_none=True),
+    )
+
+
+@router.delete("/schedule-baselines/{baseline_id}/activities/{activity_id}")
+def remove_project_schedule_activity(
+    baseline_id: str,
+    activity_id: str,
+    permanent: bool = False,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return control_schedule_activity(
+        baseline_id=baseline_id,
+        activity_id=activity_id,
+        action="delete" if permanent else "remove",
+        user_email=current_user.email,
+    )
+
+
+@router.post("/schedule-baselines/{baseline_id}/activities/{activity_id}/restore")
+def restore_project_schedule_activity(
+    baseline_id: str,
+    activity_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return control_schedule_activity(
+        baseline_id=baseline_id,
+        activity_id=activity_id,
+        action="restore",
+        user_email=current_user.email,
     )
 
 

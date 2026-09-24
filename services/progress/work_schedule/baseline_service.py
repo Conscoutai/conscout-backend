@@ -219,7 +219,7 @@ def import_schedule_baseline(
 
         old_activities = list(
             schedule_activities_collection.find(
-                {"baseline_id": previous["baseline_id"]}, {"_id": 0}
+                {"baseline_id": previous["baseline_id"], "removed_at": None}, {"_id": 0}
             )
         )
         plan = carry_plan(previous, old_activities, parsed["activities"])
@@ -334,7 +334,7 @@ def get_schedule_baseline(
     if include_activities:
         activities = list(
             schedule_activities_collection.find(
-                {"baseline_id": baseline_id}, {"_id": 0}
+                {"baseline_id": baseline_id, "removed_at": None}, {"_id": 0}
             ).sort([("start_date", 1), ("activity_id", 1)])
         )
         payload["activities"] = activities
@@ -344,7 +344,11 @@ def get_schedule_baseline(
 def active_schedule_baseline(project_ref: str) -> Optional[dict[str, Any]]:
     project_context = resolve_project(project_ref)
     return schedule_baselines_collection.find_one(
-        {"project_id": project_context["project_id"], "is_active": True, "removed_at": None},
+        {
+            "project_id": project_context["project_id"],
+            "is_active": True,
+            "removed_at": None,
+        },
         sort=[("version", -1)],
     )
 
@@ -426,7 +430,7 @@ def update_activity_mapping(
         raise HTTPException(400, "No supported activity mapping fields were supplied")
     payload["updated_at"] = datetime.now(timezone.utc)
     result = schedule_activities_collection.update_one(
-        {"baseline_id": baseline_id, "activity_id": activity_id},
+        {"baseline_id": baseline_id, "activity_id": activity_id, "removed_at": None},
         {"$set": payload},
     )
     if result.matched_count == 0:
@@ -435,6 +439,76 @@ def update_activity_mapping(
         {"baseline_id": baseline_id, "activity_id": activity_id}, {"_id": 0}
     )
     return {"status": "updated", "activity": activity}
+
+
+def control_schedule_activity(
+    *, baseline_id: str, activity_id: str, action: str, user_email: str
+) -> dict[str, Any]:
+    """Remove, restore, or permanently delete one activity in a baseline."""
+    baseline = schedule_baselines_collection.find_one(
+        {"baseline_id": baseline_id, "removed_at": None}
+    )
+    if not baseline:
+        raise HTTPException(404, "Schedule baseline not found")
+    activity = schedule_activities_collection.find_one(
+        {"baseline_id": baseline_id, "activity_id": activity_id}
+    )
+    if not activity:
+        raise HTTPException(404, "Schedule activity not found")
+    selector = {"baseline_id": baseline_id, "activity_id": activity_id}
+    removed = activity.get("removed_at") is not None
+    if action == "remove":
+        if removed:
+            raise HTTPException(409, "Activity is already in Recently deleted")
+        schedule_activities_collection.update_one(
+            selector,
+            {
+                "$set": {
+                    "removed_at": datetime.now(timezone.utc),
+                    "removed_by_email": user_email,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        schedule_progress_snapshots_collection.delete_many({"baseline_id": baseline_id})
+        return {"status": "removed", "activity_id": activity_id}
+    if not removed:
+        raise HTTPException(409, "Remove the activity first")
+    if action == "restore":
+        schedule_activities_collection.update_one(
+            selector,
+            {
+                "$set": {
+                    "removed_at": None,
+                    "removed_by_email": "",
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        schedule_progress_snapshots_collection.delete_many({"baseline_id": baseline_id})
+        return {"status": "restored", "activity_id": activity_id}
+    if action == "delete":
+        internal_id = activity.get("activity_internal_id")
+        schedule_activities_collection.delete_one(selector)
+        schedule_progress_snapshots_collection.delete_many({"baseline_id": baseline_id})
+        if internal_id:
+            schedule_evidence_collection.delete_many(
+                {"baseline_id": baseline_id, "activity_internal_id": internal_id}
+            )
+            schedule_assignments_collection.delete_many(
+                {"baseline_id": baseline_id, "activity_internal_id": internal_id}
+            )
+            schedule_relationships_collection.delete_many(
+                {
+                    "baseline_id": baseline_id,
+                    "$or": [
+                        {"activity_internal_id": internal_id},
+                        {"predecessor_internal_id": internal_id},
+                    ],
+                }
+            )
+        return {"status": "deleted", "activity_id": activity_id}
+    raise HTTPException(400, "Unsupported activity action")
 
 
 def _zone_plan_state(
@@ -552,7 +626,7 @@ def _schedule_zone_activity_mapping(
             ],
         }
 
-    activity_filter = {"baseline_id": baseline_id}
+    activity_filter = {"baseline_id": baseline_id, "removed_at": None}
     total_activities = schedule_activities_collection.count_documents(activity_filter)
     zone_activity_counts = [
         {
@@ -1098,14 +1172,24 @@ def delete_baseline_data(baseline_id: str) -> None:
 def remove_schedule_baseline(*, project_ref: str, baseline_id: str) -> dict[str, Any]:
     project = resolve_project(project_ref)
     baseline = schedule_baselines_collection.find_one(
-        {"project_id": project["project_id"], "baseline_id": baseline_id, "removed_at": None}
+        {
+            "project_id": project["project_id"],
+            "baseline_id": baseline_id,
+            "removed_at": None,
+        }
     )
     if not baseline:
         raise HTTPException(404, "Schedule baseline not found for this project")
     if baseline.get("is_active"):
-        raise HTTPException(409, "Activate a replacement baseline before removing this one.")
+        raise HTTPException(
+            409, "Activate a replacement baseline before removing this one."
+        )
     schedule_baselines_collection.update_one(
-        {"project_id": project["project_id"], "baseline_id": baseline_id, "removed_at": None},
+        {
+            "project_id": project["project_id"],
+            "baseline_id": baseline_id,
+            "removed_at": None,
+        },
         {"$set": {"removed_at": datetime.now(timezone.utc)}},
     )
     return {"status": "removed", "baseline_id": baseline_id}

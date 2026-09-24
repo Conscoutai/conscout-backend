@@ -278,7 +278,7 @@ def import_schedule_update(
         raise HTTPException(422, str(error)) from error
     original = list(
         schedule_activities_collection.find(
-            {"baseline_id": baseline["baseline_id"]}, {"_id": 0}
+            {"baseline_id": baseline["baseline_id"], "removed_at": None}, {"_id": 0}
         )
     )
     review = build_review(parsed, original, baseline)
@@ -350,19 +350,31 @@ def list_schedule_updates(project_ref: str) -> dict:
     }
 
 
-def remove_schedule_update(*, project_ref: str, update_id: str, reviewer_email: str = "") -> dict:
+def remove_schedule_update(
+    *, project_ref: str, update_id: str, reviewer_email: str = ""
+) -> dict:
     project = resolve_project(project_ref)
     update = schedule_updates_collection.find_one(
-        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None}
+        {
+            "project_id": project["project_id"],
+            "update_id": update_id,
+            "removed_at": None,
+        }
     )
     if not update:
         raise HTTPException(404, "Schedule update not found for this project")
     schedule_updates_collection.update_one(
-        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None},
-        {"$set": {
-            "removed_at": datetime.now(timezone.utc),
-            "removed_by_email": reviewer_email,
-        }},
+        {
+            "project_id": project["project_id"],
+            "update_id": update_id,
+            "removed_at": None,
+        },
+        {
+            "$set": {
+                "removed_at": datetime.now(timezone.utc),
+                "removed_by_email": reviewer_email,
+            }
+        },
     )
     return {"status": "removed", "update_id": update_id}
 
@@ -372,7 +384,11 @@ def accept_schedule_update(
 ) -> dict:
     project = resolve_project(project_ref)
     document = schedule_updates_collection.find_one(
-        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None}
+        {
+            "project_id": project["project_id"],
+            "update_id": update_id,
+            "removed_at": None,
+        }
     )
     if not document:
         raise HTTPException(404, "Schedule update not found")
