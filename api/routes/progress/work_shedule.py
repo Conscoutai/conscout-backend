@@ -26,6 +26,7 @@ from services.progress.work_schedule.baseline_service import (
     delete_project_schedule_baselines,
     remove_schedule_baseline,
     delete_project_schedule_zone_plan,
+    discard_proposed_schedule_zone_plan,
     get_schedule_baseline,
     import_schedule_baseline,
     import_schedule_zone_plan,
@@ -452,6 +453,16 @@ def delete_project_schedule_zones(
 ):
     ensure_admin_user(current_user)
     return delete_project_schedule_zone_plan(project_id)
+
+
+@router.delete("/projects/{project_id}/schedule-zones/proposed/{zone_plan_id}")
+def discard_project_proposed_schedule_zones(
+    project_id: str,
+    zone_plan_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return discard_proposed_schedule_zone_plan(project_id, zone_plan_id)
 
 
 @router.post("/projects/{project_id}/schedule-zones/import")

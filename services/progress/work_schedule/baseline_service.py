@@ -1207,3 +1207,93 @@ def delete_project_schedule_zone_plan(project_ref: str) -> dict[str, Any]:
         "directories_deleted": removed_directories,
         "files_deleted": removed_files,
     }
+
+
+def discard_proposed_schedule_zone_plan(
+    project_ref: str, expected_zone_plan_id: str
+) -> dict[str, Any]:
+    expected_zone_plan_id = str(expected_zone_plan_id or "").strip()
+    if not expected_zone_plan_id:
+        raise HTTPException(400, "zone_plan_id is required")
+
+    project_context = resolve_project(project_ref)
+    project = project_context["document"]
+    project_id = project_context["project_id"]
+    proposed_plan = dict(project.get("proposed_schedule_zone_plan") or {})
+    proposed_plan_id = str(proposed_plan.get("zone_plan_id") or "").strip()
+    if not proposed_plan_id:
+        raise HTTPException(404, "No proposed zone plan to discard")
+    if proposed_plan_id != expected_zone_plan_id:
+        raise HTTPException(
+            409, "The proposed zone plan has changed. Refresh and retry"
+        )
+
+    result = floorplans_collection.update_many(
+        {
+            "$and": [
+                project_filter(project_ref),
+                {"proposed_schedule_zone_plan.zone_plan_id": expected_zone_plan_id},
+            ]
+        },
+        {
+            "$unset": {
+                "proposed_schedule_zones": "",
+                "proposed_schedule_zone_plan": "",
+                "proposed_schedule_zones_updated_at": "",
+            },
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(
+            409, "The proposed zone plan has changed. Refresh and retry"
+        )
+
+    # Alignment and boundary revisions can reuse the approved PDF. Keep any
+    # source still referenced by the approved plan; remove only an orphaned
+    # proposed PDF from this project's zone-plan directory.
+    source_url = str(proposed_plan.get("source_url") or "").split("?", 1)[0]
+    active_source_url = str(
+        (project.get("schedule_zone_plan") or {}).get("source_url") or ""
+    ).split("?", 1)[0]
+    source_filename = Path(source_url).name
+    files_deleted = 0
+    if (
+        source_filename
+        and SITE_ZONE_PLAN_DIRNAME in Path(source_url).parts
+        and source_url != active_source_url
+    ):
+        storage_keys = {
+            str(value or "").strip()
+            for value in (
+                project_id,
+                project_ref,
+                project.get("site_name"),
+                project.get("id"),
+            )
+            if str(value or "").strip() not in ("", ".", "..")
+            and "/" not in str(value)
+            and "\\" not in str(value)
+        }
+        for root in site_storage_roots(
+            owner_email=project.get("owner_email"),
+            owner_user_id=project.get("owner_user_id"),
+        ):
+            for storage_key in storage_keys:
+                directory = Path(root, storage_key, SITE_ZONE_PLAN_DIRNAME).resolve()
+                candidate = Path(directory, source_filename).resolve()
+                if candidate.parent != directory or not candidate.is_file():
+                    continue
+                try:
+                    candidate.unlink()
+                    files_deleted += 1
+                except OSError:
+                    pass
+
+    return {
+        "status": "discarded",
+        "asset": "proposed_schedule_zone_plan",
+        "zone_plan_id": expected_zone_plan_id,
+        "zones_deleted": len(project.get("proposed_schedule_zones") or []),
+        "files_deleted": files_deleted,
+    }

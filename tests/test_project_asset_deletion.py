@@ -201,6 +201,92 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
         self.assertIn("proposed_schedule_zone_plan", update["$unset"])
         self.assertNotIn("schedule_baseline", update["$unset"])
 
+    def test_discard_proposed_zone_pdf_preserves_approved_plan_and_file(self):
+        self.project.update(
+            {
+                "schedule_zones": [{"name": "Approved"}],
+                "schedule_zone_plan": {"zone_plan_id": "approved-plan"},
+                "proposed_schedule_zones": [{"name": "Draft"}],
+                "proposed_schedule_zone_plan": {
+                    "zone_plan_id": "draft-plan",
+                    "source_url": "/sites/project-1/zone-plans/v2_draft-plan_draft.pdf",
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary_root:
+            plan_dir = Path(temporary_root, "project-1", "zone-plans")
+            plan_dir.mkdir(parents=True)
+            approved_file = Path(plan_dir, "v1_approved-plan_approved.pdf")
+            draft_file = Path(plan_dir, "v2_draft-plan_draft.pdf")
+            approved_file.write_bytes(b"approved")
+            draft_file.write_bytes(b"draft")
+
+            with (
+                patch.object(baseline_service, "floorplans_collection", self.floorplans),
+                patch.object(
+                    baseline_service, "site_storage_roots", return_value=[temporary_root]
+                ),
+            ):
+                result = baseline_service.discard_proposed_schedule_zone_plan(
+                    "project-1", "draft-plan"
+                )
+
+            self.assertEqual(result["status"], "discarded")
+            self.assertEqual(result["files_deleted"], 1)
+            self.assertFalse(draft_file.exists())
+            self.assertTrue(approved_file.exists())
+            query, update = self.floorplans.update_many.call_args.args
+            self.assertEqual(
+                query["$and"][1],
+                {"proposed_schedule_zone_plan.zone_plan_id": "draft-plan"},
+            )
+            self.assertIn("proposed_schedule_zone_plan", update["$unset"])
+            self.assertNotIn("schedule_zone_plan", update["$unset"])
+            self.assertNotIn("schedule_zones", update["$unset"])
+
+    def test_discard_stale_proposal_does_not_change_approved_or_draft_plan(self):
+        self.project["proposed_schedule_zone_plan"] = {
+            "zone_plan_id": "newer-plan",
+        }
+        with patch.object(baseline_service, "floorplans_collection", self.floorplans):
+            with self.assertRaises(HTTPException) as error:
+                baseline_service.discard_proposed_schedule_zone_plan(
+                    "project-1", "older-plan"
+                )
+        self.assertEqual(error.exception.status_code, 409)
+        self.floorplans.update_many.assert_not_called()
+
+    def test_discard_boundary_revision_keeps_shared_approved_pdf(self):
+        source_url = "/sites/project-1/zone-plans/v1_approved-plan_zones.pdf"
+        self.project.update(
+            {
+                "schedule_zone_plan": {
+                    "zone_plan_id": "approved-plan",
+                    "source_url": source_url,
+                },
+                "proposed_schedule_zone_plan": {
+                    "zone_plan_id": "boundary-revision",
+                    "source_url": source_url,
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary_root:
+            plan_dir = Path(temporary_root, "project-1", "zone-plans")
+            plan_dir.mkdir(parents=True)
+            approved_file = Path(plan_dir, "v1_approved-plan_zones.pdf")
+            approved_file.write_bytes(b"approved")
+            with (
+                patch.object(baseline_service, "floorplans_collection", self.floorplans),
+                patch.object(
+                    baseline_service, "site_storage_roots", return_value=[temporary_root]
+                ),
+            ):
+                result = baseline_service.discard_proposed_schedule_zone_plan(
+                    "project-1", "boundary-revision"
+                )
+            self.assertEqual(result["files_deleted"], 0)
+            self.assertTrue(approved_file.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
