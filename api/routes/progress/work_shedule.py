@@ -24,6 +24,7 @@ from services.progress.work_schedule.baseline_service import (
     activate_schedule_baseline,
     align_schedule_zones,
     delete_project_schedule_baselines,
+    remove_schedule_baseline,
     delete_project_schedule_zone_plan,
     get_schedule_baseline,
     import_schedule_baseline,
@@ -45,6 +46,7 @@ from services.progress.work_schedule.update_service import (
     accept_schedule_update,
     import_schedule_update,
     list_schedule_updates,
+    remove_schedule_update,
 )
 
 router = APIRouter(tags=["WorkSchedule"])
@@ -89,6 +91,19 @@ def accept_project_schedule_update(
     return accept_schedule_update(
         project_ref=project_id, update_id=update_id,
         acknowledge_warnings=payload.acknowledge_warnings,
+        reviewer_email=current_user.email,
+    )
+
+
+@router.delete("/projects/{project_id}/schedule-updates/{update_id}")
+def remove_project_schedule_update(
+    project_id: str,
+    update_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return remove_schedule_update(
+        project_ref=project_id, update_id=update_id,
         reviewer_email=current_user.email,
     )
 
@@ -338,6 +353,16 @@ def delete_project_baselines(
 ):
     ensure_admin_user(current_user)
     return delete_project_schedule_baselines(project_id)
+
+
+@router.delete("/projects/{project_id}/schedule-baselines/{baseline_id}")
+def remove_project_schedule_baseline(
+    project_id: str,
+    baseline_id: str,
+    current_user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    ensure_admin_user(current_user)
+    return remove_schedule_baseline(project_ref=project_id, baseline_id=baseline_id)
 
 
 @router.get("/schedule-baselines/{baseline_id}")

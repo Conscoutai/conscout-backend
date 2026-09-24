@@ -157,6 +157,12 @@ def import_schedule_baseline(
         {"project_id": project_id, "source_sha256": digest}
     )
     if existing:
+        if existing.get("removed_at"):
+            schedule_baselines_collection.update_one(
+                {"baseline_id": existing["baseline_id"]},
+                {"$set": {"removed_at": None}},
+            )
+            existing["removed_at"] = None
         return {
             "status": "already_imported",
             "baseline": _public_baseline(existing),
@@ -306,7 +312,7 @@ def list_schedule_baselines(project_ref: str) -> dict[str, Any]:
     project_context = resolve_project(project_ref)
     documents = list(
         schedule_baselines_collection.find(
-            {"project_id": project_context["project_id"]}
+            {"project_id": project_context["project_id"], "removed_at": None}
         ).sort("version", -1)
     )
     return {
@@ -319,7 +325,9 @@ def list_schedule_baselines(project_ref: str) -> dict[str, Any]:
 def get_schedule_baseline(
     *, baseline_id: str, include_activities: bool = True
 ) -> dict[str, Any]:
-    baseline = schedule_baselines_collection.find_one({"baseline_id": baseline_id})
+    baseline = schedule_baselines_collection.find_one(
+        {"baseline_id": baseline_id, "removed_at": None}
+    )
     if not baseline:
         raise HTTPException(404, "Schedule baseline not found")
     payload = {"baseline": _public_baseline(baseline)}
@@ -336,7 +344,7 @@ def get_schedule_baseline(
 def active_schedule_baseline(project_ref: str) -> Optional[dict[str, Any]]:
     project_context = resolve_project(project_ref)
     return schedule_baselines_collection.find_one(
-        {"project_id": project_context["project_id"], "is_active": True},
+        {"project_id": project_context["project_id"], "is_active": True, "removed_at": None},
         sort=[("version", -1)],
     )
 
@@ -345,7 +353,7 @@ def activate_schedule_baseline(*, project_ref: str, baseline_id: str) -> dict[st
     project_context = resolve_project(project_ref)
     project_id = project_context["project_id"]
     baseline = schedule_baselines_collection.find_one(
-        {"baseline_id": baseline_id, "project_id": project_id}
+        {"baseline_id": baseline_id, "project_id": project_id, "removed_at": None}
     )
     if not baseline:
         raise HTTPException(404, "Schedule baseline not found for this project")
@@ -520,10 +528,10 @@ def _schedule_zone_activity_mapping(
     *, project_id: str, zones: list[dict[str, Any]]
 ) -> dict[str, Any]:
     mapped_baseline = schedule_baselines_collection.find_one(
-        {"project_id": project_id, "is_active": True},
+        {"project_id": project_id, "is_active": True, "removed_at": None},
         sort=[("version", -1)],
     ) or schedule_baselines_collection.find_one(
-        {"project_id": project_id}, sort=[("version", -1)]
+        {"project_id": project_id, "removed_at": None}, sort=[("version", -1)]
     )
     baseline_id = str((mapped_baseline or {}).get("baseline_id") or "")
     zone_names = [
@@ -1085,6 +1093,22 @@ def delete_baseline_data(baseline_id: str) -> None:
     schedule_evidence_collection.delete_many({"baseline_id": baseline_id})
     schedule_progress_snapshots_collection.delete_many({"baseline_id": baseline_id})
     schedule_baselines_collection.delete_one({"baseline_id": baseline_id})
+
+
+def remove_schedule_baseline(*, project_ref: str, baseline_id: str) -> dict[str, Any]:
+    project = resolve_project(project_ref)
+    baseline = schedule_baselines_collection.find_one(
+        {"project_id": project["project_id"], "baseline_id": baseline_id, "removed_at": None}
+    )
+    if not baseline:
+        raise HTTPException(404, "Schedule baseline not found for this project")
+    if baseline.get("is_active"):
+        raise HTTPException(409, "Activate a replacement baseline before removing this one.")
+    schedule_baselines_collection.update_one(
+        {"project_id": project["project_id"], "baseline_id": baseline_id, "removed_at": None},
+        {"$set": {"removed_at": datetime.now(timezone.utc)}},
+    )
+    return {"status": "removed", "baseline_id": baseline_id}
 
 
 def delete_project_schedule_baselines(project_ref: str) -> dict[str, Any]:

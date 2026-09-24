@@ -191,7 +191,7 @@ def load_progress(
         inherited_updates
         + list(
             schedule_updates_collection.find(
-                {"baseline_id": baseline_id, "status": "accepted"}, {"_id": 0}
+                {"baseline_id": baseline_id, "status": "accepted", "removed_at": None}, {"_id": 0}
             )
         ),
         as_of,
@@ -213,7 +213,7 @@ def review_schedule_observation(
         raise HTTPException(404, "Schedule observation not found")
     _, update_id, activity_id = parts
     update = schedule_updates_collection.find_one(
-        {"update_id": update_id, "status": "accepted"}
+        {"update_id": update_id, "status": "accepted", "removed_at": None}
     )
     if not update or not schedule_activities_collection.find_one(
         {"baseline_id": update["baseline_id"], "activity_id": activity_id}

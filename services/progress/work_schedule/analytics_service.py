@@ -507,11 +507,11 @@ def build_baseline_comparison(
     project_context = resolve_project(project_ref)
     project_id = project_context["project_id"]
     baseline = schedule_baselines_collection.find_one(
-        {"project_id": project_id, "is_active": True}, sort=[("version", -1)]
+        {"project_id": project_id, "is_active": True, "removed_at": None}, sort=[("version", -1)]
     )
     if not baseline:
         baseline = schedule_baselines_collection.find_one(
-            {"project_id": project_id}, sort=[("version", -1)]
+            {"project_id": project_id, "removed_at": None}, sort=[("version", -1)]
         )
     if not baseline:
         return None

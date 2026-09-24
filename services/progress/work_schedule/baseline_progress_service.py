@@ -87,7 +87,7 @@ def inherited_history(baseline, activities, evidence_collection, updates_collect
             row["source_baseline_id"] = source_id
             evidence.append(row)
         for raw in updates_collection.find(
-            {"baseline_id": source_id, "status": "accepted"}, {"_id": 0}
+            {"baseline_id": source_id, "status": "accepted", "removed_at": None}, {"_id": 0}
         ):
             update = deepcopy(raw)
             update["activities"] = [

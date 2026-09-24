@@ -274,6 +274,10 @@ class ScheduleUpdateTests(unittest.TestCase):
             self.assertEqual(history.json()["latest_update_id"], uid)
             self.assertNotIn("activities", history.json()["updates"][0])
             actor["role"] = "stakeholder"
+            self.assertEqual(
+                client.delete(f"/projects/project-1/schedule-updates/{uid}").status_code,
+                403,
+            )
             self.assertEqual(client.post(accept_url, json={}).status_code, 403)
             self.assertEqual(
                 client.post(
@@ -284,6 +288,15 @@ class ScheduleUpdateTests(unittest.TestCase):
             )
             self.assertEqual(
                 client.get("/projects/project-1/schedule-updates").status_code, 200
+            )
+            actor["role"] = "admin"
+            self.assertEqual(
+                client.delete(f"/projects/project-1/schedule-updates/{uid}").status_code,
+                200,
+            )
+            self.assertEqual(
+                client.get("/projects/project-1/schedule-updates").json()["latest_update_id"],
+                "",
             )
             app.dependency_overrides.clear()
             self.assertIn(
@@ -298,6 +311,29 @@ class ScheduleUpdateTests(unittest.TestCase):
         ):
             with self.assertRaises(HTTPException) as error:
                 self.accept(update)
+        self.assertEqual(error.exception.status_code, 404)
+
+    def test_remove_one_update_reverts_latest_without_touching_other_updates(self):
+        older = self.upload()
+        self.accept(older)
+        newer = self.upload("2024-11-24", complete=True)
+        self.accept(newer)
+        self.assertEqual(service.latest_accepted("baseline-1")["update_id"], newer["update_id"])
+        removed = service.remove_schedule_update(
+            project_ref="project-1", update_id=newer["update_id"]
+        )
+        self.assertEqual(removed["update_id"], newer["update_id"])
+        self.assertEqual(service.latest_accepted("baseline-1")["update_id"], older["update_id"])
+        self.assertEqual(
+            [row["update_id"] for row in service.list_schedule_updates("project-1")["updates"]],
+            [older["update_id"]],
+        )
+        with self.assertRaises(HTTPException) as error:
+            service.remove_schedule_update(project_ref="project-1", update_id=newer["update_id"])
+        self.assertEqual(error.exception.status_code, 404)
+        with patch.object(service, "resolve_project", return_value={"project_id": "other-project"}):
+            with self.assertRaises(HTTPException) as error:
+                service.remove_schedule_update(project_ref="other-project", update_id=older["update_id"])
         self.assertEqual(error.exception.status_code, 404)
 
     def test_import_review_accept_and_reload_preserve_baseline_and_evidence(self):

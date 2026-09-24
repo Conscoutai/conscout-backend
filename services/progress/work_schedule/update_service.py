@@ -53,7 +53,11 @@ def reported_percent(activity: dict) -> float | None:
 
 
 def latest_accepted(baseline_id: str, as_of: str | None = None) -> dict | None:
-    query: dict[str, Any] = {"baseline_id": baseline_id, "status": "accepted"}
+    query: dict[str, Any] = {
+        "baseline_id": baseline_id,
+        "status": "accepted",
+        "removed_at": None,
+    }
     if as_of:
         query["data_date"] = {"$lte": as_of[:10]}
     # Sorting by reporting date, not upload/accept time, prevents a concurrent
@@ -259,6 +263,12 @@ def import_schedule_update(
     identity = {"baseline_id": baseline["baseline_id"], "source_sha256": digest}
     existing = schedule_updates_collection.find_one(identity)
     if existing:
+        if existing.get("removed_at"):
+            schedule_updates_collection.update_one(
+                {"update_id": existing["update_id"]},
+                {"$set": {"removed_at": None, "removed_by_email": ""}},
+            )
+            existing["removed_at"] = None
         return {"status": "already_imported", "update": public_update(existing)}
     try:
         if len(_parse_tables(_decode_xer(raw_bytes)).get("PROJECT", [])) != 1:
@@ -330,7 +340,8 @@ def list_schedule_updates(project_ref: str) -> dict:
     baseline = active_schedule_baseline(project_ref)
     latest = latest_accepted(baseline["baseline_id"]) if baseline else None
     documents = schedule_updates_collection.find(
-        {"project_id": project["project_id"]}, {"activities": 0}
+        {"project_id": project["project_id"], "removed_at": None},
+        {"activities": 0},
     ).sort([("data_date", -1), ("uploaded_at", -1)])
     return {
         "updates": [public_update(d) for d in documents],
@@ -339,12 +350,29 @@ def list_schedule_updates(project_ref: str) -> dict:
     }
 
 
+def remove_schedule_update(*, project_ref: str, update_id: str, reviewer_email: str = "") -> dict:
+    project = resolve_project(project_ref)
+    update = schedule_updates_collection.find_one(
+        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None}
+    )
+    if not update:
+        raise HTTPException(404, "Schedule update not found for this project")
+    schedule_updates_collection.update_one(
+        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None},
+        {"$set": {
+            "removed_at": datetime.now(timezone.utc),
+            "removed_by_email": reviewer_email,
+        }},
+    )
+    return {"status": "removed", "update_id": update_id}
+
+
 def accept_schedule_update(
     *, project_ref: str, update_id: str, acknowledge_warnings: bool, reviewer_email: str
 ) -> dict:
     project = resolve_project(project_ref)
     document = schedule_updates_collection.find_one(
-        {"project_id": project["project_id"], "update_id": update_id}
+        {"project_id": project["project_id"], "update_id": update_id, "removed_at": None}
     )
     if not document:
         raise HTTPException(404, "Schedule update not found")

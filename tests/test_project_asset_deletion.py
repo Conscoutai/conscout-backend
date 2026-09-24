@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+from fastapi import HTTPException
 
 os.environ.setdefault("MONGO_URI", "mongodb://127.0.0.1:27017")
 
@@ -87,6 +88,36 @@ class ScheduleAssetDeletionTests(unittest.TestCase):
         collection.delete_many.return_value = Mock(deleted_count=0)
         collection.delete_one.return_value = Mock(deleted_count=1)
         return collection
+
+    def test_remove_single_baseline_preserves_other_versions_and_active_baseline(self):
+        baselines = self._collection()
+        baselines.find_one.return_value = {
+            "baseline_id": "old-version", "project_id": "project-1", "is_active": False
+        }
+        with (
+            patch.object(baseline_service, "floorplans_collection", self.floorplans),
+            patch.object(baseline_service, "schedule_baselines_collection", baselines),
+        ):
+            result = baseline_service.remove_schedule_baseline(
+                project_ref="project-1", baseline_id="old-version"
+            )
+        self.assertEqual(result["baseline_id"], "old-version")
+        baselines.update_one.assert_called_once()
+        baselines.delete_many.assert_not_called()
+        self.floorplans.update_many.assert_not_called()
+
+        baselines.find_one.return_value = {
+            "baseline_id": "active-version", "project_id": "project-1", "is_active": True
+        }
+        with (
+            patch.object(baseline_service, "floorplans_collection", self.floorplans),
+            patch.object(baseline_service, "schedule_baselines_collection", baselines),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                baseline_service.remove_schedule_baseline(
+                    project_ref="project-1", baseline_id="active-version"
+                )
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_schedule_delete_removes_all_versioned_data_not_legacy_schedule(self):
         baselines = self._collection()
