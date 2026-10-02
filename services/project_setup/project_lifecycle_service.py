@@ -11,6 +11,10 @@ from core.database import (
     budget_variations_collection,
     budget_verification_runs_collection,
     floorplans_collection,
+    project_documents_collection,
+    document_metadata_collection,
+    document_groups_collection,
+    document_events_collection,
     inspections_collection,
     material_audit_events_collection,
     material_documents_collection,
@@ -168,6 +172,10 @@ def delete_project(site_name: str) -> None:
         budget_invoices_collection,
         budget_verification_runs_collection,
         budget_audit_events_collection,
+        project_documents_collection,
+        document_metadata_collection,
+        document_groups_collection,
+        document_events_collection,
     ):
         collection.delete_many(material_filter)
 
@@ -288,6 +296,10 @@ def rename_project(old_site_name: str, new_site_name: str) -> None:
         budget_invoices_collection,
         budget_verification_runs_collection,
         budget_audit_events_collection,
+        project_documents_collection,
+        document_metadata_collection,
+        document_groups_collection,
+        document_events_collection,
     ):
         collection.update_many(
             {"$or": [{"project_id": old_site}, {"site_name": old_site}]},

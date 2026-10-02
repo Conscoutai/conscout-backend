@@ -116,6 +116,19 @@ raw_subscription_payments_collection = db["subscription_payments"]
 raw_helpdesk_tickets_collection = db["helpdesk_tickets"]
 raw_helpdesk_messages_collection = db["helpdesk_messages"]
 raw_ai_quality_flags_collection = db["ai_quality_flags"]
+raw_project_documents_collection = db["project_documents"]
+raw_document_metadata_collection = db["document_metadata"]
+raw_document_groups_collection = db["document_groups"]
+raw_document_events_collection = db["document_events"]
+
+
+def ensure_document_indexes() -> None:
+    raw_project_documents_collection.create_index("document_id", unique=True)
+    raw_project_documents_collection.create_index([("project_id", 1), ("client_reference", 1)], unique=True)
+    raw_project_documents_collection.create_index([("group_id", 1), ("version", 1)], unique=True)
+    raw_document_metadata_collection.create_index("document_id", unique=True)
+    raw_document_groups_collection.create_index("group_id", unique=True)
+    raw_document_events_collection.create_index([("group_id", 1), ("created_at", -1)])
 
 
 def ensure_chat_indexes() -> None:
@@ -367,6 +380,10 @@ def ensure_safety_indexes() -> None:
 # Store site-related data in a single collection.
 # This replaces the old floorplans collection name.
 floorplans_collection = ScopedCollection(raw_floorplans_collection)
+project_documents_collection = ScopedCollection(raw_project_documents_collection)
+document_metadata_collection = ScopedCollection(raw_document_metadata_collection)
+document_groups_collection = ScopedCollection(raw_document_groups_collection)
+document_events_collection = ScopedCollection(raw_document_events_collection)
 tours_collection = ScopedCollection(raw_tours_collection)
 work_schedules_collection = ScopedCollection(raw_work_schedules_collection)
 schedule_baselines_collection = ScopedCollection(raw_schedule_baselines_collection)

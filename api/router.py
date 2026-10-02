@@ -16,6 +16,7 @@ from api.routes.notifications import router as notifications_router
 from api.routes.helpdesk import router as helpdesk_router
 from api.routes.subscriptions import router as subscriptions_router
 from api.routes.safety import router as safety_router
+from api.routes.documents import router as documents_router
 from core.auth import require_authenticated_user
 
 api_router = APIRouter()
@@ -32,3 +33,4 @@ api_router.include_router(tour_management_router, dependencies=[Depends(require_
 api_router.include_router(features_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(ai_management_router, dependencies=[Depends(require_authenticated_user)])
 api_router.include_router(protected_assets_router)
+api_router.include_router(documents_router)
