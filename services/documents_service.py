@@ -15,7 +15,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from core.auth_context import AuthenticatedUser
-from core.config import SITE_DXF_DIRNAME, site_storage_roots
+from core.config import SITE_DXF_DIRNAME, site_storage_roots, tour_storage_roots
 from core.database import (
     raw_floorplans_collection as projects, raw_schedule_baselines_collection,
     raw_schedule_updates_collection, raw_budget_boqs_collection,
@@ -23,6 +23,7 @@ from core.database import (
     raw_safety_records_collection, raw_project_documents_collection as documents,
     raw_document_metadata_collection as metadata, raw_document_groups_collection as groups,
     raw_document_events_collection as events,
+    raw_schedule_evidence_collection, raw_tours_collection,
 )
 
 GENERAL_TYPES = {"contract", "drawing", "specification", "correspondence", "other", "report"}
@@ -156,6 +157,29 @@ def catalog_rows(user):
                 row["uploaded_at"] = iso(record.get("finalized_at") or record.get("created_at"))
                 row["uploaded_by"] = text((record.get("finalized_by") or {}).get("email")) or row["uploaded_by"]
             rows.append(row)
+    evidence = list(raw_schedule_evidence_collection.find(source_scope(allowed), {
+        field: 1 for field in ("project_id", "evidence_id", "image_url", "activity_name", "activity_id", "tour_id", "uploaded_at", "created_at", "captured_at", "status", "uploaded_by_email")
+    }))
+    tours = {text(t.get("tour_id")): t for t in raw_tours_collection.find({"tour_id": {"$in": list({text(e.get("tour_id")) for e in evidence if e.get("tour_id")})}}, {field: 1 for field in ("tour_id", "storage_key", "project_id", "site_name", "site", "floorplan_id", "owner_user_id", "owner_email")})}
+    for record in evidence:
+        project = by_id.get(text(record.get("project_id")))
+        image = text(record.get("image_url"))
+        if not project or not record.get("evidence_id") or not image:
+            continue
+        path = unquote(urlparse(image).path)
+        tour = tours.get(text(record.get("tour_id")))
+        if path.startswith("/streetview/"):
+            if not _evidence_tour_matches(tour, project):
+                continue
+            key = path[len("/streetview/"):].split("/")[0]
+            if key not in {text(tour.get("storage_key")), text(tour.get("tour_id"))}:
+                continue
+        elif not path.startswith("/sites/"):
+            continue
+        row = _row({**record, "source_url": image}, project, "activity-evidence", "schedule", record["evidence_id"])
+        row.update(activity_name=text(record.get("activity_name")), activity_id=text(record.get("activity_id")), _tour=tour)
+        row["title"] = (row["activity_name"] + " · " if row["activity_name"] else "") + "Site capture"
+        rows.append(row)
     for record in documents.find(source_scope(allowed), {"_id": 0}):
         row = _row(record, by_id[record["project_id"]], "library", record["category"], record["document_id"], record["group_id"])
         row.update({key: record.get(key, row.get(key)) for key in ("title", "description", "reference", "tags", "archived")})
@@ -220,6 +244,19 @@ def public(row):
     return {key: value for key, value in row.items() if not key.startswith("_") and key != "group_id"}
 
 
+def _evidence_tour_matches(tour, project):
+    if not tour:
+        return False
+    keys = {project_id(project), text(project.get("id")), text(project.get("site_name")), text(project.get("dxf_project_id"))} - {""}
+    if not any(text(tour.get(key)) in keys for key in ("project_id", "site_name", "site", "floorplan_id")):
+        return False
+    # A tour linked by an activity must belong to the same project owner.
+    if tour.get("owner_user_id") or tour.get("owner_email"):
+        return bool((tour.get("owner_user_id") and tour.get("owner_user_id") == project.get("owner_user_id")) or
+                    (text(tour.get("owner_email")).lower() and text(tour.get("owner_email")).lower() == text(project.get("owner_email")).lower()))
+    return True
+
+
 def list_documents(user, *, project="", category="", query="", status="", uploader="", after="", before="", latest=True, archived=False, page=1, limit=30):
     if page < 1 or not 1 <= limit <= 100:
         raise HTTPException(400, "Choose a valid document page")
@@ -271,9 +308,25 @@ def document_file(identity, user):
     if row["source"] == "safety-report":
         return row, None
     project = row["_project"]
+    url = unquote(urlparse(row["_url"]).path)
+    if row["source"] == "activity-evidence" and url.startswith("/streetview/"):
+        tour = row.get("_tour")
+        if not _evidence_tour_matches(tour, project):
+            raise HTTPException(404, "Activity attachment not found")
+        relative = url[len("/streetview/"):]
+        key, _, rest = relative.partition("/")
+        keys = {text(tour.get("storage_key")), text(tour.get("tour_id"))} - {""}
+        if key in keys and rest:
+            for storage_root in tour_storage_roots(owner_email=tour.get("owner_email"), owner_user_id=tour.get("owner_user_id"), site_name=tour.get("site_name") or tour.get("site") or project.get("site_name")):
+                root = Path(storage_root).resolve()
+                for alias in keys:
+                    directory = (root / alias).resolve()
+                    path = (directory / rest).resolve()
+                    if directory.is_relative_to(root) and directory != root and path.is_relative_to(directory) and path.is_file():
+                        return row, path
+        raise HTTPException(404, "The activity attachment is unavailable. Open the activity to view its context.")
     roots = [Path(p).resolve() for p in site_storage_roots(owner_email=project.get("owner_email"), owner_user_id=project.get("owner_user_id"))]
     candidates = [Path(row["_path"])] if row["_path"] else []
-    url = unquote(urlparse(row["_url"]).path)
     if url.startswith("/sites/"):
         relative = url[len("/sites/"):]
         candidates.extend(root / relative for root in roots)

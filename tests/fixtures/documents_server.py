@@ -24,15 +24,18 @@ from api.routes.documents import router
 storage = tempfile.TemporaryDirectory(prefix="conscout-documents-preview-")
 root = Path(storage.name)
 db = mongomock.MongoClient().documents_preview
-for name in ("projects", "documents", "metadata", "groups", "events", "raw_schedule_baselines_collection", "raw_schedule_updates_collection", "raw_budget_boqs_collection", "raw_budget_invoices_collection", "raw_material_documents_collection", "raw_safety_records_collection"):
+for name in ("projects", "documents", "metadata", "groups", "events", "raw_schedule_baselines_collection", "raw_schedule_updates_collection", "raw_budget_boqs_collection", "raw_budget_invoices_collection", "raw_material_documents_collection", "raw_safety_records_collection", "raw_schedule_evidence_collection", "raw_tours_collection"):
     setattr(service, name, db[name])
 service.site_storage_roots = lambda **kwargs: [str(root)]
+service.tour_storage_roots = lambda **kwargs: [str(root / "tours")]
 db.documents.create_index([("project_id", 1), ("client_reference", 1)], unique=True)
 db.documents.create_index([("group_id", 1), ("version", 1)], unique=True)
 db.groups.create_index("group_id", unique=True)
 
 project = {"id": "local-project", "site_name": "Report fixture", "owner_user_id": "local-user", "owner_email": "local@example.com", "created_by_email": "local@example.com"}
 db.projects.insert_many([project, {"id": "foreign-project", "site_name": "Private project", "owner_user_id": "another-user", "owner_email": "another@example.com"}])
+for identity, name in (("harbor-project", "Harbor offices"), ("north-project", "North residence"), ("warehouse-project", "Warehouse extension"), ("city-project", "City apartments")):
+    db.projects.insert_one({"id": identity, "site_name": name, "owner_user_id": "local-user", "owner_email": "local@example.com"})
 pdf = FPDF();pdf.add_page();pdf.set_font("Arial", size=12);pdf.cell(0, 12, "ConScout local Documents verification")
 rendered = pdf.output(dest="S")
 pdf_bytes = rendered.encode("latin-1") if isinstance(rendered, str) else bytes(rendered)
@@ -57,6 +60,13 @@ Path(db.raw_budget_invoices_collection.find_one({"invoice_id": "missing"})["stor
 image = root / "local-project" / "fixture" / "floorplan.png";image.write_bytes(png)
 db.projects.update_one({"id": "local-project"}, {"$set": {"imageUrl": "/sites/local-project/fixture/floorplan.png"}})
 db.raw_budget_invoices_collection.insert_one({"project_id": "foreign-project", "invoice_id": "secret", "original_filename": "Private invoice.pdf", "status": "paid"})
+capture = root / "tours" / "local__tour" / "concrete.png"
+capture.parent.mkdir(parents=True); capture.write_bytes(png)
+db.raw_tours_collection.insert_one({"tour_id": "local-tour", "storage_key": "local__tour", "site_name": "Report fixture", "owner_user_id": "local-user"})
+db.raw_schedule_evidence_collection.insert_one({"project_id": "local-project", "evidence_id": "concrete-evidence", "tour_id": "local-tour", "activity_id": "A100", "activity_name": "Concrete works", "image_url": "/streetview/local__tour/concrete.png", "status": "approved", "uploaded_at": "2026-10-01T10:00:00Z"})
+# More than one upstream page proves that categories are grouped before pagination.
+for index in range(105):
+    db.raw_budget_invoices_collection.insert_one({"project_id": "harbor-project", "invoice_id": f"harbor-{index}", "source_filename": f"Harbor invoice {index+1}.pdf", "status": "paid", "uploaded_at": "2026-09-01T08:00:00Z"})
 
 app = FastAPI(title="Isolated local Documents verification")
 app.include_router(router)

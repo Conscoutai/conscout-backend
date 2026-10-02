@@ -25,13 +25,14 @@ PDF = b"%PDF-1.7\nlocal document\n%%EOF"
 @pytest.fixture
 def library(monkeypatch, tmp_path):
     db = mongomock.MongoClient().db
-    names = ["projects", "documents", "metadata", "groups", "events", "raw_schedule_baselines_collection", "raw_schedule_updates_collection", "raw_budget_boqs_collection", "raw_budget_invoices_collection", "raw_material_documents_collection", "raw_safety_records_collection"]
+    names = ["projects", "documents", "metadata", "groups", "events", "raw_schedule_baselines_collection", "raw_schedule_updates_collection", "raw_budget_boqs_collection", "raw_budget_invoices_collection", "raw_material_documents_collection", "raw_safety_records_collection", "raw_schedule_evidence_collection", "raw_tours_collection"]
     for name in names:
         monkeypatch.setattr(service, name, db[name])
     db.documents.create_index([("project_id", 1), ("client_reference", 1)], unique=True)
     db.documents.create_index([("group_id", 1), ("version", 1)], unique=True)
     db.groups.create_index("group_id", unique=True)
     monkeypatch.setattr(service, "site_storage_roots", lambda **kwargs: [str(tmp_path)])
+    monkeypatch.setattr(service, "tour_storage_roots", lambda **kwargs: [str(tmp_path / "tours")])
     db.projects.insert_many([
         {"id": "p1", "site_name": "Site A", "owner_user_id": OWNER.user_id, "owner_email": OWNER.email},
         {"id": "p2", "site_name": "Site B", "owner_user_id": OTHER.user_id, "owner_email": OTHER.email},
@@ -206,3 +207,34 @@ def test_library_records_and_files_follow_project_deletion(library, monkeypatch)
     assert service.groups.count_documents({}) == 0
     assert service.events.count_documents({}) == 0
     assert not (root / "p1").exists()
+
+
+def test_activity_attachments_require_project_and_tour_authorization(library):
+    db, root = library
+    image = root / "tours" / "owner__tour1" / "capture.jpg"
+    image.parent.mkdir(parents=True); image.write_bytes(b"local activity image")
+    foreign = root / "tours" / "tour2" / "secret.jpg"
+    foreign.parent.mkdir(); foreign.write_bytes(b"private image")
+    db.raw_tours_collection.insert_many([
+        {"tour_id": "tour1", "storage_key": "owner__tour1", "site_name": "Site A", "owner_user_id": OWNER.user_id},
+        {"tour_id": "tour2", "storage_key": "tour2", "site_name": "Site B", "owner_user_id": OTHER.user_id},
+    ])
+    db.raw_schedule_evidence_collection.insert_many([
+        {"project_id": "p1", "evidence_id": "e1", "tour_id": "tour1", "activity_name": "Concrete works", "activity_id": "A100", "image_url": "/streetview/owner__tour1/capture.jpg", "status": "approved"},
+        {"project_id": "p1", "evidence_id": "foreign-tour", "tour_id": "tour2", "image_url": "/streetview/tour2/secret.jpg"},
+        {"project_id": "p1", "evidence_id": "wrong-alias", "tour_id": "tour1", "image_url": "/streetview/tour2/secret.jpg"},
+        {"project_id": "p1", "evidence_id": "traversal", "tour_id": "tour1", "image_url": "/streetview/owner__tour1/../tour2/secret.jpg"},
+        {"project_id": "p2", "evidence_id": "foreign-project", "tour_id": "tour2", "image_url": "/streetview/tour2/secret.jpg"},
+        {"project_id": "p1", "evidence_id": "no-file", "activity_name": "Manual progress"},
+    ])
+    for user in (OWNER, VIEWER):
+        row, path = service.document_file("activity-evidence:e1", user)
+        assert path.read_bytes() == b"local activity image"
+        assert row["category"] == "schedule" and row["activity_name"] == "Concrete works"
+        assert "_tour" not in service.document_detail(row["id"], user)["document"]
+        fail(404, lambda: service.document_file("activity-evidence:traversal", user))
+        for evidence in ("foreign-tour", "wrong-alias", "foreign-project", "no-file"):
+            fail(404, lambda: service.document_detail("activity-evidence:" + evidence, user))
+    fail(404, lambda: service.document_file("activity-evidence:e1", OTHER))
+    image.unlink()
+    fail(404, lambda: service.document_file("activity-evidence:e1", OWNER))
